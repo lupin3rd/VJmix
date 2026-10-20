@@ -10,7 +10,16 @@ import json
 import os
 from typing import Any
 
-from vjmixapp.constants import DEFAULT_CONFIG, DEFAULT_PALETTE, DPG_COLOR_SCALE, PALETTE_SLOTS
+from vjmixapp.constants import (
+    DEFAULT_CONFIG,
+    DEFAULT_PALETTE,
+    DPG_COLOR_SCALE,
+    PALETTE_SLOTS,
+    SEQ_GEOMETRY_CHOICES,
+    SEQ_GEOMETRY_DEFAULT,
+    SEQ_ZOOM_DEFAULT,
+    SEQ_ZOOM_LEVELS,
+)
 from vjmixapp.queues import log_error
 
 
@@ -50,6 +59,40 @@ def _sanitize_palette(colors: Any) -> dict[str, list[int]]:
             if isinstance(raw, (list, tuple)) and len(raw) >= 3:
                 clean[slot] = [_recover_channel(c) for c in raw[:3]]
     return clean
+
+
+def sanitize_geometry(value: Any) -> int:
+    """A legal live sequencer size, or the cap when the value is anything else (e66s01).
+
+    The live geometry is a value in ``SEQ_GEOMETRY_CHOICES`` per axis, and THIS is the
+    only place that decides what legal means, so a project document, the app config and
+    a MIDI-learned message cannot disagree. The heal is total and deliberately strict:
+    only an ``int`` counts — a ``bool`` is an ``int`` in Python and must not become 1 or
+    4, and a hand-edited ``4.0`` is not a value this product writes — so 3, 9, 2, 6,
+    ``True``, ``4.0``, ``"8"`` and ``None`` all resolve to ``SEQ_GEOMETRY_DEFAULT`` and
+    the grid can never leave {4, 8}.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return SEQ_GEOMETRY_DEFAULT
+    if value in SEQ_GEOMETRY_CHOICES:
+        return value
+    return SEQ_GEOMETRY_DEFAULT
+
+
+def sanitize_seq_zoom(value: Any) -> int:
+    """A legal zoom level, or the default when the value is anything else (e66s03).
+
+    The zoom is a display preference read from an APP-LEVEL config file, so a hand-edited
+    0, a 100, a "90" or a whole corrupt block must leave the grid READABLE — the default
+    is the level the shipped look was designed at, which makes it the safe answer to every
+    doubt. Only an ``int`` counts (a ``bool`` is one in Python, and a 90.0 is not a value
+    this product writes).
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return SEQ_ZOOM_DEFAULT
+    if value in SEQ_ZOOM_LEVELS:
+        return value
+    return SEQ_ZOOM_DEFAULT
 
 
 def load_config() -> dict[str, Any]:

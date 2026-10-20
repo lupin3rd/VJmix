@@ -12,6 +12,11 @@ from typing import Any
 import dearpygui.dearpygui as dpg
 
 from vjmixapp import state
+from vjmixapp.colorscale import (
+    dpg_color_rgba,  # noqa: F401 — re-exported for the existing callers
+    dpg_color_value,  # noqa: F401 — re-exported for the existing callers
+    palette_rgba,
+)
 from vjmixapp.config import _recover_channel, load_config, save_config
 from vjmixapp.constants import (
     DEFAULT_PALETTE,
@@ -60,26 +65,6 @@ GLOBAL_THEME_COMPONENTS: list[tuple[int, str]] = [
     (dpg.mvThemeCol_InputTextCursor, "accent"),
     (dpg.mvThemeCol_TextSelectedBg, "accent"),
 ]
-
-
-def dpg_color_value(rgb: list[float]) -> list[float]:
-    """Convert normalized 0..1 RGB to DPG's color API scale (0..255).
-
-    DPG 2.x parses color lists by dividing every channel by 255, so colors
-    pushed programmatically (default_value / set_value) must arrive on the
-    0..255 scale; user-picked colors arrive via callbacks already 0..1.
-    """
-    return [round(c * DPG_COLOR_SCALE, 2) for c in rgb]
-
-
-def dpg_color_rgba(rgb: list[float]) -> list[float]:
-    """DPG-scale RGB plus an opaque alpha (color_button needs 4 components)."""
-    return [*dpg_color_value(rgb), DPG_COLOR_SCALE]
-
-
-def palette_rgba(color: list[int]) -> list[int]:
-    """Palette RGB (0..255) plus an opaque alpha, the DPG color shape for themes/widgets."""
-    return [color[0], color[1], color[2], 255]
 
 
 def _blend(a: list[int], b: list[int], t: float) -> list[int]:

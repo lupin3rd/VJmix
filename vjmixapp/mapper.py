@@ -9,12 +9,15 @@ sequencer pattern.
 """
 
 import copy
+import time
 from typing import Any
 
-from vjmixapp import catalog, leap, state
+from vjmixapp import catalog, leap, shadercode, sourcekind, sourcestatus, state
 from vjmixapp.constants import (
+    BAND_SOURCES,
     CLOCK_DEFAULT,
     CLOCK_SOURCES,
+    CLOCK_STEP,
     DEST_MIDI,
     DEST_OSC,
     DEST_VIMIX,
@@ -38,7 +41,7 @@ from vjmixapp.constants import (
     ORIGINS,
 )
 from vjmixapp.osc import osc_client
-from vjmixapp.queues import append_log
+from vjmixapp.queues import log_error
 
 # Property catalog: single-float vimix source attributes usable with a
 # video/image source. Ranges are the vimix Open-Sound-Control-API wiki
@@ -69,6 +72,27 @@ MAPPER_CONTROL_BUTTON = "button"  # e51s01: the two-state trigger control
 # e40s09: the value e40 originally persisted for the same sentinel (Route era).
 # sanitize_mapping still accepts it and heals it, so an old .VJmix file loads.
 MAPPER_CONTROL_MAPPING_LEGACY = "route"
+# e77: how a GUI button behaves when PRESSED. `toggle` is the latch this app has always
+# had (ON <-> OFF); `momentary` fires the action and releases the square on its own. It is
+# chosen at CREATION in the Mapping editor and stored per Mapping (project content).
+MAPPER_BUTTON_MODE_TOGGLE = "toggle"
+MAPPER_BUTTON_MODE_MOMENTARY = "momentary"
+MAPPER_BUTTON_MODES: tuple[str, ...] = (MAPPER_BUTTON_MODE_TOGGLE, MAPPER_BUTTON_MODE_MOMENTARY)
+
+
+def sanitize_button_mode(raw: Any) -> str:
+    """A legal button mode, or the latch when the value is anything else (e77)."""
+    return raw if raw in MAPPER_BUTTON_MODES else MAPPER_BUTTON_MODE_TOGGLE
+
+
+def is_momentary_button(mapping: dict[str, Any]) -> bool:
+    """True for a GUI button that fires and releases on its own (e77)."""
+    return (
+        mapping.get("control") == MAPPER_CONTROL_BUTTON
+        and mapping.get("button_mode") == MAPPER_BUTTON_MODE_MOMENTARY
+    )
+
+
 MAPPER_CONTROLS: tuple[str, ...] = (
     "slider",
     "knob",
@@ -94,18 +118,56 @@ MAPPER_CONTROL_TAG_KINDS: dict[str, str] = {
 }
 
 
-def mappable_properties() -> list[str]:
-    """Catalog properties a Mapper mapping may target (e36s03).
+def mappable_properties(
+    registry: dict[str, dict[str, dict[str, float | None]]] | None = None,
+) -> list[str]:
+    """Catalog properties a Mapper mapping may target (e36s03, e61s05).
 
     Everything except the RATE family — loom/turn/grab/resize/ffwd are
-    Cue-only (user decision 2). Order = catalog order (the New-Mapping dialog
-    lists exactly this).
+    Cue-only (user decision 2). Order = catalog order, then the shader uniforms
+    currently registered (e61s05), so the Mapper dialog, the Cue property rows and
+    the Sequencer step picker all offer the same vocabulary.
     """
+    source = state.shader_uniforms if registry is None else registry
+    uniforms = sorted(
+        shadercode.uniform_entries(source), key=lambda key: catalog.parse_uniform_slot(key) or 0
+    )
     return [
         prop
         for prop, entry in catalog.PROPERTY_CATALOG.items()
         if entry["family"] != catalog.FAMILY_RATE
-    ]
+    ] + uniforms
+
+
+def mapper_properties(
+    registry: dict[str, dict[str, dict[str, float | None]]] | None = None,
+) -> list[str]:
+    """The Mapper dialog's vocabulary: the shared one + the Mapper-only action (e83).
+
+    `set current` is offered HERE and nowhere else: a Cue row or a Sequencer step
+    with it would be meaningless (it is not a vimix attribute).
+    """
+    return [*mappable_properties(registry), catalog.SET_CURRENT_PROPERTY]
+
+
+def current_target_argument(target_id: str) -> str:
+    """The `/vimix/current/<x>` argument of a source: its INDEX when the table knows it.
+
+    vimix parses a leading number as an index and ignores the rest
+    (BUG-2026-10-16T233000), so "07-Ritual..." must be addressed by its live index.
+    The name is the fallback when the source is not in the table.
+    """
+    for key, props in (state.global_vimix_state.get("sources") or {}).items():
+        if not isinstance(props, dict):
+            continue
+        if str(props.get("name") or key) != str(target_id):
+            continue
+        raw_index = props.get("index")
+        try:
+            return str(int(raw_index)) if raw_index is not None else str(int(key))
+        except (TypeError, ValueError):
+            return str(target_id)
+    return str(target_id)
 
 
 def control_tag_kind(control: str) -> str:
@@ -144,14 +206,83 @@ def toggle_on_press(mapping: dict[str, Any]) -> bool:
     return _degenerate_input_window(mapping)
 
 
-def _component_spec(prop: str, component: str | None) -> dict[str, Any]:
+def _registry(
+    registry: dict[str, dict[str, dict[str, float | None]]] | None,
+) -> dict[str, dict[str, dict[str, float | None]]]:
+    """The uniform registry a dynamic property is resolved against (BUG-2026-10-14T191248).
+
+    ``None`` means the LIVE registry (the UI paths). A project load passes the
+    DOCUMENT's registry, which is the authority while the live one is still empty.
+    """
+    return state.shader_uniforms if registry is None else registry
+
+
+# e83: the Mapper-only action, shaped like a catalog entry so the existing
+# machinery (family, components, output range, help cards) works unchanged.
+SET_CURRENT_ENTRY: dict[str, Any] = {
+    "family": catalog.FAMILY_TRIGGER,
+    "label": "Set current",
+    "components": [{"key": "v", "label": "Set current", "min": 0.0, "max": 1.0, "neutral": 0.0}],
+    "partial": catalog.PARTIAL_NONE,
+    "ms": False,
+    "options": None,
+    "derivable": False,
+}
+
+
+def mapping_entry(
+    prop: str, registry: dict[str, dict[str, dict[str, float | None]]] | None = None
+) -> dict[str, Any] | None:
+    """The catalog-shaped entry of a mapping property, Mapper actions included (e83)."""
+    return _maybe_entry(prop, registry)
+
+
+def property_family(prop: str) -> str:
+    """The family of a mapping property, Mapper-only actions included (e83)."""
+    entry = _maybe_entry(prop)
+    return str(entry["family"]) if entry else ""
+
+
+def _entry(
+    prop: str, registry: dict[str, dict[str, dict[str, float | None]]] | None = None
+) -> dict[str, Any]:
+    """The catalogue entry of a mapping property, static or live-uniform (e61s05).
+
+    A shader uniform is a dynamic property: its entry exists only while the target's
+    registry holds it, so the core (not just the dialogs) must resolve through here.
+    Raises KeyError for an unknown property, exactly like the static table did.
+    """
+    if str(prop) == catalog.SET_CURRENT_PROPERTY:
+        return SET_CURRENT_ENTRY
+    return (
+        shadercode.uniform_entries(_registry(registry)).get(str(prop))
+        or (catalog.PROPERTY_CATALOG[str(prop)])
+    )
+
+
+def _maybe_entry(
+    prop: str, registry: dict[str, dict[str, dict[str, float | None]]] | None = None
+) -> dict[str, Any] | None:
+    """The entry of a property or None (the tolerant twin of `_entry`)."""
+    if str(prop) == catalog.SET_CURRENT_PROPERTY:
+        return SET_CURRENT_ENTRY
+    return shadercode.uniform_entries(_registry(registry)).get(str(prop)) or (
+        catalog.PROPERTY_CATALOG.get(str(prop))
+    )
+
+
+def _component_spec(
+    prop: str,
+    component: str | None,
+    registry: dict[str, dict[str, dict[str, float | None]]] | None = None,
+) -> dict[str, Any]:
     """The catalog spec of one mapping component (KeyError = catalog bug).
 
     e36s02: multi-value properties (position/size/color/corner, the rate
     vectors grab/resize) resolve the component key; scalar/toggle/trigger/
     enum properties always resolve their single component.
     """
-    entry = catalog.PROPERTY_CATALOG[prop]
+    entry = _entry(prop, registry)
     key = component if component is not None else entry["components"][0]["key"]
     for c in entry["components"]:
         if c["key"] == key:
@@ -205,7 +336,7 @@ def _cue_property_payload(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
     prop = str(raw.get("property") or "")
-    entry = catalog.PROPERTY_CATALOG.get(prop)
+    entry = _maybe_entry(prop)
     if entry is None or entry["family"] == catalog.FAMILY_RATE:
         return None
     comps = entry["components"]
@@ -254,7 +385,7 @@ def _cue_burst_payload(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
     prop = str(raw.get("property") or "")
-    entry = catalog.PROPERTY_CATALOG.get(prop)
+    entry = _maybe_entry(prop)
     if entry is None or entry["family"] != catalog.FAMILY_RATE:
         return None
     ms = raw.get("ms")
@@ -436,20 +567,29 @@ def prop_flag(value: Any) -> bool:
 def dead_reckon(
     mapping: dict[str, Any], last_value: float, elapsed_s: float, props: dict[str, Any]
 ) -> float:
-    """Extrapolate a derivable State Origin between refreshes (e40s01).
+    """Extrapolate a derivable State Origin between refreshes (e40s01, fixed e83).
 
     ADR decision 5: the catalog marks the properties VJmix may extrapolate
-    (``seek`` is a linear timeline position). While the source plays, the value
-    advances by ``speed * elapsed`` from the last REAL value, clamped to the
-    Origin window; a paused source, a non-derivable property and a negative
-    elapsed all return the last value unchanged.
+    (``seek`` is a linear timeline position). ``seek`` is a FRACTION of the clip,
+    so the advance per second is ``speed / duration`` — advancing by ``speed``
+    alone raced to 100% (a MIDI LED bar pinned at 127) as soon as ``play`` reached
+    the plan; an unknown duration FREEZES the value rather than guessing.
+
+    ``duration_s`` is a viOSC-local table key (like ``media_kind``): it arrives
+    with the snapshot/stream, so no interest declares it. The arithmetic is shared
+    with the tile's seek bar (``sourcestatus.seek_now``).
     """
     if not catalog.is_derivable(str(mapping["property"])) or not prop_flag(props.get("play")):
         return float(last_value)
-    speed = props.get("speed")
-    speed = float(speed) if isinstance(speed, (int, float)) else 1.0
     lo, hi = _input_window(float(mapping["input_from"]), float(mapping["input_to"]))
-    return _clamp(float(last_value) + speed * max(0.0, float(elapsed_s)), lo, hi)
+    extrapolated = sourcestatus.seek_now(
+        last_value,
+        props.get("speed"),
+        props.get("play"),
+        elapsed_s,
+        props.get("duration_s"),
+    )
+    return _clamp(extrapolated, lo, hi)
 
 
 def mapping_emit_epsilon(destination: str) -> float:
@@ -522,6 +662,7 @@ def _build_mapping(
     component: str | None = None,
     origin: str = ORIGIN_CONTROL,
     destination: str = DEST_VIMIX,
+    registry: dict[str, dict[str, dict[str, float | None]]] | None = None,
 ) -> dict[str, Any]:
     """A fresh mapping dict with the catalog defaults, no side effects (e28s01).
 
@@ -539,7 +680,7 @@ def _build_mapping(
     Origin seeds its Origin window from the catalog property, an output
     Destination its range from the MIDI/OSC scale.
     """
-    entry = catalog.PROPERTY_CATALOG[prop]
+    entry = _entry(prop, registry)
     if len(entry["components"]) > 1:
         keys = {c["key"] for c in entry["components"]}
         component = component if component is not None else entry["components"][0]["key"]
@@ -547,7 +688,7 @@ def _build_mapping(
             raise KeyError(f"component {component!r} of {prop!r}")
     else:
         component = None
-    spec = _component_spec(prop, component)
+    spec = _component_spec(prop, component, registry)
     in_from, in_to = _default_input_range(origin, spec)
     out_from, out_to = _default_output_range(destination, spec)
     neutral = _clamp(float(spec["neutral"]), min(out_from, out_to), max(out_from, out_to))
@@ -578,6 +719,7 @@ def _build_mapping(
         "output_to": out_to,
         "input_from": in_from,
         "input_to": in_to,
+        "button_mode": MAPPER_BUTTON_MODE_TOGGLE,
         "enabled": False,
         "cue": fresh_cue(),  # e35s01: uniform key set — inert for non-cue-list controls
     }
@@ -602,6 +744,23 @@ def _validate_mapping(origin: str, destination: str) -> None:
         )
 
 
+def clock_window(clock: str) -> tuple[float, float]:
+    """The Origin window of a Clock kind, seeded from the LIVE sequencer geometry (e66s01).
+
+    `step` is the sequencer's live COLUMN. `CLOCK_SOURCES` holds its CAP — 0..7, the tag
+    space — so a 4-column sequencer would map only columns 0..3 onto the lower half of
+    its destination's range. A NEW mapping therefore seeds 0..`cols - 1`.
+
+    A window that was already WRITTEN is respected: both seeding sites run only when the
+    row carries no explicit window, so a geometry change never rewrites a saved mapping.
+    The `max(1, …)` is the floor — a column count can never be zero (`sanitize_geometry`
+    only accepts 4 and 8) and an inverted window would be worse than a degenerate one.
+    """
+    if clock == CLOCK_STEP:
+        return (0.0, float(max(1, state.seq_cols) - 1))
+    return CLOCK_SOURCES.get(clock, (0.0, 1.0))
+
+
 def add_mapping(
     target_id: str | None = None,
     prop: str = "alpha",
@@ -614,6 +773,7 @@ def add_mapping(
     origin_spec: dict[str, Any] | None = None,
     cadence: int | None = None,
     steps: int = MAPPING_STEPS_CONTINUOUS,
+    button_mode: str = MAPPER_BUTTON_MODE_TOGGLE,
 ) -> dict[str, Any]:
     """Create a Mapping and append it to the mapper state (e16s01, e40s01, e40s09).
 
@@ -628,6 +788,11 @@ def add_mapping(
     (None = scalar property, or the FIRST component for a vector property).
     """
     _validate_mapping(origin, destination)
+    if origin in (ORIGIN_CONTROL, ORIGIN_STATE) and not target_id:
+        # BUG-2026-10-14T160827: a source-bound Mapping IS its write/read target
+        # (Control -> /vimix/<source>, State reads the source's property); without
+        # one it is unusable and the Mapper body could not render it.
+        raise ValueError(f"a {origin} mapping needs a source")
     if control is None:
         control = MAPPER_CONTROL_MAPPING
         value_mapping = True
@@ -643,6 +808,7 @@ def add_mapping(
         origin=origin,
         destination=destination,
     )
+    mapping["button_mode"] = sanitize_button_mode(button_mode)
     if value_mapping:
         if isinstance(destination_spec, dict):
             mapping["destination_spec"] = dict(destination_spec)
@@ -650,7 +816,7 @@ def add_mapping(
             mapping["origin_spec"] = dict(origin_spec)
         if origin == ORIGIN_CLOCK:
             clock = str(mapping["origin_spec"].get("clock") or CLOCK_DEFAULT)
-            mapping["input_from"], mapping["input_to"] = CLOCK_SOURCES.get(clock, (0.0, 1.0))
+            mapping["input_from"], mapping["input_to"] = clock_window(clock)
         if origin == ORIGIN_STATE and cadence is not None:
             mapping["cadence"] = max(MAPPING_MIN_CADENCE_MS, int(cadence))
         mapping["steps"] = max(MAPPING_STEPS_CONTINUOUS, int(steps))
@@ -676,7 +842,9 @@ def _to_float_or(value: Any, default: float) -> float:
         return default
 
 
-def sanitize_mapping(raw: Any) -> dict[str, Any] | None:
+def sanitize_mapping(
+    raw: Any, registry: dict[str, dict[str, dict[str, float | None]]] | None = None
+) -> dict[str, Any] | None:
     """Heal one stored mapping row onto the live runtime shape (e28s01).
 
     A row that cannot become a valid mapping (unknown property, inconsistent
@@ -693,7 +861,7 @@ def sanitize_mapping(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
     prop = str(raw.get("property") or "")
-    if prop not in catalog.PROPERTY_CATALOG:
+    if _maybe_entry(prop, registry) is None:
         return None
     origin = raw.get("origin", ORIGIN_CONTROL)
     destination = raw.get("destination", DEST_VIMIX)
@@ -704,6 +872,12 @@ def sanitize_mapping(raw: Any) -> dict[str, Any] | None:
     if destination not in MAPPING_DIRECTIONS[origin]:
         return None  # e40s01: inconsistent Origin/Destination pair
     control = str(raw.get("control") or "")
+    if prop == catalog.SET_CURRENT_PROPERTY and (
+        origin != ORIGIN_CONTROL or control != MAPPER_CONTROL_BUTTON
+    ):
+        # e83: a Mapper-only action, only as a BUTTON (a slider/knob would have
+        # nothing to drive; a state origin has nothing to read).
+        return None
     if origin == ORIGIN_CONTROL:
         if control not in MAPPER_CONTROLS or control == MAPPER_CONTROL_MAPPING:
             return None
@@ -711,7 +885,7 @@ def sanitize_mapping(raw: Any) -> dict[str, Any] | None:
         if control not in ("", MAPPER_CONTROL_MAPPING, MAPPER_CONTROL_MAPPING_LEGACY):
             return None
         control = MAPPER_CONTROL_MAPPING
-    entry = catalog.PROPERTY_CATALOG[prop]
+    entry = _entry(prop, registry)
     target_id = str(raw.get("target_id") or "") or None
     if len(entry["components"]) > 1:
         component = raw.get("component")
@@ -723,7 +897,7 @@ def sanitize_mapping(raw: Any) -> dict[str, Any] | None:
         if component not in (None, "v"):
             return None  # e36s02: scalar rows carry no component key
         component = None
-    spec = _component_spec(prop, component)
+    spec = _component_spec(prop, component, registry)
     mapping = _build_mapping(
         int(raw.get("id") or 0),
         target_id,
@@ -732,9 +906,10 @@ def sanitize_mapping(raw: Any) -> dict[str, Any] | None:
         component=component,
         origin=origin,
         destination=destination,
+        registry=registry,
     )
     if origin == ORIGIN_CONTROL:
-        if raw.get("band") in (2, 3):
+        if raw.get("band") in BAND_SOURCES:
             mapping["band"] = int(raw["band"])
         elif isinstance(raw.get("midi"), dict):
             midi = raw["midi"]
@@ -773,7 +948,7 @@ def sanitize_mapping(raw: Any) -> dict[str, Any] | None:
         # the clock kind's natural window wins when the row carries no explicit
         # input range (a hand-edited window is respected)
         clock = str(mapping["origin_spec"].get("clock") or CLOCK_DEFAULT)
-        mapping["input_from"], mapping["input_to"] = CLOCK_SOURCES.get(clock, (0.0, 1.0))
+        mapping["input_from"], mapping["input_to"] = clock_window(clock)
     if origin == ORIGIN_STATE:
         cadence = _to_float_or(raw.get("cadence"), MAPPING_DEFAULT_CADENCE_MS)
         mapping["cadence"] = max(MAPPING_MIN_CADENCE_MS, int(cadence))
@@ -784,6 +959,7 @@ def sanitize_mapping(raw: Any) -> dict[str, Any] | None:
     lo, hi = _output_bounds(mapping)
     neutral = float(spec["neutral"])  # e36s02: catalog no-effect neutral
     mapping["value"] = _clamp(_to_float_or(raw.get("value"), neutral), lo, hi)
+    mapping["button_mode"] = sanitize_button_mode(raw.get("button_mode"))
     mapping["enabled"] = bool(raw.get("enabled", False))
     mapping["cue"] = sanitize_cue(raw.get("cue"))  # e35s01: heal the per-mapping cue
     return mapping
@@ -811,7 +987,9 @@ def _drop_dangling_cue_rows(mappings: list[dict[str, Any]]) -> None:
         ]
 
 
-def restore_mappings(rows: Any) -> list[dict[str, Any]]:
+def restore_mappings(
+    rows: Any, registry: dict[str, dict[str, dict[str, float | None]]] | None = None
+) -> list[dict[str, Any]]:
     """Replace the live mapper with sanitized project rows (e28s01).
 
     Order is preserved (render order), invalid rows drop, the list is capped at
@@ -825,7 +1003,7 @@ def restore_mappings(rows: Any) -> list[dict[str, Any]]:
     max_id = state.mapper_counter
     if isinstance(rows, list):
         for raw in rows[:MAPPER_MAX_MAPPINGS]:
-            mapping = sanitize_mapping(raw)
+            mapping = sanitize_mapping(raw, registry)
             if mapping is None:
                 continue
             restored.append(mapping)
@@ -860,7 +1038,18 @@ def copy_mapping(mapping_id: int) -> dict[str, Any] | None:
     snapshot = capture_mapping(mapping)
     snapshot.pop("id", None)
     state.mapper_clipboard = snapshot
+    state.mapper_clipboard_at = time.monotonic()  # e74s11: arms the Paste buttons
     return snapshot
+
+
+def clear_clipboard() -> None:
+    """Forget the clipboard snapshot and its arming time (e74s11 expiry).
+
+    The Paste buttons derive from `state.mapper_clipboard`, so dropping it and clearing
+    the stamp is what makes them disappear (the caller rebuilds the Mapper body).
+    """
+    state.mapper_clipboard = None
+    state.mapper_clipboard_at = 0.0
 
 
 def cut_mapping(mapping_id: int) -> dict[str, Any] | None:
@@ -1125,6 +1314,14 @@ def toggle_mapping_value(mapping_id: int) -> float:
     return mapping["value"]
 
 
+def set_mapping_button_mode(mapping_id: int, mode: str) -> None:
+    """Choose how the GUI button behaves on a press (e77); unknown values are ignored."""
+    mapping = find_mapping(mapping_id)
+    if mapping is None or mode not in MAPPER_BUTTON_MODES:
+        return
+    mapping["button_mode"] = mode
+
+
 def set_mapping_enabled(mapping_id: int, enabled: bool) -> None:
     """Arm or mute a mapping (e24): disabled mappings send no OSC."""
     mapping = find_mapping(mapping_id)
@@ -1170,7 +1367,46 @@ def _send(mapping: dict[str, Any]) -> None:
         return
     target_id = str(mapping["target_id"])
     prop = str(mapping["property"])
-    entry = catalog.PROPERTY_CATALOG[prop]
+    if prop == catalog.SET_CURRENT_PROPERTY:
+        # e83: an ACTION, not an attribute: no `/vimix/<target>/<prop>` exists.
+        osc_client.send_message(f"/vimix/current/{current_target_argument(target_id)}", [])
+        return
+    # e61s05: a shader uniform is a catalogue property whose message shape is its
+    # own (`/uniform` with name + value): same choke point, same mute gate, same log.
+    uniform = shadercode.uniform_send(
+        state.shader_uniforms, prop, float(mapping["value"]), target_id
+    )
+    slot = catalog.parse_uniform_slot(prop)
+    mapping_id = mapping.get("id")
+    if slot is not None and uniform is None:
+        # BUG-2026-10-14T180544: the property IS a uniform slot, but THIS target's
+        # registry has no such slot (a stale Mapping, or a slot another source owns).
+        # Send NOTHING: falling into the static path would compose a bogus address or
+        # raise KeyError EVERY frame, and that exception would starve the sibling
+        # Mappings of the same drive pass. The log line is emitted once per episode.
+        if mapping_id is not None and int(mapping_id) not in state.mapping_unresolved_uniforms:
+            state.mapping_unresolved_uniforms.add(int(mapping_id))
+            log_error("Mapper", f"{target_id}: {prop} is not declared by the shader — not sent")
+        return
+    if mapping_id is not None:
+        state.mapping_unresolved_uniforms.discard(int(mapping_id))
+    if uniform is not None:
+        # e61s06: /uniform on a declared GENERATOR crashes vimix (SPIKE-6). The guard
+        # is asked HERE, once the property is known to be a uniform
+        # (BUG-2026-10-11T131042): asked at the top of the function it muted every
+        # property of a target the operator had declared a generator, so a Mapping on
+        # `alpha` stopped sending anything at all.
+        if shadercode.uniform_blocked(
+            target_id,
+            state.shader_target,
+            state.shader_kind,
+            sourcekind.type_of_source(state.global_vimix_state.get("sources") or {}, target_id),
+        ):
+            return
+        address, uniform_args = uniform
+        osc_client.send_message(address, uniform_args)
+        return
+    entry = _entry(prop)
     anchors = (
         catalog.anchor_get(state.source_anchors, target_id, prop)
         if entry["partial"] == catalog.PARTIAL_ANCHOR
@@ -1191,14 +1427,22 @@ def _send(mapping: dict[str, Any]) -> None:
         osc_client.send_message(addr, float(args[0]))  # legacy scalar send shape
     else:
         osc_client.send_message(addr, list(args))
-    append_log("OUT", f"{addr} {_format_args(args)}")
 
 
 def _format_args(args: list[Any]) -> str:
-    """Human log form: '[0.42]' scalar; '[N, 0.25]' nil-masked/anchor lists."""
+    """Human log form: '[0.42]' scalar; '[N, 0.25]' nil-masked/anchor lists.
+
+    A uniform message carries its NAME next to the value (e61s05), so a string arg
+    is printed as-is instead of being coerced to a float.
+    """
     parts = []
     for a in args:
-        parts.append("N" if a is None else f"{float(a):.2f}")
+        if a is None:
+            parts.append("N")
+        elif isinstance(a, str):
+            parts.append(a)
+        else:
+            parts.append(f"{float(a):.2f}")
     return "[" + ", ".join(parts) + "]"
 
 
@@ -1222,7 +1466,11 @@ def send_button_mapping(mapping_id: int) -> float:
     mapping = find_mapping(mapping_id)
     if mapping is None:
         return 0.0
-    if catalog.family_of(str(mapping["property"])) == catalog.FAMILY_TRIGGER:
+    if is_momentary_button(mapping):
+        # e77: a spot action — always the ON end, never a flip, so every press fires.
+        new_value = float(mapping["output_to"])
+        mapping["value"] = new_value
+    elif property_family(str(mapping["property"])) == catalog.FAMILY_TRIGGER:
         new_value = float(mapping["value"])
     else:
         new_value = toggle_mapping_value(mapping_id)
@@ -1231,15 +1479,19 @@ def send_button_mapping(mapping_id: int) -> float:
 
 
 def set_mapping_band(mapping_id: int, band_id: int | None) -> None:
-    """Set/clear the audio-band source of a mapping (e18).
+    """Set/clear the audio-band source of a mapping (e18, e71s01).
 
     Band, MIDI and leap sources are mutually exclusive (e26s03): setting a
     band clears any MIDI or leap source. e23s02: binding a band seeds the
-    input range to 0..1 (the raw band level scale).
+    input range to 0..1 (the raw band level scale). e71s01: any of BAND_SOURCES
+    (2..5) is accepted; band 1 stays the sequencer's beat source, never a
+    Mapper source.
     """
     mapping = find_mapping(mapping_id)
     if mapping is None:
         return
+    if band_id is not None and int(band_id) not in BAND_SOURCES:
+        return  # outside the mappable bands: a no-op, never a half-set source
     mapping["band"] = band_id
     if band_id is not None:
         mapping["midi"] = None
@@ -1428,6 +1680,11 @@ def apply_input_value(mapping_id: int, raw: float) -> float:
     mapping = find_mapping(mapping_id)
     if mapping is None:
         return 0.0
+    if is_momentary_button(mapping):
+        # e77: a momentary button treats a source edge exactly like a click.
+        if not _press_matches(mapping, raw):
+            return float(mapping["value"])  # release / not my press: hold
+        return send_button_mapping(mapping_id)
     if toggle_on_press(mapping):
         if not _press_matches(mapping, raw):
             return float(mapping["value"])  # not my press value: hold

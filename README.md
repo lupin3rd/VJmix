@@ -25,8 +25,8 @@ with release **1.0.0**, download
 [GitHub Releases](https://github.com/lupin3rd/VJmix/releases) page, then:
 
 ```bash
-chmod +x vjmix-1.0.0-x86_64.AppImage
-./vjmix-1.0.0-x86_64.AppImage
+chmod +x vjmix-1.1.0-x86_64.AppImage
+./vjmix-1.1.0-x86_64.AppImage
 ```
 
 ### Where your data lives
@@ -51,8 +51,12 @@ python3.13 -m venv .venv
 
 ## Requirements
 
-- [viOSC](https://github.com/lupin3rd/viosc) (the OSC daemon that bridges VJmix
-  and Vimix)
+- [viOSC](https://github.com/lupin3rd/viosc) **0.8.0+** (the daemon that bridges
+  VJmix and Vimix). From 1.1.0 the link is HTTP-first: `/vimix/*` commands still
+  ride OSC, while the state table arrives as a snapshot (`GET /state`, revision +
+  ETag) plus a delta stream (`GET /events`, Server-Sent Events) and the Mapper
+  declares what it needs with `POST /interest`. An older viOSC keeps working
+  through the deprecated `/viosc/*` lanes.
 - Vimix
 - (optional) a Novation Launchpad MK1/MK2/MK3 for pad control
 

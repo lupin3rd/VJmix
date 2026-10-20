@@ -20,10 +20,10 @@ running in the activation chain (including the running cue itself) is a no-op
 
 from typing import Any
 
-from vjmixapp import catalog, mapper, osc, state
+from vjmixapp import catalog, mapper, osc, shadercode, sourcekind, state
 from vjmixapp.constants import IO_MONITOR_KIND_CUE
 from vjmixapp.osc import osc_client
-from vjmixapp.queues import append_log
+from vjmixapp.queues import append_log, log_warn
 
 _PLAN_SEND = "send"
 _PLAN_ACTIVATE = "activate"
@@ -229,8 +229,32 @@ def _send_property(run: dict[str, Any], payload: dict[str, Any]) -> None:
     (single float payload).
     """
     prop = str(payload["property"])
-    addr = f"/vimix/{run['target_id']}/{prop}"
     ms = payload.get("ms")
+    # e61s05: a uniform row keeps the native ms — the Cue is the ONLY surface allowed
+    # to animate a shader parameter (e36 rule D5).
+    uniform = shadercode.uniform_send(
+        state.shader_uniforms, prop, float(payload.get("value", 0.0)), run["target_id"], ms
+    )
+    if uniform is not None:
+        # e61s06: /uniform on a declared GENERATOR crashes vimix (SPIKE-6). Asked HERE,
+        # once the property is known to be a uniform (BUG-2026-10-11T131042): asked
+        # before, it dropped every Cue row aimed at a target declared a generator and
+        # logged "uniform skipped" for rows that were not uniforms.
+        if shadercode.uniform_blocked(
+            run["target_id"],
+            state.shader_target,
+            state.shader_kind,
+            sourcekind.type_of_source(
+                state.global_vimix_state.get("sources") or {}, run["target_id"]
+            ),
+        ):
+            log_warn("CUE", f"{run['target_id']}: uniform skipped (declared generator, SPIKE-6)")
+            return
+        address, uniform_args = uniform
+        _send_cue(address, list(uniform_args))
+        parts = [a if isinstance(a, str) else f"{float(a):.2f}" for a in uniform_args]
+        return
+    addr = f"/vimix/{run['target_id']}/{prop}"
     if isinstance(payload.get("values"), list):
         args: list[Any] = catalog.compose_send_args(
             prop, values=[float(x) for x in payload["values"]], ms=ms
@@ -244,7 +268,6 @@ def _send_property(run: dict[str, Any], payload: dict[str, Any]) -> None:
     parts = []
     for a in args:
         parts.append("N" if a is None else f"{float(a):.2f}")
-    append_log("OUT", f"{addr} [{', '.join(parts)}]")
 
 
 __all__ = ["build_cue_plan", "cue_is_running", "cue_start", "cue_stop", "tick"]

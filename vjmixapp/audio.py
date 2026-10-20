@@ -320,10 +320,44 @@ def band_rect_drag(
 
 
 def _set_band_variable(band_id: int, value: float) -> None:
-    """Store a band level into its module variable (band1/band2/band3)."""
-    if band_id == 1:
-        state.band1 = value
-    elif band_id == 2:
-        state.band2 = value
-    else:
-        state.band3 = value
+    """Store a band level into its module variable (band1..band5, e71s01).
+
+    Generic on purpose: the previous if/elif/`else` mapped every id beyond 2 to band3,
+    which silently hid a band the operator had enabled.
+    """
+    if int(band_id) in state.bands_enabled:
+        setattr(state, f"band{int(band_id)}", float(value))
+
+
+# --- the capture client's PulseAudio/PipeWire identity (2026-10-14) -------------------
+# The ALSA-pulse plugin (the only Linux capture path PortAudio exposes here) names the
+# node `ALSA plug-in [<exe>]` from /proc/self/exe — the app cannot change that string.
+# libpulse DOES read PULSE_PROP when it connects, and PipeWire lets `node.name` and
+# `node.description` through, so the node an operator sees in qpwgraph/Helvum becomes
+# `VJmix` instead of `ALSA plug-in [python3.13]`. The name and the icon are applied to
+# this process only (the env vars are read at the next connect).
+PULSE_CLIENT_PROPS: dict[str, str] = {
+    "node.name": "vjmix-capture",
+    "node.description": "VJmix",
+    "application.name": "VJmix",
+    "application.process.binary": "VJmix",
+    "application.icon_name": "vjmix",
+    "media.role": "Production",
+}
+
+
+def pulse_client_properties(existing: str | None = None) -> str:
+    """The `PULSE_PROP` value that names our capture client (2026-10-14).
+
+    Values are ONE token each: libpulse splits `PULSE_PROP` on whitespace, so a value
+    with a space would be read as two keys. A key the operator already set in the
+    environment WINS and is preserved (VJmix must not clobber a session-wide tuning).
+    """
+    props: dict[str, str] = {}
+    for token in str(existing or "").split():
+        key, sep, value = token.partition("=")
+        if sep and key and value:
+            props[key] = value
+    for key, value in PULSE_CLIENT_PROPS.items():
+        props.setdefault(key, value)
+    return " ".join(f"{key}={value}" for key, value in props.items())

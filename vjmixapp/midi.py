@@ -70,7 +70,6 @@ from vjmixapp.queues import append_log, log_error
 from vjmixapp.state import (
     _controller_lock,
     midi_controllers,
-    tracks_data,
 )
 
 
@@ -582,17 +581,22 @@ def action_state(action: str, params: dict[str, Any]) -> bool | None:
         name = str(params.get("mode") or "")
         return mode_is_active(name) if name else None
     if action == MIDI_ACTION_SEQ_TOGGLE:
+        index = int(params.get("seq", 0) or 0)
         row = int(params.get("row", -1) or 0)
         col = int(params.get("col", -1) or 0)
         if 0 <= row < NUM_TRACKS and 0 <= col < NUM_STEPS:
-            return bool(state.tracks_data[row]["steps"][col]["active"])
+            step = state.sequencer(index)["tracks"][row]["steps"][col]
+            return bool(step["active"])
         return None
     if action == MIDI_ACTION_TRANSPORT_PLAY:
-        return bool(state.is_playing)
+        # e67s06: the LED state resolves the instance the binding NAMES (default A).
+        return bool(state.sequencer(int(params.get("seq", 0) or 0))["playing"])
     if action in (MIDI_ACTION_SEQ_ROW_ENABLE, MIDI_ACTION_SEQ_ROW_DISABLE):
+        index = int(params.get("seq", 0) or 0)
         row = int(params.get("row", -1) or 0)
         if 0 <= row < NUM_TRACKS:
-            return any(state.tracks_data[row]["steps"][col]["active"] for col in range(NUM_STEPS))
+            steps = state.sequencer(index)["tracks"][row]["steps"]
+            return any(steps[col]["active"] for col in range(NUM_STEPS))
         return None
     return None
 
@@ -1166,7 +1170,13 @@ def midi_init_from_config(cfg: dict[str, Any]) -> None:
             {
                 "port": str(raw["port"]),
                 "profile_id": str(raw.get("profile_id") or ""),
-                "role": "grid" if raw.get("role") == "grid" else None,
+                # e67s03: the legacy "grid" heals to grid_a HERE, so nothing downstream has to
+                # remember that there used to be one role. An unknown value means no grid.
+                "role": (
+                    grid_role(existing)
+                    if (existing := role_sequencer_index(raw.get("role"))) is not None
+                    else None
+                ),
                 "bindings": list(raw.get("bindings") or []),
                 "output": None,
                 "auto_bindings": [],
@@ -1181,7 +1191,7 @@ def _migrate_legacy_controller(midi_cfg: dict[str, Any]) -> list[dict[str, Any]]
     if not port:
         return []
     profile = match_controller_profile(port, controller_profiles())
-    role = "grid" if profile and profile.get("features", {}).get("grid") else None
+    role = grid_role(0) if profile and profile.get("features", {}).get("grid") else None
     return [
         {
             "port": str(port),
@@ -1253,10 +1263,39 @@ def controller_profiles() -> dict[str, dict[str, Any]]:
     return state._controller_profiles
 
 
-def grid_controller() -> dict[str, Any] | None:
-    """The controller designated as the sequencer grid (role 'grid'), or None (e14s02)."""
+def grid_role(index: int) -> str:
+    """The role string that names a sequencer's grid (e67s03): `grid_a` for 0, `grid_b` for 1."""
+    if index == 0:
+        return "grid_a"
+    if index == 1:
+        return "grid_b"
+    raise ValueError(f"sequencer {index!r}: this app offers two (0 and 1)")
+
+
+def role_sequencer_index(role: Any) -> int | None:
+    """Which sequencer a stored role names, or None when it names none (e67s03).
+
+    The legacy value `grid` — every config and project written before e67 — heals to A, which is
+    what makes this change backward compatible rather than a migration: the operator's one device
+    keeps driving the sequencer it always drove.
+    """
+    text = str(role or "")
+    if text == "grid":  # e14s02's value, before there were two
+        return 0
+    if text in ("grid_a", "grid_b"):
+        return 0 if text == "grid_a" else 1
+    return None
+
+
+def grid_controller(index: int = 0) -> dict[str, Any] | None:
+    """The controller bound to THAT sequencer's grid, or None (e14s02, e67s03).
+
+    The default is 0, so every existing caller — the LED mirror, the playhead flash, the auto
+    bindings — keeps addressing the sequencer the app always had.
+    """
+    wanted = grid_role(index)
     for controller in midi_controllers:
-        if controller.get("role") == "grid":
+        if role_sequencer_index(controller.get("role")) == role_sequencer_index(wanted):
             return controller
     return None
 
@@ -1324,9 +1363,20 @@ def _port_brand(port_name: str) -> str | None:
 
 
 def _register_grid_bindings(controller: dict[str, Any], profile: dict[str, Any]) -> None:
-    """Auto 8x8 grid bindings for a grid-role controller; never persisted (e14s02)."""
-    rows = int(profile["grid"]["rows"])
-    cols = int(profile["grid"]["cols"])
+    """Auto grid bindings for ONE sequencer's controller, bounded by ITS LIVE geometry (e67s06).
+
+    The profile says what the DEVICE has (8x8); the live geometry says what THAT sequencer SHOWS.
+    Binding their intersection keeps the two honest — at 4x4 the device accepts 16 pads, so a
+    press can never land on a cell nobody can see. The instance comes from the controller's ROLE,
+    and every binding NAMES it (`seq`), so a pad of B's device cannot toggle a step of A. Never
+    persisted: a geometry change re-registers on the next connect instead of needing a migration.
+    """
+    index = role_sequencer_index(controller.get("role"))
+    if index is None:
+        return
+    record = state.sequencer(index)
+    rows = min(int(profile["grid"]["rows"]), record["rows"])
+    cols = min(int(profile["grid"]["cols"]), record["cols"])
     controller["auto_bindings"] = [
         {
             "device": controller["port"],
@@ -1334,12 +1384,42 @@ def _register_grid_bindings(controller: dict[str, Any], profile: dict[str, Any])
             "type": "note",
             "number": _grid_note(profile, r, c),
             "action": MIDI_ACTION_SEQ_TOGGLE,
-            "params": {"row": r, "col": c},
+            "params": {"row": r, "col": c, "seq": index},
             "auto": True,
         }
         for r in range(rows)
         for c in range(cols)
     ]
+
+
+def reregister_grid_bindings() -> int:
+    """Re-register every grid controller's auto bindings for the LIVE geometry (e66s02).
+
+    Called when the geometry changes: the auto bindings cover the intersection of what the
+    DEVICE has and what the sequencer SHOWS, so a 4x4 grid must stop accepting the pads it
+    stopped drawing. They are never persisted, which is exactly why re-registering is
+    enough and no migration is needed.
+
+    Returns how many controllers were rebound, so a caller (and a test) can tell a real
+    re-registration from a silent no-op.
+
+    BUG-2026-10-16: a controller that has NO grid role (or no grid profile) must end up
+    with NO auto bindings — otherwise a slot that MOVED to another device leaves the old
+    one armed and its pads keep toggling steps nobody sees.
+    """
+    rebound = 0
+    for controller in midi_controllers:
+        profile = controller_profile_of(controller)
+        if (
+            role_sequencer_index(controller.get("role")) is None
+            or profile is None
+            or not profile.get("features", {}).get("grid")
+        ):
+            controller["auto_bindings"] = []
+            continue
+        _register_grid_bindings(controller, profile)
+        rebound += 1
+    return rebound
 
 
 def _mapping_wants_output(port_name: str) -> bool:
@@ -1372,6 +1452,24 @@ def controller_connect(controller: dict[str, Any], mido: Any) -> None:
             return
         with _controller_lock:
             controller["output"] = mido.open_output(out_name)
+        # e80: the MK1 family selects its LAYOUT with a CC (not SysEx), so the device always
+        # speaks the note space the profile and the auto bindings are built on.
+        if leds and profile is not None and profile.get("setup_cc"):
+            # e80: the layout selection of the MK1 family is a CONTROL CHANGE, not SysEx.
+            # Forcing it at connect is what makes the pads speak the note space the
+            # profile (and every auto binding) is built on.
+            setup_cc = profile["setup_cc"]
+            _send_observed(
+                controller["output"],
+                mido.Message(
+                    "control_change", control=int(setup_cc["control"]), value=int(setup_cc["value"])
+                ),
+                str(controller.get("port") or "?"),
+                "cc",
+                int(setup_cc["control"]),
+                int(setup_cc["value"]),
+                "controller setup (layout)",
+            )
         if leds and profile is not None and profile.get("setup_sysex"):
             setup = profile["setup_sysex"]
             _send_observed(
@@ -1386,10 +1484,18 @@ def controller_connect(controller: dict[str, Any], mido: Any) -> None:
         if (
             leds
             and profile is not None
-            and controller.get("role") == "grid"
+            and role_sequencer_index(controller.get("role")) is not None
             and profile.get("features", {}).get("grid")
         ):
             _register_grid_bindings(controller, profile)
+            # e78: say HOW MANY pads are armed. "LEDs work but a press does nothing" is a
+            # data question (0 pads = the role was never projected), and this line answers it.
+            slot = "A" if role_sequencer_index(controller.get("role")) == 0 else "B"
+            append_log(
+                "MIDI",
+                f"{controller.get('port')}: grid {slot} - "
+                f"{len(controller.get('auto_bindings') or [])} pads armed",
+            )
         name = profile.get("name", controller["port"]) if profile else controller["port"]
         append_log("MIDI", f"{name} output on {out_name}")
     except Exception as e:
@@ -1512,7 +1618,7 @@ def send_mapping_midi(
         return False
 
 
-def grid_led(row: int, col: int, color: str) -> None:
+def grid_led(row: int, col: int, color: str, index: int = 0) -> None:
     """Set one grid pad LED on the grid controller (semantic color; best-effort).
 
     The mirror runs only while MIDI is enabled — a disabled engine must never light
@@ -1520,7 +1626,7 @@ def grid_led(row: int, col: int, color: str) -> None:
     """
     if not state.midi_enabled:
         return
-    controller = grid_controller()
+    controller = grid_controller(index)
     if controller is None:
         return
     output = controller.get("output")
@@ -1545,40 +1651,49 @@ def grid_led(row: int, col: int, color: str) -> None:
         log_error("MIDI", f"grid LED ({row},{col}): {e}")
 
 
-def grid_mirror_step(row: int, col: int, is_active: bool, is_head: bool) -> None:
-    """Mirror one step cell on the grid controller (any thread; no-op without one) (e14s02)."""
-    if grid_controller() is None:
+def grid_mirror_step(row: int, col: int, is_active: bool, is_head: bool, index: int = 0) -> None:
+    """Mirror one step cell on THAT sequencer's grid controller (e14s02, e67s03).
+
+    The instance matters: without it, touching a cell of B lit A's Launchpad — a visible effect
+    on the WRONG instrument, the mirror's version of the mouse defect.
+    """
+    if grid_controller(index) is None:
         return
     if is_head:
-        grid_led(row, col, GRID_LED_AMBER)
+        grid_led(row, col, GRID_LED_AMBER, index)
     elif is_active:
-        grid_led(row, col, GRID_LED_GREEN)
+        grid_led(row, col, GRID_LED_GREEN, index)
     else:
-        grid_led(row, col, GRID_LED_OFF)
+        grid_led(row, col, GRID_LED_OFF, index)
 
 
-def grid_flash_playhead() -> None:
-    """White pulse on the current playhead column, restored by a timer (e14s02)."""
-    controller = grid_controller()
-    if controller is None or state.current_step < 0:
+def grid_flash_playhead(index: int = 0) -> None:
+    """White pulse on ONE sequencer's current playhead column, restored by a timer (e67s06).
+
+    The rows come from THAT instance's LIVE geometry, not from the profile: the profile describes
+    what the DEVICE has (8x8), while the grid may be a 4x4 instrument, and flashing eight pads
+    for a four-row sequencer lights four that mean nothing. The device is the one wearing the
+    instance's role, so B's beat flashes B's Launchpad — never A's. The default 0 keeps every
+    existing caller on A.
+    """
+    record = state.sequencer(index)
+    controller = grid_controller(index)
+    if controller is None or record["step"] < 0:
         return
-    profile = controller_profile_of(controller) or {}
-    rows = int(profile.get("grid", {}).get("rows", 8))
-    for r in range(rows):
-        grid_led(r, state.current_step, GRID_LED_WHITE)
-    threading.Timer(GRID_FLASH_SECONDS, _grid_restore_playhead).start()
+    for r in range(record["rows"]):
+        grid_led(r, record["step"], GRID_LED_WHITE, index)
+    threading.Timer(GRID_FLASH_SECONDS, _grid_restore_playhead, args=(index,)).start()
 
 
-def _grid_restore_playhead() -> None:
-    """Timer thread: re-apply the playhead amber after a beat flash (e14s02)."""
-    controller = grid_controller()
-    if controller is None or state.current_step < 0:
+def _grid_restore_playhead(index: int = 0) -> None:
+    """Timer thread: re-apply ONE instance's playhead amber after a beat flash (e67s06)."""
+    record = state.sequencer(index)
+    controller = grid_controller(index)
+    if controller is None or record["step"] < 0:
         return
-    profile = controller_profile_of(controller) or {}
-    rows = int(profile.get("grid", {}).get("rows", 8))
-    for r in range(rows):
-        active = tracks_data[r]["steps"][state.current_step]["active"]
-        grid_mirror_step(r, state.current_step, active, True)
+    for r in range(record["rows"]):
+        active = record["tracks"][r]["steps"][record["step"]]["active"]
+        grid_mirror_step(r, record["step"], active, True, index)
 
 
 def _clock_port_name() -> str | None:

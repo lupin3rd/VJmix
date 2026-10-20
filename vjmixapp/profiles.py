@@ -50,6 +50,12 @@ DEFAULT_PROFILES: dict[str, dict[str, Any]] = {
         # Official Programmers Reference (normal use, Flags=12): 16*Green+Red+12.
         "colors": {"off": 12, "red": 15, "amber": 63, "white": 62, "green": 60},
         "setup_sysex": None,
+        # The MK1/S/Mini selects its LAYOUT with CC 0 (Programmer's Reference, p.7):
+        # 1 = X-Y (the layout this profile's `row*16+col` describes), 2 = Drum rack.
+        # Sent at connect so the device is ALWAYS in the layout the bindings assume: a
+        # unit left in Drum rack answers presses with notes the app cannot match, and
+        # nothing in the app could tell that apart from a dead device.
+        "setup_cc": {"control": 0, "value": 1},
         "features": {"grid": True, "leds": True, "clock": False},
     },
     "launchpad_mk2": {
@@ -108,6 +114,7 @@ def _sanitize_profile(raw: Any) -> dict[str, Any]:
         "grid": {"rows": 8, "cols": 8, "note": _DEFAULT_GRID_NOTE_FORMULA},
         "colors": dict(_DEFAULT_PROFILE_COLORS),
         "setup_sysex": None,
+        "setup_cc": None,
         "features": {"grid": False, "leds": False, "clock": False},
         "feedback": None,
     }
@@ -131,6 +138,12 @@ def _sanitize_profile(raw: Any) -> dict[str, Any]:
     sysex = raw.get("setup_sysex")
     if isinstance(sysex, list) and all(isinstance(b, int) and 0 <= b <= 127 for b in sysex):
         profile["setup_sysex"] = [int(b) for b in sysex]
+    setup_cc = raw.get("setup_cc")
+    if isinstance(setup_cc, dict):
+        control = _to_int(setup_cc.get("control"), -1)
+        value = _to_int(setup_cc.get("value"), -1)
+        if 0 <= control <= 127 and 0 <= value <= 127:
+            profile["setup_cc"] = {"control": control, "value": value}
     features = raw.get("features")
     if isinstance(features, dict):
         for flag in profile["features"]:
