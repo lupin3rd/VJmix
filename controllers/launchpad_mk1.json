@@ -1,11 +1,31 @@
 {
   "id": "launchpad_mk1",
   "name": "Novation Launchpad MK1 / S / Mini",
-  "match": ["launchpad"],
+  "match": [
+    "launchpad"
+  ],
   "priority": 10,
   "protocol": "mk1",
-  "grid": {"rows": 8, "cols": 8, "note": "row*16+col"},
-  "colors": {"off": 12, "red": 15, "amber": 63, "white": 62, "green": 60},
+  "grid": {
+    "rows": 8,
+    "cols": 8,
+    "note": "row*16+col"
+  },
+  "colors": {
+    "off": 12,
+    "red": 15,
+    "amber": 63,
+    "white": 62,
+    "green": 60
+  },
   "setup_sysex": null,
-  "features": {"grid": true, "leds": true, "clock": false}
+  "features": {
+    "grid": true,
+    "leds": true,
+    "clock": false
+  },
+  "setup_cc": {
+    "control": 0,
+    "value": 1
+  }
 }

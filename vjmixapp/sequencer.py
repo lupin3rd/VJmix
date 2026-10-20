@@ -9,7 +9,8 @@ import random
 import time
 from typing import Any
 
-from vjmixapp import catalog, osc, state, textplay
+from vjmixapp import catalog, osc, shadercode, sourcekind, state, textplay
+from vjmixapp.colorscale import dpg_color_rgba  # e61: never the GUI module (HIGH-1)
 from vjmixapp.constants import (
     BEAT_SOURCE_BAND1,
     BEAT_SOURCE_MANUAL,
@@ -17,10 +18,10 @@ from vjmixapp.constants import (
     BPM_DETECTION_STALE_SECONDS,
     IO_MONITOR_KIND_FADE,
     IO_MONITOR_KIND_SEQUENCER,
+    SEQ_MAX_ROWS,
 )
 from vjmixapp.osc import osc_client
-from vjmixapp.palette import dpg_color_rgba
-from vjmixapp.queues import append_log, enqueue_set_value
+from vjmixapp.queues import enqueue_set_value
 
 
 def _send(address: str, args: Any) -> None:
@@ -65,7 +66,6 @@ def advance_fade(fade: dict[str, Any], now: float) -> bool:
     index = min(expected_index, total_msgs - 1)
     value = fade_message_value(fade, index)
     _send_fade(fade["address"], value)
-    append_log("OUT", f"{fade['address']} [FADE: {value:.2f}]")
     fade["last_msg_index"] = index
     if index >= total_msgs - 1:
         fade["active"] = False
@@ -77,10 +77,9 @@ def send_colorv_step(track: dict[str, Any], row: int, col: int) -> None:
     target_addr = f"{track['base_address']}/color"
     r_val, g_val, b_val = [float(c) for c in track["steps"][col]["color"]]
     _send(target_addr, [r_val, g_val, b_val])
-    append_log("OUT", f"{target_addr} [{r_val:.2f}, {g_val:.2f}, {b_val:.2f}]")
 
 
-def send_colorr_step(track: dict[str, Any], row: int, col: int) -> None:
+def send_colorr_step(track: dict[str, Any], row: int, col: int, tag_prefix: str = "seq") -> None:
     """Send a random RGB for a ColorR step and show it in the step's color square."""
     target_addr = f"{track['base_address']}/color"
     r_val, g_val, b_val = (
@@ -89,24 +88,22 @@ def send_colorr_step(track: dict[str, Any], row: int, col: int) -> None:
         random.uniform(0.0, 1.0),
     )
     _send(target_addr, [r_val, g_val, b_val])
-    append_log("OUT", f"{target_addr} [{r_val:.2f}, {g_val:.2f}, {b_val:.2f}]")
 
     step_data = track["steps"][col]
     step_data["last_rand_color"] = [r_val, g_val, b_val]
-    tag_color = f"rand_color_{row}_{col}"
+    tag_color = f"{tag_prefix}_rand_color_{row}_{col}"
     enqueue_set_value(tag_color, dpg_color_rgba(step_data["last_rand_color"]))
 
 
-def send_seekr_step(track: dict[str, Any], row: int, col: int) -> None:
+def send_seekr_step(track: dict[str, Any], row: int, col: int, tag_prefix: str = "seq") -> None:
     """Send a random seek (0..1) for a SeekR step and show the value in the cell."""
     target_addr = f"{track['base_address']}/seek"
     rand_val = random.uniform(0.0, 1.0)
     _send(target_addr, float(rand_val))
-    append_log("OUT", f"{target_addr} [{rand_val:.2f}]")
 
     step_data = track["steps"][col]
     step_data["last_rand_seek"] = rand_val
-    tag_seek = f"rand_seek_{row}_{col}"
+    tag_seek = f"{tag_prefix}_rand_seek_{row}_{col}"
     enqueue_set_value(tag_seek, f"{rand_val:.2f}")
 
 
@@ -130,6 +127,56 @@ def beat_is_event_driven() -> bool:
     return state.beat_source in (BEAT_SOURCE_BAND1, BEAT_SOURCE_MIDI)
 
 
+def fire_step(
+    tracks: list[dict[str, Any]],
+    row: int,
+    column: int,
+    beat_seconds: float | None = None,
+    tag_prefix: str = "seq",
+) -> None:
+    """Fire ONE row's active step for one beat (e67s01, worker-safe).
+
+    Extracted from `sequencer_tick` so the beat's DECISION is testable without the worker thread,
+    and so a pluralised runtime can hand it ONE instance's tracks and the row it means instead of
+    reading the globals — the parameters are exactly what a second sequencer changes.
+
+    The tick's own rules move with it, word for word: a new active step cancels a fade that is
+    still running (audit HIGH-2), and a failing send is REPORTED rather than allowed to kill the
+    worker (the worker defensive posture). A disarmed step, or a row outside the live geometry,
+    is a silent no-op — a geometry is a display state, and e66's own acceptance says an
+    out-of-geometry binding must be inert rather than fatal.
+    """
+    if row < 0 or row >= len(tracks):
+        return
+    step_data = tracks[row]["steps"][column]
+    if not step_data["active"]:
+        return
+    tracks[row]["active_fade"]["active"] = False
+    try:
+        # e36s04: the property+mode engine replaces the hard-coded AlphaV/AlphaR/AlphaF/
+        # ColorV/ColorR/SeekR if/elif chain
+        execute_step(tracks[row], row, column, beat_seconds, tag_prefix)
+    except Exception as e:
+        print(f"[VJmix OSC Error] {e}")
+
+
+def next_beat(step: int, rows: int, cols: int) -> tuple[int, tuple[int, ...]]:
+    """The next live column and the row indices in play (e66s01, pure, worker-safe).
+
+    The two places the LIVE geometry enters the tick. Extracted because the tick runs on
+    a worker thread and cannot be unit-tested: without this seam, "a 4x4 sequencer fires
+    four columns and four rows" would be a claim nobody can run.
+
+    The column wraps at ``cols`` (never at the cap), so shrinking the grid cannot leave
+    the playhead pointing at a column that is not drawn. The rows in play are the first
+    ``rows`` of the tag space, capped by ``SEQ_MAX_ROWS``, so no geometry can ask for a
+    row the grid never built. A step armed outside the returned rows is not visited —
+    the geometry is a DISPLAY state, never a storage one — and firing nothing is the
+    correct outcome, not an error.
+    """
+    return (step + 1) % cols, tuple(range(min(rows, SEQ_MAX_ROWS)))
+
+
 # ==============================================================================
 # e36s04: canonical (property, mode) step tokens + the per-beat step engine.
 # A step type is `Prop + mode-letter`: V value, R random, F fade (client-side
@@ -140,6 +187,11 @@ def beat_is_event_driven() -> bool:
 # ==============================================================================
 
 _MODE_SUFFIX = {"V": "value", "R": "random", "F": "fade", "X": "fire", "C": "cycle"}
+# e61s05: a uniform step's token carries the full property key (which contains a
+# ':' and a name), so it cannot use the legacy "<Prop><Mode>" shape: it is
+# "Uniform<Mode>|<property>", and the legacy parser keeps working untouched.
+UNIFORM_TOKEN_PREFIX = "Uniform"
+UNIFORM_TOKEN_SEPARATOR = "|"
 _MODE_LABELS = {
     "value": "Value",
     "random": "Random",
@@ -157,7 +209,13 @@ def _mode_letter(mode: str) -> str:
 
 
 def step_token(prop: str, mode: str) -> str:
-    """Canonical persisted type token of (property, mode), e.g. 'SpeedF', 'PlayX'."""
+    """Canonical persisted type token of (property, mode), e.g. 'SpeedF', 'PlayX'.
+
+    e61s05: a uniform property is dynamic (its key is `uniform:<name>`), so its
+    token carries the whole key after a separator the legacy shape cannot contain.
+    """
+    if catalog.parse_uniform_slot(prop) is not None:
+        return f"{UNIFORM_TOKEN_PREFIX}{_mode_letter(mode)}{UNIFORM_TOKEN_SEPARATOR}{prop}"
     return prop[0].upper() + prop[1:] + _mode_letter(mode)
 
 
@@ -165,6 +223,13 @@ def parse_step_token(token: str) -> tuple[str, str] | None:
     """(property, mode) of a step type token; None for NONE or garbage tokens."""
     if not token or token == "NONE" or len(token) < 2:
         return None
+    if token.startswith(UNIFORM_TOKEN_PREFIX) and UNIFORM_TOKEN_SEPARATOR in token:
+        body, _sep, prop = token.partition(UNIFORM_TOKEN_SEPARATOR)
+        letter = body[len(UNIFORM_TOKEN_PREFIX) :]
+        mode = _MODE_SUFFIX.get(letter)
+        if mode is None or catalog.parse_uniform_slot(prop) is None:
+            return None
+        return prop, mode
     mode = _MODE_SUFFIX.get(token[-1])
     prop = token[:-1].lower()
     if mode is None or prop not in catalog.PROPERTY_CATALOG:
@@ -184,6 +249,10 @@ def step_modes_for(prop: str) -> list[str]:
     ``flag`` is the exception: it carries a target id (-1 = next), so it is a
     VALUE step (token ``FlagV``), never a bare fire (e36s07 user decision).
     """
+    if catalog.parse_uniform_slot(prop) is not None:
+        # a shader uniform is a scalar the operator maps to a beat: no fade (its
+        # envelope would need a per-beat ramp the Mapper/Cue own, not the step)
+        return ["value", "random"]
     family = catalog.family_of(prop)
     if family == catalog.FAMILY_SET_SCALAR:
         modes = ["value", "random"]
@@ -221,7 +290,9 @@ def more_step_offerings() -> list[dict[str, Any]]:
     lists. Each entry: {prop, label, modes: [(mode, token, menu_label), ...]}.
     """
     offerings: list[dict[str, Any]] = []
-    for prop, entry in catalog.PROPERTY_CATALOG.items():
+    entries = dict(catalog.PROPERTY_CATALOG)
+    entries.update(shadercode.uniform_entries(state.shader_uniforms))  # e61s05
+    for prop, entry in entries.items():
         modes = [m for m in step_modes_for(prop) if not step_modes_covered_by_legacy(prop, m)]
         if not modes:
             continue
@@ -241,8 +312,27 @@ def _component_bounds(prop: str) -> tuple[float, float]:
     return float(comp["min"]), float(comp["max"])
 
 
-def _rand_tag(row: int, col: int) -> str:
-    return f"rand_v1_{row}_{col}"
+def _uniform_bounds(target: str, prop: str) -> tuple[float, float] | None:
+    """The range of a uniform step on ITS OWN row's source, or None when absent.
+
+    e70s01: the property is a SLOT, so the row is resolved on the target's own
+    registry (the same slot is a different uniform on two sources) — and a slot the
+    shader does not have is a silent no-op rather than a guessed range.
+    """
+    row = shadercode.registry_row(state.shader_uniforms, target, prop)
+    if row is None:
+        return None
+    return shadercode.effective_range(row)
+
+
+def _rand_tag(row: int, col: int, tag_prefix: str = "seq") -> str:
+    """The display tag of a random step's value, in ITS sequencer's namespace (e67).
+
+    `seq` is A's prefix and the default: the tags are namespaced so two grids cannot share an alias,
+    and a WORKER that composed the bare name would update a tag that is no longer built — the random
+    values stopped appearing in the cells (the operator's report, 2026-10-12).
+    """
+    return f"{tag_prefix}_rand_v1_{row}_{col}"
 
 
 # ==============================================================================
@@ -280,12 +370,14 @@ def execute_text_step(track: dict[str, Any], base_address: str, mode: str) -> No
     cursors[mode] = index + 1
     address = f"{base_address}/contents"
     _send(address, fragment)
-    preview = fragment.replace("\n", "\\n")
-    append_log("OUT", f"{address} [{preview[:48]}]")
 
 
 def execute_step(
-    track: dict[str, Any], row: int, col: int, beat_seconds: float | None = None
+    track: dict[str, Any],
+    row: int,
+    col: int,
+    beat_seconds: float | None = None,
+    tag_prefix: str = "seq",
 ) -> None:
     """Fire one active step on the beat (e36s04; HIGH-1 worker-safe).
 
@@ -323,10 +415,38 @@ def execute_step(
         if mode == "value":
             send_colorv_step(track, row, col)
         else:
-            send_colorr_step(track, row, col)
+            send_colorr_step(track, row, col, tag_prefix)
         return
     if prop == "seek" and mode == "random":
-        send_seekr_step(track, row, col)
+        send_seekr_step(track, row, col, tag_prefix)
+        return
+
+    # e61s05 / e70s01: a uniform step drives its ROW's source, by SLOT
+    uniform_target = str(track.get("target_id") or "")
+    if catalog.parse_uniform_slot(prop) is not None:
+        if shadercode.uniform_blocked(
+            uniform_target,
+            state.shader_target,
+            state.shader_kind,
+            sourcekind.type_of_source(
+                state.global_vimix_state.get("sources") or {}, uniform_target
+            ),
+        ):
+            return  # e61s06: never /uniform a declared generator (SPIKE-6: it crashes)
+        bounds = _uniform_bounds(uniform_target, prop)
+        if bounds is None:
+            return  # the slot has no live uniform on the row's source: nothing to drive
+        lo, hi = bounds
+        if mode == "value":
+            value = max(lo, min(hi, float(step_data.get("v1") or 0.0)))
+        else:
+            value = random.uniform(lo, hi)
+            step_data["last_rand_v1"] = value
+            enqueue_set_value(_rand_tag(row, col, tag_prefix), f"{value:.2f}")
+        message = shadercode.uniform_send(state.shader_uniforms, prop, value, uniform_target)
+        if message is None:
+            return
+        _send(message[0], message[1])
         return
 
     target_addr = f"{base_addr}/{prop}"
@@ -340,18 +460,15 @@ def execute_step(
             value = float(raw) if raw is not None else -1.0
             flag_id = float(round(max(lo, min(hi, value))))
             _send(target_addr, flag_id)
-            append_log("OUT", f"{target_addr} [{flag_id:.0f}]")
         else:
             val = max(lo, min(hi, float(raw or 0.0)))
             _send(target_addr, float(val))
-            append_log("OUT", f"{target_addr} [{val:.2f}]")
 
     elif mode == "random":
         rand_val = random.uniform(lo, hi)
         _send(target_addr, float(rand_val))
-        append_log("OUT", f"{target_addr} [{rand_val:.2f}]")
         step_data["last_rand_v1"] = rand_val
-        enqueue_set_value(_rand_tag(row, col), f"{rand_val:.2f}")
+        enqueue_set_value(_rand_tag(row, col, tag_prefix), f"{rand_val:.2f}")
 
     elif mode == "fade":
         total_msgs = int(step_data.get("frames") or 4) * int(step_data.get("msgs") or 1)
@@ -374,17 +491,14 @@ def execute_step(
             "last_msg_index": 0,
         }
         _send(target_addr, float(start_val))
-        append_log("OUT", f"{target_addr} [FADE START: {start_val:.2f}]")
 
     elif mode == "fire":
         family = catalog.family_of(prop)
         if family == catalog.FAMILY_TOGGLE:
             val = max(0.0, min(1.0, float(step_data.get("v1") or 0.0)))
             _send(target_addr, float(val))
-            append_log("OUT", f"{target_addr} [{val:.2f}]")
         else:  # trigger: replay/reset/reload no-arg
             _send(target_addr, [])
-            append_log("OUT", f"{target_addr} (fire)")
 
     elif mode == "cycle":
         options = catalog.PROPERTY_CATALOG[prop].get("options") or []
@@ -394,5 +508,4 @@ def execute_step(
         index = (last + 1) % count
         step_data["last_idx"] = index
         _send(target_addr, float(index))
-        append_log("OUT", f"{target_addr} [{index}.00]")
-        enqueue_set_value(_rand_tag(row, col), f"{index}")
+        enqueue_set_value(_rand_tag(row, col, tag_prefix), f"{index}")

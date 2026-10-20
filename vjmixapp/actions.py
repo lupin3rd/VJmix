@@ -50,11 +50,18 @@ from vjmixapp.constants import (
     MIDI_ACTION_SEQ_ROW_DISABLE,
     MIDI_ACTION_SEQ_ROW_ENABLE,
     MIDI_ACTION_SEQ_TOGGLE,
+    MIDI_ACTION_SET_BLENDING,
     MIDI_ACTION_SET_CURRENT,
+    MIDI_ACTION_SHADER_BYPASS,
+    MIDI_ACTION_SHADER_LOAD,
+    MIDI_ACTION_SHADER_SAVE,
+    MIDI_ACTION_SHADER_SEND,
+    MIDI_ACTION_SHADER_WINDOW_TOGGLE,
     MIDI_ACTION_SHOW_WINDOW,
     MIDI_ACTION_SOURCE_NEXT,
     MIDI_ACTION_SOURCE_PREV,
     MIDI_ACTION_SOURCE_STEP,
+    MIDI_ACTION_SOURCES_DATA_REFRESH,
     MIDI_ACTION_TEXT_CLEAR,
     MIDI_ACTION_TEXT_LINE,
     MIDI_ACTION_TEXT_LINE_PLUS,
@@ -93,6 +100,8 @@ CATEGORY_FILES = "files"
 
 # e59s02: Text window actions (toggle the window, send the document).
 CATEGORY_TEXT = "text"
+# e61s03: the Shader window — authors a GLSL asset and deploys its FILE PATH.
+CATEGORY_SHADER = "shader"
 
 # e33s05: global actions (window show + project new/open/save).
 CATEGORY_GLOBAL = "global"
@@ -225,6 +234,21 @@ ACTION_SPECS: dict[str, ActionSpec] = {
         CATEGORY_MEDIAGRID,
         KIND_MOMENTARY,
     ),
+    # e74s13: the blending of the SELECTED source, by enum index (0..7, the wiki's
+    # `blending` table); the tile menu is the mouse surface of the same message.
+    MIDI_ACTION_SET_BLENDING: ActionSpec(
+        MIDI_ACTION_SET_BLENDING,
+        "Set blending",
+        CATEGORY_MEDIAGRID,
+        KIND_MOMENTARY,
+    ),
+    # e82s08: one-shot sweep of every readable property (the Sources-data button).
+    MIDI_ACTION_SOURCES_DATA_REFRESH: ActionSpec(
+        MIDI_ACTION_SOURCES_DATA_REFRESH,
+        "Refresh sources data",
+        CATEGORY_MEDIAGRID,
+        KIND_MOMENTARY,
+    ),
     MIDI_ACTION_IO_MONITOR_TOGGLE: ActionSpec(
         MIDI_ACTION_IO_MONITOR_TOGGLE, "I/O Monitor window", CATEGORY_MONITOR, KIND_MOMENTARY
     ),
@@ -238,7 +262,7 @@ ACTION_SPECS: dict[str, ActionSpec] = {
         MIDI_ACTION_PAIRING_PROMPT, "Pair with viOSC", CATEGORY_SETTINGS, KIND_MOMENTARY
     ),
     MIDI_ACTION_FILE_MANAGER_TOGGLE: ActionSpec(
-        MIDI_ACTION_FILE_MANAGER_TOGGLE, "File Manager window", CATEGORY_FILES, KIND_MOMENTARY
+        MIDI_ACTION_FILE_MANAGER_TOGGLE, "Sessions Manager window", CATEGORY_FILES, KIND_MOMENTARY
     ),
     MIDI_ACTION_DRAFT_LOAD: ActionSpec(
         MIDI_ACTION_DRAFT_LOAD, "Send draft to Vimix", CATEGORY_FILES, KIND_MOMENTARY
@@ -274,6 +298,21 @@ ACTION_SPECS: dict[str, ActionSpec] = {
     ),
     MIDI_ACTION_TEXT_CLEAR: ActionSpec(
         MIDI_ACTION_TEXT_CLEAR, "Clear text source", CATEGORY_TEXT, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_SHADER_WINDOW_TOGGLE: ActionSpec(
+        MIDI_ACTION_SHADER_WINDOW_TOGGLE, "Shader window", CATEGORY_SHADER, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_SHADER_SEND: ActionSpec(
+        MIDI_ACTION_SHADER_SEND, "Deploy shader to source", CATEGORY_SHADER, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_SHADER_LOAD: ActionSpec(
+        MIDI_ACTION_SHADER_LOAD, "Load shader asset", CATEGORY_SHADER, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_SHADER_SAVE: ActionSpec(
+        MIDI_ACTION_SHADER_SAVE, "Save shader asset", CATEGORY_SHADER, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_SHADER_BYPASS: ActionSpec(
+        MIDI_ACTION_SHADER_BYPASS, "Bypass shader effect", CATEGORY_SHADER, KIND_MOMENTARY
     ),
     MIDI_ACTION_TEXT_WORD: ActionSpec(
         MIDI_ACTION_TEXT_WORD, "Text: 1 word", CATEGORY_TEXT, KIND_MOMENTARY

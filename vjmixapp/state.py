@@ -13,7 +13,7 @@ mutations through ``state.ui_task_queue`` — they never import dpg.
 import copy
 import queue
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, MutableMapping
 from typing import Any
 
 import numpy as np
@@ -24,6 +24,10 @@ from vjmixapp.constants import (
     DEFAULT_PALETTE,
     NUM_STEPS,
     NUM_TRACKS,
+    SEQ_MAX_COLS,
+    SEQ_MAX_ROWS,
+    SEQ_ZOOM_DEFAULT,
+    SHADER_KIND_DEFAULT,
     SPECTRUM_BARS,
 )
 from vjmixapp.textplay import DEFAULT_REVEAL_MODE
@@ -59,6 +63,21 @@ midi_selected_port: str | None = None  # e14s03: port whose bindings the Binding
 
 
 midi_clock_source: str | None = None  # e14s04: MIDI clock input (None = first available)
+
+
+# e76: hover help is a display preference (config `ui.hover_help`), not project content.
+hover_help: bool = True
+
+
+# e81: the Logs window's own view state — a LEVEL filter (None = all) and PAUSE, which
+# freezes the VIEW without losing lines (the history keeps filling).
+log_level_filter: str | None = None
+log_paused: bool = False
+
+
+# e77: the per-mapping token of the momentary button flash — a newer press supersedes the
+# timer of an older one, so a stale release can never turn off a fresh press.
+mapper_button_flash_token: dict[int, int] = {}
 
 
 _theme_color_bindings: dict[Any, str] = {}
@@ -211,6 +230,22 @@ osc_log_history: list[str] = []
 current_step: int = -1
 
 
+# e66s01: the LIVE geometry, beside the scalars the codebase already keeps. 8 is both
+# the cap and the default, so a fresh grid is the cap and `sanitize_geometry` has one
+# value to heal to. They are scalars, not a record, because nothing today iterates a
+# list of sequencers: e67 pluralises them when it needs N of them.
+seq_rows: int = SEQ_MAX_ROWS
+
+
+seq_cols: int = SEQ_MAX_COLS
+
+
+# e66s03: the CELL size of the grid (px), one of `SEQ_ZOOM_LEVELS`. App-level, not project
+# content: opening a project must not resize the operator's cells, so it lives here and in
+# the config file, and never in the project document.
+seq_zoom: int = SEQ_ZOOM_DEFAULT
+
+
 is_playing: bool = False
 
 
@@ -235,7 +270,7 @@ midi_pulses: int = 0  # running MIDI clock pulse count (worker thread)
 tap_times: list[float] = []  # TAP timestamps for the manual BPM mode
 
 
-band_prev_values: dict[int, float] = {1: 0.0, 2: 0.0, 3: 0.0}  # band rising-edge tracking
+band_prev_values: dict[int, float] = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0, 5: 0.0}  # rising edges
 
 
 copied_step_data: dict[str, Any] | None = None  # step config copied for paste (e08)
@@ -244,7 +279,7 @@ copied_step_data: dict[str, Any] | None = None  # step config copied for paste (
 active_step: tuple[int, int] | None = None  # last touched step (keyboard shortcuts target)
 
 
-copied_step_pos: tuple[int, int] | None = None  # where the copied highlight is shown
+copied_step_pos: tuple[int, int, int] | None = None  # (instance, row, col) of the highlight
 
 
 def _pristine_step() -> dict[str, Any]:
@@ -285,6 +320,226 @@ def _pristine_track() -> dict[str, Any]:
 
 tracks_data: list[dict[str, Any]] = [_pristine_track() for _ in range(NUM_TRACKS)]
 
+# ==============================================================================
+# e67s01: THE PLURAL RUNTIME — up to TWO sequencers, behind ONE uniform record.
+#
+# Instance 0 IS the sequencer the app has always had, and its storage stays the module globals
+# below (`current_step`, `is_playing`, `beat_source`, `tracks_data`, `seq_rows`, `seq_cols`,
+# `seq_zoom`, `phase_nudge`): `sequencer(0)` is a LIVE VIEW over them, not a copy, so there is
+# exactly ONE home per value and nothing can diverge — the trap REFACTOR_LATEST warns about.
+# Instance 1 (the second sequencer, B) is a plain record created on demand.
+#
+# Why a view and not a migration of the 242 sites that read those globals: the uniform record is
+# what a second sequencer NEEDS (one tick, one builder and one MIDI resolver serve both), and a
+# view delivers it with no rewrite and no window in which the runtime is half-migrated. The cost
+# is asymmetry — A lives in the module, B in a dict — and it is stated here rather than hidden.
+# ==============================================================================
+SECOND_SEQUENCER_INDEX = 1
+SEQUENCER_RECORD_KEYS: tuple[str, ...] = (
+    "rows",
+    "cols",
+    "zoom",
+    "step",
+    "playing",
+    "beat_source",
+    "tracks",
+    "nudge",
+    "bpm",
+)
+# The globals that ARE instance 0's storage, one entry per record key.
+_INSTANCE_A_BY_KEY: dict[str, str] = {
+    "rows": "seq_rows",
+    "cols": "seq_cols",
+    "zoom": "seq_zoom",
+    "step": "current_step",
+    "playing": "is_playing",
+    "beat_source": "beat_source",
+    "tracks": "tracks_data",
+    "nudge": "phase_nudge",
+    # e67: A's MANUAL bpm has always lived in `current_bpm` (the manual widget and the analyser
+    # share it because there was one sequencer). The record names it `bpm` so B can have its own,
+    # and `_sequencer_interval` reads it only in MANUAL mode — which stops B on Analysis from
+    # being driven by the number A typed.
+    "bpm": "current_bpm",
+}
+
+
+class _InstanceAView(MutableMapping):
+    """Instance 0's record as a LIVE view over the module globals (e67s01).
+
+    Reads and writes go straight to the globals, so `sequencer(0)["step"]` and
+    `state.current_step` are the same value in the same place. A `MutableMapping` because the
+    callers that serve both instances use one shape: subscript reads and writes.
+    """
+
+    def __getitem__(self, key: str) -> Any:
+        return globals()[_INSTANCE_A_BY_KEY[key]]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        globals()[_INSTANCE_A_BY_KEY[key]] = value
+
+    def __delitem__(self, key: str) -> None:
+        raise TypeError("a sequencer record cannot drop a key: the app reads all of them")
+
+    def __iter__(self):
+        return iter(SEQUENCER_RECORD_KEYS)
+
+    def __len__(self) -> int:
+        return len(SEQUENCER_RECORD_KEYS)
+
+
+_instances: list[Any] = []  # built lazily so the view sees the globals, not a snapshot of them
+
+
+def _new_second_sequencer() -> dict[str, Any]:
+    """The record of B, a fresh instrument: the cap geometry, the default level, no playhead."""
+    return {
+        "rows": SEQ_MAX_ROWS,
+        "cols": SEQ_MAX_COLS,
+        "zoom": SEQ_ZOOM_DEFAULT,
+        "step": -1,
+        "playing": False,
+        "beat_source": BEAT_SOURCE_ANALYSIS,
+        "tracks": [_pristine_track() for _ in range(NUM_TRACKS)],
+        "nudge": 0.0,
+        "bpm": DEFAULT_MANUAL_BPM,
+    }
+
+
+def sequencer(index: int = 0):
+    """The record of ONE sequencer, the same shape for both (e67s01).
+
+    At most two exist: index 0 is the app's original sequencer (a live view over the module
+    globals) and index 1 is the second one, created on first use. Anything else is REFUSED — the
+    product offers two, and a caller that asks for a third has a bug worth hearing about.
+    """
+    if index < 0 or index > SECOND_SEQUENCER_INDEX:
+        raise ValueError(
+            f"sequencer index {index!r}: this app holds at most "
+            f"{SECOND_SEQUENCER_INDEX + 1} sequencers (0 and 1)"
+        )
+    while len(_instances) <= index:
+        _instances.append(_InstanceAView() if not _instances else _new_second_sequencer())
+    return _instances[index]
+
+
+def sequencer_count() -> int:
+    """How many sequencers exist: 1 until B is asked for is not the same as 1 slot used.
+
+    The record list is built lazily, so this reports what has been ASKED for, which is what the
+    delete path and the menu icons need: A always exists (the app boots into it), B only after
+    `sequencer(1)` or `build_sequencer(..., index=1)`.
+    """
+    return max(1, len(_instances))
+
+
+def drop_second_sequencer() -> None:
+    """Forget B entirely (the in-window delete, e67s02). A cannot be dropped: the app needs one."""
+    del _instances[1:]
+    forget_sequencer_created(1)
+
+
+# e67s05: which slots hold a sequencer the operator MADE — a project's record applied, or the
+# creation dialog's Create. A's record VIEW always exists, so slot 0 needs this separate bit:
+# without it there is no way to tell "A has never been made" from "A is the app's default 8x8".
+_created_slots: set[int] = set()
+
+
+def mark_sequencer_created(index: int) -> None:
+    """Record that a slot's sequencer was CREATED (e67s05): a project's record or the dialog."""
+    _created_slots.add(index)
+
+
+def forget_sequencer_created(index: int) -> None:
+    """That slot is empty again (the delete, e67s05)."""
+    _created_slots.discard(index)
+
+
+def sequencer_is_created(index: int) -> bool:
+    """Whether that slot's sequencer was MADE — without creating anything (e67s05)."""
+    return index in _created_slots
+
+
+def needs_creation(index: int) -> bool:
+    """True while that slot has no sequencer to open, so the FIRST opening must ask (e67s05).
+
+    On an empty start BOTH slots are empty: A is no longer built by the boot, exactly as B never
+    was. A project that carries a record, or the dialog's Create, is what fills a slot.
+    """
+    return not sequencer_is_created(index)
+
+
+def sequencer_exists(index: int) -> bool:
+    """Whether a sequencer occupies that slot — WITHOUT creating it (e67s02).
+
+    A always exists (the app boots into it). Asking about B must not bring B into existence, or
+    the menu's create-or-open icons could no longer tell an empty slot from a full one: the
+    question itself would fill the slot.
+    """
+    if index == 0:
+        return True
+    if index != SECOND_SEQUENCER_INDEX:
+        raise ValueError(f"sequencer slot {index!r}: this app offers slots 0 and 1")
+    return len(_instances) > index
+
+
+_pending_delete: int | None = None
+
+
+def request_sequencer_delete(index: int) -> int | None:
+    """FIRST half of the in-window delete: remember WHICH sequencer, and change NOTHING.
+
+    The operator's decision is that the delete asks for confirmation, so this is the asking: it
+    arms a pending deletion and the caller draws the dialog. It returns the armed slot, or None
+    when there is nothing legitimate to delete — an empty slot has nothing to remove.
+
+    e68: slot 0 is deletable too. The operator deletes A to recreate it at another shape (the
+    shape is chosen at CREATION and then stays), and e66 already made ZERO a legal state.
+    """
+    global _pending_delete
+    if not sequencer_exists(index):
+        _pending_delete = None
+        return None
+    _pending_delete = index
+    return index
+
+
+def confirm_sequencer_delete(index: int) -> bool:
+    """SECOND half: delete ONLY the armed slot, and only if it is still the armed one.
+
+    The index is checked against the pending one, so a stale dialog (the operator opened the
+    confirmation on B, went away, and the confirmation outlived its subject) cannot delete the
+    wrong sequencer. A confirmation that arrives without a request does nothing at all: that is
+    what makes the confirmation real rather than decorative.
+
+    e68: deleting A empties its slots in place (its record IS the live view over the globals)
+    and marks it uncreated, so the A icon asks for a new shape. Deleting B drops its record.
+    """
+    global _pending_delete
+    if _pending_delete != index:
+        return False
+    _pending_delete = None
+    if index == 0:
+        forget_sequencer_created(0)
+        for row in range(NUM_TRACKS):
+            tracks_data[row] = _pristine_track()
+        globals()["current_step"] = -1
+        globals()["is_playing"] = False
+    else:
+        drop_second_sequencer()
+    return True
+
+
+def cancel_sequencer_delete() -> None:
+    """The operator said no: forget the request and change nothing (e67s02)."""
+    global _pending_delete
+    _pending_delete = None
+
+
+def pending_delete_slot() -> int | None:
+    """Which slot is waiting for confirmation, or None (e67s02) — what the dialog reads."""
+    return _pending_delete
+
 
 samplerate = 44100
 
@@ -312,6 +567,16 @@ current_bpm: float = DEFAULT_MANUAL_BPM
 bpm_last_detected: float = 0.0
 
 
+# e75: the Ableton Link session (written by the link worker thread, read everywhere).
+# `link_available` is False until the worker builds its Link (and on any failure), so the
+# UI degrades instead of pretending to follow a session that is not there.
+link_available: bool = False
+link_tempo: float = 120.0
+link_beat: float = 0.0
+link_phase: float = 0.0
+link_peers: int = 0
+
+
 beat_confidence: float = 0.0
 
 
@@ -321,7 +586,7 @@ spectrum_bars_cache: np.ndarray = np.zeros(SPECTRUM_BARS, dtype=np.float32)
 spec_peak_hold: float = 0.0  # AGC running spectral peak (spectrum worker only, e10s09)
 
 
-bands_enabled: dict[int, bool] = {1: False, 2: False, 3: False}
+bands_enabled: dict[int, bool] = {1: False, 2: False, 3: False, 4: False, 5: False}
 
 
 band1: float = 0.0
@@ -331,6 +596,12 @@ band2: float = 0.0
 
 
 band3: float = 0.0
+
+
+band4: float = 0.0
+
+
+band5: float = 0.0
 
 
 thumbnails_data: dict[str, list[str]] = {}
@@ -352,10 +623,9 @@ thumb_fail_count: dict[str, int] = {}
 thumb_frames_at_last_request: dict[str, int] = {}
 
 
-_last_unmatched_log: dict[str, float] = {}  # port -> last unmatched-message log time
-
-
-_midi_first_msg_logged: set[str] = set()  # ports that already logged their first message
+# e81: one I/O Monitor IGNORED row per (port, raw mido type) — tells "the app ignores
+# this message type" apart from "the device sends nothing" without a Logs line.
+_midi_ignored_types: set[tuple[str, str]] = set()  # (port, raw type) pairs
 
 
 midi_controllers: list[dict[str, Any]] = []
@@ -461,6 +731,9 @@ mapper_counter: int = 0
 # e51s02: the Mapper clipboard — a captured Mapping snapshot (MAPPER_PERSISTED_KEYS
 # minus the id) awaiting a Paste, mirroring `copied_step_data` for the sequencer.
 mapper_clipboard: dict[str, Any] | None = None
+# e74s11: when the clipboard was ARMED (a monotonic stamp set by copy/cut). The Paste
+# buttons derive from `mapper_clipboard`; the tick expires it so they do not ride forever.
+mapper_clipboard_at: float = 0.0
 
 
 # e35s02: active cue runs — written by the cue engine (vjmixapp/cue.py) from
@@ -509,6 +782,25 @@ current_window: str | None = None
 text_document: str = ""
 text_target: str = ""
 text_source_path: str = ""
+# e61: the Shader window's live document, its OSC target, the DECLARED kind of
+# that target (effect | generator — the OSC state feed exposes no source type),
+# the asset file the deploy sends the path of (D4': never inline), and the
+# client-side uniform registry (vimix reports neither the code nor its uniform
+# values back, so the registry is authoritative only for what we sent). The
+# project save/load flows in the composition root persist all five; an empty
+# target means "no source chosen yet".
+shader_document: str = ""
+shader_target: str = ""
+shader_kind: str = SHADER_KIND_DEFAULT
+# e65s06: the family the picker is narrowed to (the TOKEN a `// family:` line declares,
+# `""` for no filter). A view preference, remembered with the kind because the shader
+# section is what remembers the client-side state vimix cannot report back.
+shader_family: str = ""
+shader_path: str = ""
+shader_uniforms: dict[str, dict[str, dict[str, float | None]]] = {}
+# e61s04: the effect's bypass, client-side only — vimix reports no filter state,
+# so this is what VJmix believes it set (and what the button shows).
+shader_bypass: bool = False
 # e59: the tracked caret (a shadow position — DearPyGui exposes none; see the
 # Text window's infer_edit_caret). Runtime only, never persisted.
 text_caret: int = 0
@@ -543,6 +835,11 @@ mapping_subscriptions: dict[str, list[str]] = {}
 # e40s02: Mappings the orphan policy disabled (their source is gone); they are
 # re-enabled automatically when the source comes back.
 mapping_orphans: set[int] = set()
+
+
+# BUG-2026-10-14T180544: Mapping ids whose `uniform:<slot>` has no live row on their
+# own target (so the send fails soft and the log line is emitted ONCE, not every frame).
+mapping_unresolved_uniforms: set[int] = set()
 # BUG-2026-09-13T231500: every source NAME the state table has ever reported.
 # A Mapping's target absent from a state update is only evidence of removal if
 # the name was seen before — the first tables after boot/pairing can be empty or
@@ -553,5 +850,28 @@ known_sources: set[str] = set()
 # sent to viOSC and whether the lane is proven alive (None = unknown, still
 # using the 2 s monitor fallback).
 watch_state_queue: queue.Queue[tuple[str, list[Any]]] = queue.Queue()
+
+# e82s04: the delta stream. The worker parses SSE frames and puts the event dicts
+# here; the MAIN thread applies them to the table (worker modules never touch dpg).
+event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+# None = not probed yet, True = live, False = this daemon has no /events.
+event_stream_supported: bool | None = None
+# The last revision this app has applied (snapshot or event); it is the ETag of
+# the snapshot and the gap detector of the stream.
+event_rev: int = 0
+# e83: the measured footprint of one Mediagrid cell (tile + cell padding), learned
+# from the built table: the column count must follow the REAL width, or a column is
+# dropped while there is still room (the scrollbar appearing too early).
+media_cell_w: float = 0.0
+# e82s09: the current source the grid was last PAINTED for. A current change only
+# recolors a tile, so it must not enter the structural signature (that rebuilt the
+# whole grid — the glitch the stream made visible).
+last_current_source: Any = None
+# e82s05: POST /interest lane. None = not probed, True = the daemon accepts it,
+# False = an older daemon (fall back to /viosc/watch).
+interest_supported: bool | None = None
+# e82s05: the properties some consumer has asked for, so the raw table can render
+# "never asked" differently from "asked, no value".
+asked_props: set[str] = set()
 mapping_watch_plan: dict[str, dict[str, Any]] = {}
 osc_watch_supported: bool | None = None

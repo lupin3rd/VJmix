@@ -31,10 +31,12 @@ from vjmixapp.constants import (
     IO_MONITOR_KIND_MIDI_IN,
     IO_MONITOR_KIND_MIDI_OUT,
     IO_MONITOR_NEUTRAL_CENTRE,
+    IO_MONITOR_OUTCOME_IGNORED,
     IO_MONITOR_OUTCOME_RECV,
     IO_MONITOR_OUTCOME_SENT,
     IO_MONITOR_STREAM_LIMIT,
     IO_MONITOR_SUMMARY_TEXT_MAX,
+    IO_MONITOR_TRANSPORT_HTTP,
     IO_MONITOR_TRANSPORT_MIDI,
     IO_MONITOR_TRANSPORT_OSC,
     IO_MONITOR_VALUE_MAX,
@@ -50,6 +52,7 @@ __all__ = [
     "format_stream",
     "normalize_value",
     "peers",
+    "record_ignored",
     "record_osc",
     "record_rx",
     "record_tx",
@@ -146,6 +149,40 @@ def record_osc(
     )
 
 
+def record_http(
+    kind: str,
+    resource: str,
+    detail: str = "",
+    peer: str = "",
+    status: int | None = None,
+    now: float | None = None,
+) -> None:
+    """Record one data-plane request in the stream (e82s05) — payload never kept.
+
+    Since e81 the Monitor is the only window that answers "is the link alive?",
+    and once the link is HTTP an OSC-only Monitor would go blind. The row is one
+    per request (the snapshot poll, the stream connect, an interest post, a
+    thumbnail fetch), with the resource and the HTTP status as its outcome.
+    """
+    _append_stream(
+        {
+            "ts": time.time() if now is None else float(now),
+            "transport": IO_MONITOR_TRANSPORT_HTTP,
+            "direction": IO_MONITOR_DIRECTION_IN,
+            "kind": str(kind),
+            "port": str(peer),
+            "type": "http",
+            "channel": 0,
+            "number": 0,
+            "value": 0.0,
+            "normalized": 0.0,
+            "outcome": IO_MONITOR_OUTCOME_RECV,
+            "detail": f"{resource}{f' ({detail})' if detail else ''}",
+            "subject": str(resource),
+        }
+    )
+
+
 def control_id(control: tuple[str, str, int, int, str]) -> str:
     """The copyable id of one control ('PORT type ch N') — a Binding is about input.
 
@@ -194,6 +231,34 @@ def record_rx(
         detail,
         now,
     )
+
+
+def record_ignored(port: str, msg_type: str, channel: int, detail: str = "") -> None:
+    """Record one INCOMING message whose TYPE the app does not use (e81).
+
+    STREAM ONLY: the control table is the learn/calibration view, and a message the app
+    cannot bind is not a control. This is what keeps "the device sends nothing" apart
+    from "the app ignores this type" WITHOUT a Logs line (traffic lives here).
+    """
+    global _revision
+    ts = time.time()
+    entry: dict[str, Any] = {
+        "ts": ts,
+        "transport": IO_MONITOR_TRANSPORT_MIDI,
+        "direction": IO_MONITOR_DIRECTION_IN,
+        "kind": "ignored",
+        "port": str(port),
+        "type": str(msg_type),
+        "channel": int(channel),
+        "number": 0,
+        "value": 0.0,
+        "normalized": 0.0,
+        "outcome": IO_MONITOR_OUTCOME_IGNORED,
+        "detail": str(detail),
+        "subject": f"{port} {msg_type} ch{channel}",
+    }
+    _append_stream(entry)
+    _revision += 1
 
 
 def record_tx(
@@ -321,12 +386,13 @@ def snapshot_stream(
     control: tuple[str, str, int, int, str] | None = None,
     direction: str | None = None,
     transport: str | None = None,
+    outcome: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Newest-first stream entries, filtered by peer, control, direction, transport."""
+    """Newest-first stream entries, filtered by peer, control, direction, transport, outcome."""
     return [
         dict(entry)
         for entry in reversed(_stream)
-        if _entry_matches(entry, port, control, direction, transport)
+        if _entry_matches(entry, port, control, direction, transport, outcome)
     ]
 
 
@@ -346,13 +412,17 @@ def _entry_matches(
     control: tuple[str, str, int, int, str] | None,
     direction: str | None = None,
     transport: str | None = None,
+    outcome: str | None = None,
 ) -> bool:
-    """True when a stream entry passes the active peer/control/direction/transport filters."""
+    """True when a stream entry passes the active peer/control/direction/transport/outcome
+    filters."""
     if port is not None and entry["port"] != port:
         return False
     if direction is not None and entry["direction"] != direction:
         return False
     if transport is not None and entry["transport"] != transport:
+        return False
+    if outcome is not None and entry["outcome"] != outcome:
         return False
     if control is None:
         return True

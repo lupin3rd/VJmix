@@ -38,6 +38,13 @@ FAMILIES: tuple[str, ...] = (
     FAMILY_ENUM,
 )
 
+# e61s05 / e70s01: a shader uniform joins the catalogue as a DYNAMIC property. Its
+# key carries the POSITION, not the GLSL name: a binding says "the Nth parameter of
+# this shader", and the name is resolved from the target's registry at SEND time, so
+# a re-deploy with renamed variables keeps the binding. Like every static property the
+# OSC target comes from the surface that sends.
+UNIFORM_PREFIX = "uniform:"
+
 PARTIAL_NIL = "nil"
 PARTIAL_ANCHOR = "anchor"
 PARTIAL_NONE = "none"
@@ -91,6 +98,13 @@ def _vector(
 
 PI = math.pi
 _FULL = (-5.0, 5.0)  # geometry position span (vimix panel slider range)
+
+# e83: a MAPPER-ONLY action, NOT a vimix attribute. A button whose press makes the
+# mapping's OWN source the current one: the Mapper special-cases the message
+# (`/vimix/current/<source>`, no property suffix) and offers this property only in
+# its own dialog. The string lives here so the OSC-facing tables stay untouched
+# (PROPERTY_CATALOG is the wiki mirror and never holds it).
+SET_CURRENT_PROPERTY = "set current"
 
 PROPERTY_CATALOG: dict[str, dict[str, Any]] = {
     # --- set scalar (instant absolute value, optional ms animation) ---
@@ -236,8 +250,9 @@ def is_derivable(prop: str) -> bool:
 
     e40s01 (ADR-mapping-model, decision 5): a client-side capability, not a vimix
     OSC fact — a linear timeline position (seek) can be extrapolated from the
-    last value plus speed * elapsed while the source plays. Every catalog entry
-    carries the flag; only seek is True today.
+    last value plus speed * elapsed / duration while the source plays (e83: seek
+    is a FRACTION of the clip, and an unknown duration freezes the value). Every
+    catalog entry carries the flag; only seek is True today.
     """
     return bool(PROPERTY_CATALOG[prop]["derivable"])
 
@@ -368,3 +383,46 @@ def compose_send_args(
     ):
         args = [*args, ms]
     return args
+
+
+def uniform_slot_property(slot: int) -> str:
+    """The catalogue key of a shader uniform SLOT (what a mapping/step/row persists).
+
+    1-based position in the shader's declaration order (e70s01).
+    """
+    return f"{UNIFORM_PREFIX}{int(slot)}"
+
+
+def parse_uniform_slot(prop: str) -> int | None:
+    """The 1-based SLOT behind a dynamic property key, or None for a static/unusable one.
+
+    The payload is a plain integer: the old name-based vocabulary is gone (e70s01), so a
+    `uniform:<identifier>` key is not a uniform property any more.
+    """
+    text = str(prop)
+    if not text.startswith(UNIFORM_PREFIX):
+        return None
+    payload = text[len(UNIFORM_PREFIX) :]
+    if not payload.isdigit():
+        return None
+    slot = int(payload)
+    return slot if slot >= 1 else None
+
+
+def uniform_entry(label: str, neutral: float, low: float, high: float) -> dict[str, Any]:
+    """The catalogue-shaped entry of a shader uniform: one scalar component.
+
+    `ms` is True because the ATTRIBUTE supports a duration (`/uniform sf name
+    value ms` ramps natively — rig-confirmed); the e36 rule D5 is enforced by the
+    SENDERS: the Mapper and the Sequencer never pass a duration, only a Cue row
+    may.
+    """
+    return {
+        "family": FAMILY_SET_SCALAR,
+        "label": label,
+        "components": [_component("v", label, low, high, neutral)],
+        "partial": PARTIAL_NONE,
+        "ms": True,
+        "options": None,
+        "derivable": False,
+    }

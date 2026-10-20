@@ -28,6 +28,7 @@ from vjmixapp.constants import (
     IO_MONITOR_KIND_MONITOR,
     IO_MONITOR_KIND_OSC,
     IO_MONITOR_KIND_STATE,
+    IO_MONITOR_KIND_STATE_PULL,
     IO_MONITOR_KIND_SYNC,
     IO_MONITOR_KIND_THUMBNAIL,
     IO_MONITOR_KIND_VIMIX,
@@ -39,14 +40,16 @@ from vjmixapp.constants import (
     MAX_THUMBNAIL_BLOB_BYTES,
     MAX_THUMBNAIL_PIXELS,
     RECV_BUFFER_BYTES,
+    STATE_PATH,
     STATE_PULL_INTERVAL,
     STATE_PULL_MAX_FAILURES,
+    STATE_PULL_STREAM_INTERVAL,
     THUMB_HTTP_MAX_FAILURES,
     THUMB_REQUESTS_PER_SOURCE,
     VIOSC_IP,
     VIOSC_PORT,
 )
-from vjmixapp.queues import append_log, log_error
+from vjmixapp.queues import log_error
 
 # NOTE: the client is created at the END of the module, once observe_client
 # exists (the wrapper is defined further down with the I/O Monitor plumbing).
@@ -79,7 +82,26 @@ ALL_PROPERTIES = [
     "posterize",
     "invert",
     "uri",
+    "type",
+    # e82s05: the state tier of the mirror (e82s01/e82s02) — readable attributes
+    # that used to be missing from the raw vocabulary.
+    "correction",
+    "id",
 ]
+
+
+def raw_cell_text(prop: str, value: Any, asked: set[str]) -> str:
+    """The raw table cell: `·` = never asked, `---` = asked with no value (e82s05).
+
+    Before the tier most columns were drawn `---` simply because nobody had ever
+    asked vimix; now those two states mean different things and the table must
+    not blur them. `id` is an int64 and is never formatted as a float.
+    """
+    if value is None:
+        return "---" if str(prop) in asked else "·"
+    if isinstance(value, float):
+        return f"{value:.2f}"
+    return str(value)
 
 
 def thumbnail_decoder_worker() -> None:
@@ -102,7 +124,6 @@ def request_thumbnail_over_osc(name: str, index: int) -> None:
     """Ask the daemon for one frame on the ORIGINAL OSC lane (e41s03 fallback)."""
     client = state.viosc_client or osc_client
     client.send_message(f"/viosc/thumb/{name}", [int(index)])
-    append_log("OUT", f"/viosc/thumb/{name} {index}")
 
 
 def fetch_one_thumbnail(name: str, index: int) -> bool:
@@ -168,7 +189,24 @@ def poll_state_once() -> bool:
     disappear, so one answered failure is enough; a server that does not answer
     at all may simply be busy, so it takes STATE_PULL_MAX_FAILURES in a row.
     """
-    text, answered, status = dataplane.fetch_state_ex(state.dataplane_host, state.dataplane_port)
+    etag = state.event_rev if state.event_rev > 0 else None
+    text, answered, status = dataplane.fetch_state_ex(
+        state.dataplane_host, state.dataplane_port, etag
+    )
+    iomonitor.record_http(
+        IO_MONITOR_KIND_STATE_PULL,
+        STATE_PATH,
+        f"HTTP {status}" if status is not None else "no answer",
+        f"{state.dataplane_host}:{state.dataplane_port}",
+        status,
+    )
+    if answered and status == 304:
+        # e82s04: the table did not change since the last revision: the answer IS
+        # the freshness, and the round trip cost headers only.
+        state.state_pull_supported = True
+        state.state_pull_failures = 0
+        state.last_viosc_state_ts = time.monotonic()
+        return True
     if text is not None:
         state.state_pull_supported = True
         state.state_pull_failures = 0
@@ -213,7 +251,12 @@ def state_poll_worker() -> None:
                 poll_state_once()
         except Exception as e:  # a worker thread must never die (Defensive Code)
             log_error("State data plane", str(e))
-        time.sleep(STATE_PULL_INTERVAL)
+        # e82s04: the 1 Hz pull is the FALLBACK cadence; while the delta stream is
+        # live the snapshot only reconciles (churn, drift) and steps back.
+        interval = (
+            STATE_PULL_STREAM_INTERVAL if state.event_stream_supported else STATE_PULL_INTERVAL
+        )
+        time.sleep(interval)
 
 
 def get_current_target_id() -> str | None:
@@ -285,7 +328,6 @@ def listen_peer() -> str:
 
 
 def incoming_osc_handler(address: str, *args: Any) -> None:
-    append_log("IN ", address)
     try:
         iomonitor.record_osc(
             IO_MONITOR_DIRECTION_IN,
@@ -559,7 +601,6 @@ def send_mapping_osc(spec: Any, value: float) -> bool:
             _mapping_clients[(str(spec["host"]), int(spec["port"]))] = client
         with sent_by(IO_MONITOR_KIND_DESTINATION):
             client.send_message(address, [float(value)])
-        append_log("OUT", f"{address} [{float(value):.2f}] (mapping)")
         return True
     except Exception as e:
         log_error("OSC", f"mapping destination {address}: {e}")

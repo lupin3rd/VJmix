@@ -39,6 +39,18 @@ def state_subscriptions(mappings: list[dict[str, Any]]) -> dict[str, list[str]]:
     return {target: sorted(props) for target, props in out.items()}
 
 
+# e82s07: a DERIVABLE origin is extrapolated by `mapper.dead_reckon`, which reads
+# `play` (the gate) and `speed` (the factor). The plan must therefore ask for them
+# too: the watch lane only ever declared the mapped property, so the play flag was
+# always None and the "derivable seek" never extrapolated at all.
+DERIVED_INPUT_PROPS: dict[str, tuple[str, ...]] = {"seek": ("play", "speed")}
+
+
+def plan_props(prop: str) -> tuple[str, ...]:
+    """The properties a Mapping on ``prop`` needs: the prop plus its inputs."""
+    return (prop, *DERIVED_INPUT_PROPS.get(prop, ()))
+
+
 def state_watch_plan(mappings: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """The per-source watch plan of the enabled State Mappings (e40s06).
 
@@ -56,9 +68,9 @@ def state_watch_plan(mappings: list[dict[str, Any]]) -> dict[str, dict[str, Any]
             continue
         cadence = int(mapping.get("cadence") or MAPPING_DEFAULT_CADENCE_MS)
         entry = plan.setdefault(target, {"props": [], "cadence_ms": cadence})
-        prop = str(mapping["property"])
-        if prop not in entry["props"]:
-            entry["props"].append(prop)
+        for needed in plan_props(str(mapping["property"])):
+            if needed not in entry["props"]:
+                entry["props"].append(needed)
         entry["cadence_ms"] = min(int(entry["cadence_ms"]), cadence)
     for entry in plan.values():
         entry["props"].sort()
