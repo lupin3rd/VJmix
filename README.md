@@ -60,6 +60,13 @@ python3.13 -m venv .venv
 - Vimix
 - (optional) a Novation Launchpad MK1/MK2/MK3 for pad control
 
+## Support
+
+VJmix is free and GPL-3.0. If it is useful to you, you can buy me a coffee -
+a thank-you, never a requirement.
+
+[![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/lupin3rd)
+
 ## License
 
 GPL-3.0 — see [LICENSE](LICENSE).
