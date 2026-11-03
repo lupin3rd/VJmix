@@ -13,6 +13,7 @@ av==18.1.0  # e38: source video preview decode (bundled FFmpeg; cp313 wheel)
 aalink==0.2.3  # e75: Ableton Link beat source (cp313 wheel; Link is statically bundled)
 essentia==2.1b6.dev1389
 mido==1.3.3
+onnxruntime==1.31.0  # e87: webcam hand tracking (cp313 wheel; 68 MB installed, 2 models ship in vjmixapp/assets/handtrack)
 numpy>=2,<3
 python-osc==1.10.2
 python-rtmidi==1.5.8

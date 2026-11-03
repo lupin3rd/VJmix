@@ -25,8 +25,8 @@ with release **1.0.0**, download
 [GitHub Releases](https://github.com/lupin3rd/VJmix/releases) page, then:
 
 ```bash
-chmod +x vjmix-1.1.0-x86_64.AppImage
-./vjmix-1.1.0-x86_64.AppImage
+chmod +x vjmix-1.2.0-x86_64.AppImage
+./vjmix-1.2.0-x86_64.AppImage
 ```
 
 ### Where your data lives
@@ -57,7 +57,9 @@ python3.13 -m venv .venv
   ETag) plus a delta stream (`GET /events`, Server-Sent Events) and the Mapper
   declares what it needs with `POST /interest`. An older viOSC keeps working
   through the deprecated `/viosc/*` lanes.
-- Vimix
+- [Vimix](https://github.com/brunoherbelin/vimix) **0.9.3 stable or newer** — the
+  stable release that carries the OSC fixes VJmix relies on (some of them are not
+  documented in the Vimix wiki yet).
 - (optional) a Novation Launchpad MK1/MK2/MK3 for pad control
 
 ## Support
@@ -69,4 +71,11 @@ a thank-you, never a requirement.
 
 ## License
 
-GPL-3.0 — see [LICENSE](LICENSE).
+VJmix is **GPL-3.0** — see [LICENSE](LICENSE).
+
+It bundles third-party libraries and two Apache-2.0 hand-tracking models. Every
+component, with its exact version, licence, copyright holder and source, is in
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md); the licence texts themselves
+— including the AGPL-3.0 text of `essentia` and the Apache-2.0 text of the
+models — ship in [`licenses/`](licenses/) and inside the AppImage
+(`opt/vjmix/licenses/`).

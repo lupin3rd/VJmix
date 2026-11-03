@@ -243,6 +243,68 @@ def add_mode(name: str) -> str | None:
     return trimmed
 
 
+# e52s11: the rename result the UI turns into one status line.
+MODE_RENAME_OK = "ok"
+MODE_RENAME_EMPTY = "empty"
+MODE_RENAME_DUPLICATE = "duplicate"
+MODE_RENAME_UNKNOWN = "unknown"
+
+
+def rename_mode(old_name: str, new_name: str) -> str:
+    """Rename a registered mode and EVERY reference to it, atomically (e52s11).
+
+    A mode name is referenced by the definition (its LED), the active set, the
+    activation order, the Binding gate tags (`binding["mode"]`), the MODE_TOGGLE
+    rows (`params["mode"]`) and possibly a learn session in flight. All of them
+    move together: a partial rename would silently un-gate the old tags. Blank
+    names and case-insensitive collisions with ANOTHER mode are refused; a
+    case-only change of the same mode is allowed. Returns MODE_RENAME_*.
+    """
+    definition = mode_definition(old_name)
+    if definition is None:
+        return MODE_RENAME_UNKNOWN
+    old = str(definition.get("name") or "")
+    trimmed = str(new_name or "").strip()
+    if not trimmed:
+        return MODE_RENAME_EMPTY
+    new_key = _mode_key(trimmed)
+    for other in state.midi_mode_defs:
+        if other is not definition and _mode_key(other.get("name")) == new_key:
+            return MODE_RENAME_DUPLICATE
+    if trimmed == old:
+        return MODE_RENAME_OK
+    old_key = _mode_key(old)
+    definition["name"] = trimmed
+    if old in state.midi_modes:
+        state.midi_modes.discard(old)
+        state.midi_modes.add(trimmed)
+    state.midi_mode_order[:] = [trimmed if item == old else item for item in state.midi_mode_order]
+    if state.midi_learn_target_mode is not None and (
+        _mode_key(state.midi_learn_target_mode) == old_key
+    ):
+        state.midi_learn_target_mode = trimmed
+    pending = state.midi_learn_pending
+    if (
+        pending is not None
+        and pending[0] == MIDI_ACTION_MODE_TOGGLE
+        and _mode_key(pending[1].get("mode")) == old_key
+    ):
+        state.midi_learn_pending = (pending[0], {**pending[1], "mode": trimmed})
+    for controller in midi_controllers:
+        for binding in controller.get("bindings") or []:
+            if _mode_key(binding.get("mode")) == old_key:
+                binding["mode"] = trimmed
+            params = binding.get("params")
+            if (
+                binding.get("action") == MIDI_ACTION_MODE_TOGGLE
+                and isinstance(params, dict)
+                and _mode_key(params.get("mode")) == old_key
+            ):
+                params["mode"] = trimmed
+    save_midi_controllers()  # the tags live in the persisted Bindings
+    return MODE_RENAME_OK
+
+
 def set_mode_led(name: str, led: dict[str, Any] | None) -> bool:
     """Store (or clear with None) a mode's LED spec; False when the mode is unknown."""
     definition = mode_definition(name)
@@ -650,6 +712,84 @@ def set_binding_mode(binding: dict[str, Any], name: str) -> None:
     """Write the gate tag, canonicalizing it to the registered name when possible."""
     trimmed = str(name or "").strip()
     binding["mode"] = canonical_mode_name(trimmed) or trimmed or None
+
+
+# ---------- e84s01: N controls to one function, with a sane re-learn ----------
+# The flat per-controller list already supports many-to-one (two notes toggling
+# one mode, two wheels stepping the sources). What it lacked was a UNIQUE identity
+# for the physical source: every learn appended, so re-learning a control stacked
+# a duplicate and one press fired two actions. The identity is the source in its
+# MODE LAYER, so a control can still hold one action in the base layer and another
+# under a mode.
+MIDI_BINDING_CONTROL_FIELDS: tuple[str, ...] = (
+    "led",
+    "led_behavior",
+    "encoding",
+    "step_size",
+    "max_steps_per_second",
+)
+
+
+def _binding_int(raw: Any) -> int:
+    """Coerce a stored MIDI number/channel to int, 0 for a broken value."""
+    try:
+        return int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def binding_source_key(binding: dict[str, Any]) -> tuple[str, int, str, int, str]:
+    """Identity of a physical source inside its mode layer (e84s01)."""
+    return (
+        str(binding.get("device") or ""),
+        _binding_int(binding.get("channel")),
+        str(binding.get("type") or ""),
+        _binding_int(binding.get("number")),
+        _mode_key(binding_mode(binding) or ""),
+    )
+
+
+def upsert_binding(bindings: list[dict[str, Any]], binding: dict[str, Any]) -> bool:
+    """Store a Binding: append a NEW source, replace the SAME source (e84s01).
+
+    A new physical source means a SECOND control for the same function (the
+    operator's ask). The same source in the same mode layer is a re-learn: the
+    old row is replaced, never stacked, because two identical rows would fire the
+    action twice on one press. The control's LED and step tuning survive the
+    replacement (they belong to the hardware, not to the old action). Returns
+    True when an existing row was replaced.
+    """
+    key = binding_source_key(binding)
+    for index, existing in enumerate(bindings):
+        if binding_source_key(existing) != key:
+            continue
+        for field in MIDI_BINDING_CONTROL_FIELDS:
+            if field in existing and field not in binding:
+                binding[field] = existing[field]
+        bindings[index] = binding
+        return True
+    bindings.append(binding)
+    return False
+
+
+def remove_mapping_bindings(mapping_id: int) -> int:
+    """Drop every Binding that drives one Mapper Mapping; return how many (e84s01)."""
+    removed = 0
+    for controller in midi_controllers:
+        bindings = controller.get("bindings") or []
+        kept = []
+        for binding in bindings:
+            params = binding.get("params")
+            if isinstance(params, dict) and _binding_int(params.get("mapping_id")) == int(
+                mapping_id
+            ):
+                continue
+            kept.append(binding)
+        removed += len(bindings) - len(kept)
+        controller["bindings"] = kept
+    if removed:
+        save_midi_controllers()
+    return removed
 
 
 def gate_matched_bindings(
@@ -1081,11 +1221,22 @@ def project_mapper_bindings() -> list[dict[str, Any]]:
     return rows
 
 
-def _binding_mapping_key(binding: dict[str, Any]) -> tuple[str, int]:
-    """Identity of a Mapper-binding row within one port: (action, mapping_id)."""
+def _binding_mapping_key(binding: dict[str, Any]) -> tuple[str, int, str, int, int, str]:
+    """Identity of a Mapper-binding row within one port (e84s01).
+
+    The physical source (type/number/channel) and the mode layer are part of the
+    key, so TWO controls driving one Mapping survive a project round trip while a
+    row for the SAME source still replaces itself.
+    """
+    params = binding.get("params")
+    mapping_id = _binding_int(params.get("mapping_id")) if isinstance(params, dict) else 0
     return (
         str(binding.get("action") or ""),
-        int((binding.get("params") or {}).get("mapping_id") or 0),
+        mapping_id,
+        str(binding.get("type") or ""),
+        _binding_int(binding.get("number")),
+        _binding_int(binding.get("channel")),
+        _mode_key(binding_mode(binding) or ""),
     )
 
 
@@ -1094,8 +1245,10 @@ def apply_project_mapper_bindings(rows: Any, live_mapping_ids: set[int]) -> None
 
     Each row targets the controller whose port matches. A row whose mapping_id
     does not exist in the loaded project is dropped (stale); a row already
-    present for the same (action, mapping_id) on a port is replaced so re-
-    learning inside the project updates the routing instead of stacking rows.
+    present for the same physical source (action + type/number/channel + mode)
+    on a port is replaced so re-learning inside the project updates the routing
+    instead of stacking rows, while a SECOND control for the same Mapping is
+    kept (e84s01).
     """
     if not isinstance(rows, list):
         return
@@ -1151,6 +1304,52 @@ def selected_bindings() -> list[dict[str, Any]]:
     if controller is not None:
         return controller.setdefault("bindings", [])
     return []
+
+
+# ---------- e84s02: the function a Binding fires ----------
+# The Bindings list groups the rows by FUNCTION, not by physical source: two pads
+# toggling one mode and two wheels stepping the sources are ONE header with
+# several control lines. The source is deliberately excluded from the key; the
+# mode layer is included, because the same action under another mode is another
+# layer (the gate would treat them differently). `source_type` is injected by the
+# resolver and is never stored, so it must not split a group.
+BindingActionKey = tuple[str, tuple[tuple[str, str], ...], str]
+
+
+def binding_action_key(binding: dict[str, Any]) -> BindingActionKey:
+    """Identity of the FUNCTION a Binding fires: action + params + mode (e84s02)."""
+    params = binding.get("params")
+    fingerprint: tuple[tuple[str, str], ...] = ()
+    if isinstance(params, dict):
+        fingerprint = tuple(
+            sorted((str(key), str(value)) for key, value in params.items() if key != "source_type")
+        )
+    return (
+        str(binding.get("action") or ""),
+        fingerprint,
+        _mode_key(binding_mode(binding) or ""),
+    )
+
+
+def group_bindings(
+    bindings: list[dict[str, Any]],
+) -> list[tuple[BindingActionKey, list[tuple[int, dict[str, Any]]]]]:
+    """Group (index, Binding) pairs by function, in first-seen order (e84s02).
+
+    The list INDEX is preserved so Delete and the Mode combo keep addressing the
+    controller's real list.
+    """
+    groups: list[tuple[BindingActionKey, list[tuple[int, dict[str, Any]]]]] = []
+    position_by_key: dict[BindingActionKey, int] = {}
+    for index, binding in enumerate(bindings):
+        key = binding_action_key(binding)
+        position = position_by_key.get(key)
+        if position is None:
+            position_by_key[key] = len(groups)
+            groups.append((key, [(index, binding)]))
+        else:
+            groups[position][1].append((index, binding))
+    return groups
 
 
 def midi_init_from_config(cfg: dict[str, Any]) -> None:

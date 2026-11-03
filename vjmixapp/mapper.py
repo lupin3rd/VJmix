@@ -12,7 +12,16 @@ import copy
 import time
 from typing import Any
 
-from vjmixapp import catalog, leap, shadercode, sourcekind, sourcestatus, state
+from vjmixapp import (
+    bodytrack,
+    catalog,
+    handtrack,
+    shadercode,
+    sourcekind,
+    sourcestatus,
+    state,
+    zonetrack,
+)
 from vjmixapp.constants import (
     BAND_SOURCES,
     CLOCK_DEFAULT,
@@ -40,7 +49,7 @@ from vjmixapp.constants import (
     ORIGIN_STATE,
     ORIGINS,
 )
-from vjmixapp.osc import osc_client
+from vjmixapp.osc import osc_client, sanitize_secondary_output, send_secondary_output
 from vjmixapp.queues import log_error
 
 # Property catalog: single-float vimix source attributes usable with a
@@ -189,19 +198,33 @@ def _degenerate_input_window(mapping: dict[str, Any]) -> bool:
     return float(in_from) == float(in_to)
 
 
-def toggle_on_press(mapping: dict[str, Any]) -> bool:
+def _source_kind(mapping: dict[str, Any], source_type: str = "") -> str:
+    """The kind of the message that produced a raw value (e84s01).
+
+    `source_type` wins when the caller knows it (the resolver injects it); the
+    stored `mapping["midi"].type` remains the fallback for the mouse/band/Leap
+    paths, so their behaviour is unchanged.
+    """
+    if source_type:
+        return str(source_type)
+    midi = mapping.get("midi")
+    return str(midi.get("type") or "") if isinstance(midi, dict) else ""
+
+
+def toggle_on_press(mapping: dict[str, Any], source_type: str = "") -> bool:
     """A button Mapping toggles on a source press instead of rescaling (e51s01).
 
     True when the control is a button AND the source delivers only presses:
     a learned MIDI NOTE (its release is never dispatched — BUG-2026-09-19T233307)
     or a degenerate input window (input_from == input_to, the user's 127..127
     only-controller proposal). Sliders/knobs and value Mappings never alternate,
-    so the e23 rescale model is untouched.
+    so the e23 rescale model is untouched. e84s01: `source_type` makes the answer
+    PER MESSAGE, so a note and a CC on one Mapping are interpreted independently
+    instead of the last-learned descriptor deciding for both.
     """
     if str(mapping.get("control") or "") != MAPPER_CONTROL_BUTTON:
         return False
-    midi = mapping.get("midi")
-    if isinstance(midi, dict) and str(midi.get("type")) == MIDI_KIND_NOTE:
+    if _source_kind(mapping, source_type) == MIDI_KIND_NOTE:
         return True
     return _degenerate_input_window(mapping)
 
@@ -615,6 +638,47 @@ def destination_of(mapping: dict[str, Any]) -> str:
     return destination if destination in DESTINATIONS else DEST_VIMIX
 
 
+# e92: the control kinds that carry a numeric value the SO can mirror. A cue-list
+# trigger and a `set current` action row have no value, so they never show the
+# button and never send an SO.
+SECONDARY_OUTPUT_CONTROLS: tuple[str, ...] = ("slider", "knob", MAPPER_CONTROL_BUTTON)
+
+
+def mapping_has_secondary_output(mapping: dict[str, Any]) -> bool:
+    """True when this Mapping is SO-capable and carries a stored SO spec (e92).
+
+    The predicate says CONFIGURED, not enabled: the card must be able to show an
+    amber button for a configured-but-muted SO. The sender checks `enabled` too.
+    """
+    if origin_of(mapping) != ORIGIN_CONTROL:
+        return False
+    if str(mapping.get("property") or "") == catalog.SET_CURRENT_PROPERTY:
+        return False
+    if str(mapping.get("control") or "") not in SECONDARY_OUTPUT_CONTROLS:
+        return False
+    return isinstance(mapping.get("secondary_output"), dict)
+
+
+def set_mapping_secondary_output(mapping_id: int, spec: dict[str, Any] | None) -> bool:
+    """Store (sanitized) or remove a Mapping's SO; returns whether one is stored (e92)."""
+    mapping = find_mapping(mapping_id)
+    if mapping is None:
+        return False
+    clean = sanitize_secondary_output(spec) if spec is not None else None
+    mapping["secondary_output"] = clean
+    return clean is not None
+
+
+def toggle_mapping_secondary_output(mapping_id: int) -> bool:
+    """Flip a Mapping's SO mute; returns the new enabled state (e92)."""
+    mapping = find_mapping(mapping_id)
+    if mapping is None or not mapping_has_secondary_output(mapping):
+        return False
+    spec = mapping["secondary_output"]
+    spec["enabled"] = not bool(spec.get("enabled", True))
+    return bool(spec["enabled"])
+
+
 def _default_input_range(origin: str, spec: dict[str, Any]) -> tuple[float | None, float | None]:
     """The default Origin window of a Mapping (e40s01).
 
@@ -709,6 +773,18 @@ def _build_mapping(
         "band": None,  # e18: audio-band source (2 or 3), exclusive with midi/leap
         "midi": None,  # e18: learned MIDI source {device, type, number}
         "leap": None,  # e26s03: leap signal '<hand>.<field>' (e.g. 'left.pinch')
+        # e87: which engine bound that hand signal. The key stays `leap` so old
+        # projects load unchanged; the provider only decides who DRIVES it and
+        # which default range a bind seeds.
+        "hand_provider": handtrack.PROVIDER_LEAP,
+        # e88: the zone source is a second external family next to the hand
+        # source. A hand mapping keeps its `leap` key; a zone mapping keeps the
+        # zone id and signal here, and the drive picks the snapshot by family.
+        "source_kind": "hand",
+        "zone_id": 1,
+        "zone_signal": "energy",
+        "body_id": 1,
+        "body_signal": "x",
         # e23: value rescale. output_from/to = the range the Destination sweeps
         # (catalog range for Vimix, 0..127 for MIDI; editable/reversible).
         # input_from/to = the Origin window (raw control range, or the catalog
@@ -721,7 +797,11 @@ def _build_mapping(
         "input_to": in_to,
         "button_mode": MAPPER_BUTTON_MODE_TOGGLE,
         "enabled": False,
+        "compact": False,  # e86: full by default; the operator compacts after configuring
         "cue": fresh_cue(),  # e35s01: uniform key set — inert for non-cue-list controls
+        # e92: an optional SECOND, mirrored OSC output. None = no SO; the card
+        # button and the sender share mapping_has_secondary_output().
+        "secondary_output": None,
     }
 
 
@@ -824,6 +904,22 @@ def add_mapping(
     return mapping
 
 
+def set_mapping_compact(mapping_id: int, compact: bool) -> bool:
+    """Set one mapping's compact flag (e86); False for an unknown id."""
+    mapping = find_mapping(mapping_id)
+    if mapping is None:
+        return False
+    mapping["compact"] = bool(compact)
+    return True
+
+
+def set_all_mappings_compact(compact: bool) -> int:
+    """Set every mapping's compact flag; returns how many rows changed (e86)."""
+    for mapping in state.mapper_mappings:
+        mapping["compact"] = bool(compact)
+    return len(state.mapper_mappings)
+
+
 def capture_mapping(mapping: dict[str, Any]) -> dict[str, Any]:
     """The persisted projection of one mapping (e28s01): the model keys only.
 
@@ -908,6 +1004,22 @@ def sanitize_mapping(
         destination=destination,
         registry=registry,
     )
+    source_kind = str(raw.get("source_kind") or "hand")
+    mapping["source_kind"] = source_kind if source_kind in ("hand", "zone", "body") else "hand"
+    try:
+        zone_id = int(raw.get("zone_id") or 1)
+    except (TypeError, ValueError):
+        zone_id = 1
+    mapping["zone_id"] = max(1, min(zonetrack.ZONE_MAX, zone_id))
+    zone_signal = str(raw.get("zone_signal") or "energy")
+    mapping["zone_signal"] = zone_signal if zone_signal in zonetrack.ZONE_FIELDS else "energy"
+    try:
+        body_id = int(raw.get("body_id") or 1)
+    except (TypeError, ValueError):
+        body_id = 1
+    mapping["body_id"] = max(1, min(bodytrack.BODY_MAX, body_id))
+    body_signal = str(raw.get("body_signal") or "x")
+    mapping["body_signal"] = body_signal if body_signal in bodytrack.BODY_FIELDS else "x"
     if origin == ORIGIN_CONTROL:
         if raw.get("band") in BAND_SOURCES:
             mapping["band"] = int(raw["band"])
@@ -918,18 +1030,34 @@ def sanitize_mapping(
                 "type": str(midi.get("type") or ""),
                 "number": int(midi.get("number") or 0),
             }
+        elif mapping["source_kind"] in ("zone", "body"):
+            mapping["leap"] = None
         elif raw.get("leap"):
             mapping["leap"] = str(raw["leap"])
-    if mapping["band"] is not None or mapping["midi"] is not None or mapping["leap"] is not None:
+            provider = str(raw.get("hand_provider") or handtrack.PROVIDER_LEAP)
+            mapping["hand_provider"] = (
+                provider if provider in handtrack.HAND_PROVIDERS else handtrack.PROVIDER_LEAP
+            )
+    if mapping["source_kind"] == "body":
+        seed_from, seed_to = bodytrack.body_signal_range(mapping["body_signal"])
+        mapping["input_from"] = _to_float_or(raw.get("input_from"), seed_from)
+        mapping["input_to"] = _to_float_or(raw.get("input_to"), seed_to)
+    elif mapping["source_kind"] == "zone":
+        seed_from, seed_to = zonetrack.zone_signal_range(mapping["zone_signal"])
+        mapping["input_from"] = _to_float_or(raw.get("input_from"), seed_from)
+        mapping["input_to"] = _to_float_or(raw.get("input_to"), seed_to)
+    elif mapping["band"] is not None or mapping["midi"] is not None or mapping["leap"] is not None:
         if mapping["band"] is not None:
             seed_from, seed_to = 0.0, 1.0
         elif mapping["midi"] is not None:
             seed_from, seed_to = 0.0, 127.0
         else:
-            parts = leap.binding_parts(mapping["leap"] or "")
+            parts = handtrack.binding_parts(mapping["leap"] or "")
             seed_from, seed_to = 0.0, 1.0
             if parts is not None:
-                seed_from, seed_to = leap.signal_default_range(parts[1]) or (0.0, 1.0)
+                seed_from, seed_to = handtrack.signal_default_range(
+                    parts[1], mapping["hand_provider"]
+                ) or (0.0, 1.0)
         mapping["input_from"] = _to_float_or(raw.get("input_from"), seed_from)
         mapping["input_to"] = _to_float_or(raw.get("input_to"), seed_to)
     elif origin != ORIGIN_CONTROL:
@@ -961,7 +1089,10 @@ def sanitize_mapping(
     mapping["value"] = _clamp(_to_float_or(raw.get("value"), neutral), lo, hi)
     mapping["button_mode"] = sanitize_button_mode(raw.get("button_mode"))
     mapping["enabled"] = bool(raw.get("enabled", False))
+    mapping["compact"] = bool(raw.get("compact", False))  # e86: older rows load full
     mapping["cue"] = sanitize_cue(raw.get("cue"))  # e35s01: heal the per-mapping cue
+    # e92: an invalid SO is dropped (no SO), never the Mapping that carries it.
+    mapping["secondary_output"] = sanitize_secondary_output(raw.get("secondary_output"))
     return mapping
 
 
@@ -1215,6 +1346,23 @@ def row_targets() -> list[str]:
     return seen
 
 
+def line_number(target_id: str) -> int | None:
+    """The 1-based window line of one source, or None when it has no line.
+
+    BUG-2026-10-24T082004: the three user-facing assign actions ask this BEFORE
+    re-pointing a line. A source that already owns a line would FUSE the two
+    (the e22s01 one-row-per-source rule): the assigned line would disappear and
+    every line after it would be renumbered, which silently re-aims the MIDI
+    ``mapper_line`` bindings (they are learned by index, not by source).
+    """
+    if not target_id:
+        return None
+    targets = row_targets()
+    if target_id not in targets:
+        return None
+    return targets.index(target_id) + 1
+
+
 def row_slots(card_count: int, per_line: int) -> list[list[int]]:
     """Visual-line groups of one mapper row's CARDS (e34s01).
 
@@ -1338,39 +1486,77 @@ def reset_mapping_value(mapping_id: int) -> float:
     1.0, posterize 0.0, transparency 1.0, color channels 1.0, ...). A
     button-like control (button, cue list — e34s04) returns to the OFF end
     (output_from) instead — the un-pressed state, consistent with
-    toggle_mapping_value. A rescaleped output range (e23) clamps the neutral
-    into the mapping's own interval, exactly like set_mapping_output
-    re-clamps. Returns the effective stored value (0.0 for an unknown id);
-    the e24 gate applies: a disabled mapping stores + moves but sends no OSC.
+    toggle_mapping_value. A rescaleped output range (e23) does NOT move the
+    neutral: the reset returns the property's STANDARD state, so a threshold
+    with Out 0.3..1.0 resets to 0.0, not 0.3 (BUG-2026-10-20T214929); only the
+    property's own contract range guards it. Returns the effective stored value
+    (0.0 for an unknown id).
+    e24 does NOT apply: BUG-2026-10-20T213730 — an explicit reset sends even
+    when the mapping is disabled, so a parked control can be returned to its
+    neutral with the mapping OFF. The mute still applies to every drive.
     """
     mapping = find_mapping(mapping_id)
     if mapping is None:
         return 0.0
     if button_like(mapping["control"]):  # e34s04: button + cue list reset to OFF
-        neutral = mapping["output_from"]
+        neutral = float(mapping["output_from"])
     else:
-        neutral = float(_mapping_component_spec(mapping)["neutral"])
-    lo, hi = _output_bounds(mapping)
-    mapping["value"] = _clamp(neutral, lo, hi)
-    _send(mapping)
+        spec = _mapping_component_spec(mapping)
+        neutral = _clamp(float(spec["neutral"]), float(spec["min"]), float(spec["max"]))
+    mapping["value"] = neutral
+    _send(mapping, force=True)
     return mapping["value"]
 
 
-def _send(mapping: dict[str, Any]) -> None:
-    """Send the mapping's current value to vimix and log it (worker-safe).
+def _send(mapping: dict[str, Any], *, force: bool = False) -> None:
+    """Send the primary Destination, then mirror it to the Mapping's SO (e92).
+
+    The SO only fires when the primary actually emitted, so a muted Mapping, an
+    unresolved/blocked uniform, `set current` and a cue-list card never mirror.
+    """
+    if not _send_primary(mapping, force=force):
+        return
+    send_mapping_secondary_output(mapping)
+
+
+def send_mapping_secondary_output(mapping: dict[str, Any]) -> bool:
+    """Send the Mapping's SO when it is configured and enabled (e92).
+
+    The value is the Destination value the primary just emitted, rescaled into
+    the SO's own interval. False means nothing was sent (no SO, muted, or the
+    sender refused the spec).
+    """
+    if not mapping_has_secondary_output(mapping):
+        return False
+    spec = mapping.get("secondary_output")
+    if not isinstance(spec, dict) or not spec.get("enabled", True):
+        return False
+    return send_secondary_output(
+        spec,
+        float(mapping["value"]),
+        float(mapping["output_from"]),
+        float(mapping["output_to"]),
+    )
+
+
+def _send_primary(mapping: dict[str, Any], *, force: bool = False) -> bool:
+    """Send the Mapping's primary Destination; True only when it left (e92).
 
     e24: a DISABLED mapping is muted here — the value is stored by the caller
-    and the control moves, but no OSC message leaves and nothing is logged
-    until the mapping is enabled.
+    and the control moves, but no OSC message leaves until the mapping is
+    enabled. ``force`` is the explicit-RESET path only (BUG-2026-10-20T213730):
+    the operator's R is a command, not a drive, so it reaches vimix even with
+    the mapping muted. The e92 SO seam uses the result to mirror ONLY a real
+    emission.
     """
-    if not mapping.get("enabled", False):
-        return
+    if not force and not mapping.get("enabled", False):
+        return False
     target_id = str(mapping["target_id"])
     prop = str(mapping["property"])
     if prop == catalog.SET_CURRENT_PROPERTY:
         # e83: an ACTION, not an attribute: no `/vimix/<target>/<prop>` exists.
         osc_client.send_message(f"/vimix/current/{current_target_argument(target_id)}", [])
-        return
+        return True
     # e61s05: a shader uniform is a catalogue property whose message shape is its
     # own (`/uniform` with name + value): same choke point, same mute gate, same log.
     uniform = shadercode.uniform_send(
@@ -1387,7 +1573,7 @@ def _send(mapping: dict[str, Any]) -> None:
         if mapping_id is not None and int(mapping_id) not in state.mapping_unresolved_uniforms:
             state.mapping_unresolved_uniforms.add(int(mapping_id))
             log_error("Mapper", f"{target_id}: {prop} is not declared by the shader — not sent")
-        return
+        return False
     if mapping_id is not None:
         state.mapping_unresolved_uniforms.discard(int(mapping_id))
     if uniform is not None:
@@ -1402,10 +1588,10 @@ def _send(mapping: dict[str, Any]) -> None:
             state.shader_kind,
             sourcekind.type_of_source(state.global_vimix_state.get("sources") or {}, target_id),
         ):
-            return
+            return False
         address, uniform_args = uniform
         osc_client.send_message(address, uniform_args)
-        return
+        return True
     entry = _entry(prop)
     anchors = (
         catalog.anchor_get(state.source_anchors, target_id, prop)
@@ -1427,6 +1613,7 @@ def _send(mapping: dict[str, Any]) -> None:
         osc_client.send_message(addr, float(args[0]))  # legacy scalar send shape
     else:
         osc_client.send_message(addr, list(args))
+    return True
 
 
 def _format_args(args: list[Any]) -> str:
@@ -1526,25 +1713,81 @@ def set_mapping_midi(mapping_id: int, binding: dict[str, Any]) -> None:
         mapping["input_to"] = 127.0
 
 
-def set_mapping_leap(mapping_id: int, signal_key: str) -> None:
-    """Set the Leap Motion source of a mapping from a signal key (e26s03).
+def set_mapping_leap(
+    mapping_id: int, signal_key: str, provider: str = handtrack.PROVIDER_LEAP
+) -> None:
+    """Set the HAND source of a mapping from a signal key (e26s03, e87).
 
-    ``'<hand>.<field>'`` from the leap catalog (e.g. 'left.pinch'), exclusive
-    with band/midi. Binding seeds the input range from the signal's catalog
-    default (palm mm, velocity mm/s, normal -1..1, pinch/grab/confidence
-    0..1), like the band 0..1 and MIDI 0..127 seeding.
+    ``'<hand>.<field>'`` from the provider's catalog (e.g. 'left.pinch'),
+    exclusive with band/midi. Binding seeds the input range from the PROVIDER's
+    catalog default — millimetres for the Leap, normalized units for the webcam
+    (specs/HAND_TRACKING_MODES_LATEST.md §7) — like the band 0..1 and MIDI
+    0..127 seeding.
     """
     mapping = find_mapping(mapping_id)
     if mapping is None:
         return
+    if provider not in handtrack.HAND_PROVIDERS:
+        provider = handtrack.PROVIDER_LEAP
     mapping["leap"] = signal_key
+    mapping["hand_provider"] = provider
+    mapping["source_kind"] = "hand"
+    mapping["zone_id"] = 1
+    mapping["zone_signal"] = "energy"
+    mapping["body_id"] = 1
+    mapping["body_signal"] = "x"
     mapping["band"] = None
     mapping["midi"] = None
-    parts = leap.binding_parts(signal_key)
+    parts = handtrack.binding_parts(signal_key)
     if parts is not None:
-        frm, to = leap.signal_default_range(parts[1]) or (0.0, 1.0)
+        frm, to = handtrack.signal_default_range(parts[1], provider) or (0.0, 1.0)
     else:
         frm, to = 0.0, 1.0
+    mapping["input_from"] = frm
+    mapping["input_to"] = to
+
+
+def set_mapping_zone(mapping_id: int, zone_id: int, signal: str) -> None:
+    """Set the ZONE source of a mapping (e88s03), exclusive with band/midi/hand.
+
+    Binding seeds the input range from the zone signal's catalog default (0..1
+    for energy/occupancy/enter/exit, -1..1 for x/y, the velocity clamp for
+    vx/vy), like the hand and band bind functions.
+    """
+    mapping = find_mapping(mapping_id)
+    if mapping is None:
+        return
+    if signal not in zonetrack.ZONE_FIELDS:
+        signal = "energy"
+    mapping["source_kind"] = "zone"
+    mapping["zone_id"] = max(1, min(zonetrack.ZONE_MAX, int(zone_id)))
+    mapping["zone_signal"] = signal
+    mapping["body_id"] = 1
+    mapping["body_signal"] = "x"
+    mapping["band"] = None
+    mapping["midi"] = None
+    mapping["leap"] = None
+    frm, to = zonetrack.zone_signal_range(signal)
+    mapping["input_from"] = frm
+    mapping["input_to"] = to
+
+
+def set_mapping_body(mapping_id: int, body_id: int, signal: str) -> None:
+    """Set the BODY source of a mapping (e89s05), exclusive with the others."""
+    mapping = find_mapping(mapping_id)
+    if mapping is None:
+        return
+    if signal not in bodytrack.BODY_FIELDS:
+        signal = "x"
+    mapping["source_kind"] = "body"
+    mapping["body_id"] = max(1, min(bodytrack.BODY_MAX, int(body_id)))
+    mapping["body_signal"] = signal
+    mapping["zone_id"] = 1
+    mapping["zone_signal"] = "energy"
+    mapping["band"] = None
+    mapping["midi"] = None
+    mapping["leap"] = None
+    frm, to = bodytrack.body_signal_range(signal)
     mapping["input_from"] = frm
     mapping["input_to"] = to
 
@@ -1566,6 +1809,11 @@ def clear_mapping_source(mapping_id: int) -> None:
     mapping["band"] = None
     mapping["midi"] = None
     mapping["leap"] = None
+    mapping["source_kind"] = "hand"
+    mapping["zone_id"] = 1
+    mapping["zone_signal"] = "energy"
+    mapping["body_id"] = 1
+    mapping["body_signal"] = "x"
 
 
 def _input_window(in_from: float, in_to: float) -> tuple[float, float]:
@@ -1605,18 +1853,21 @@ def _raw_unit(mapping: dict[str, Any], raw: float) -> float | None:
     return _clamp((float(raw) - in_from) / (in_to - in_from), 0.0, 1.0)
 
 
-def preview_mapping_value(mapping: dict[str, Any], raw: float) -> tuple[float, str]:
+def preview_mapping_value(
+    mapping: dict[str, Any], raw: float, source_type: str = ""
+) -> tuple[float, str]:
     """Pure diagnostic preview of what a raw value would do (e39s01).
 
     Mirrors apply_input_value WITHOUT sending: disabled -> MUTED (value
     unchanged), outside a real window -> HOLD (value unchanged), otherwise the
     value the mapping would take. Returns (effective_value, tag). Used by the
-    I/O Monitor; the dispatch path itself is untouched.
+    I/O Monitor; the dispatch path itself is untouched. e84s01: `source_type`
+    makes the preview follow the message, like the dispatch.
     """
     if not mapping.get("enabled", False):
         return float(mapping["value"]), IO_MONITOR_OUTCOME_MUTED
-    if toggle_on_press(mapping):
-        if not _press_matches(mapping, raw):
+    if toggle_on_press(mapping, source_type):
+        if not _press_matches(mapping, raw, source_type):
             return float(mapping["value"]), IO_MONITOR_OUTCOME_HOLD
         return next_toggle_value(mapping), IO_MONITOR_OUTCOME_SENT
     unit = _raw_unit(mapping, raw)
@@ -1640,15 +1891,15 @@ def _rescaled_unit_value(mapping: dict[str, Any], unit: float) -> float:
     return frm + u * (to - frm)
 
 
-def _press_matches(mapping: dict[str, Any], raw: float) -> bool:
+def _press_matches(mapping: dict[str, Any], raw: float, source_type: str = "") -> bool:
     """True when a source event is the press of a toggling button (e51s01).
 
     A note is always a press (its release is never delivered); a degenerate
     input window accepts only its single value, so a released switch that sends
-    0 into a 127..127 window HOLDS instead of flipping twice.
+    0 into a 127..127 window HOLDS instead of flipping twice. e84s01: the kind
+    comes from the message when given.
     """
-    midi = mapping.get("midi")
-    if isinstance(midi, dict) and str(midi.get("type")) == MIDI_KIND_NOTE:
+    if _source_kind(mapping, source_type) == MIDI_KIND_NOTE:
         return True
     return float(raw) == float(mapping["input_from"])
 
@@ -1662,7 +1913,7 @@ def _send_toggled(mapping_id: int) -> float:
     return value
 
 
-def apply_input_value(mapping_id: int, raw: float) -> float:
+def apply_input_value(mapping_id: int, raw: float, source_type: str = "") -> float:
     """Drive a mapping from a raw source value (band level / MIDI value, e23s02).
 
     The raw value is rescaleped through the mapping's input range onto a clamped
@@ -1675,6 +1926,8 @@ def apply_input_value(mapping_id: int, raw: float) -> float:
     and overwrote each other — one slider looked dead. A degenerate range
     yields unit 0 (output_from). e51s01: a button whose source delivers only
     presses (a MIDI note, or a degenerate window) TOGGLES instead of rescaling.
+    e84s01: `source_type` resolves the press semantics for THIS message, so two
+    controls of different kinds can drive one Mapping.
     Returns the effective value (0.0 for an unknown id). Worker-safe, HIGH-1.
     """
     mapping = find_mapping(mapping_id)
@@ -1682,11 +1935,11 @@ def apply_input_value(mapping_id: int, raw: float) -> float:
         return 0.0
     if is_momentary_button(mapping):
         # e77: a momentary button treats a source edge exactly like a click.
-        if not _press_matches(mapping, raw):
+        if not _press_matches(mapping, raw, source_type):
             return float(mapping["value"])  # release / not my press: hold
         return send_button_mapping(mapping_id)
-    if toggle_on_press(mapping):
-        if not _press_matches(mapping, raw):
+    if toggle_on_press(mapping, source_type):
+        if not _press_matches(mapping, raw, source_type):
             return float(mapping["value"])  # not my press value: hold
         return _send_toggled(mapping_id)
     unit = _raw_unit(mapping, raw)

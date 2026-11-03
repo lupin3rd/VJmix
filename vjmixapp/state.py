@@ -19,9 +19,11 @@ from typing import Any
 import numpy as np
 
 from vjmixapp.constants import (
+    AUDIO_BUFFER_SECONDS,
     BEAT_SOURCE_ANALYSIS,
     DEFAULT_MANUAL_BPM,
     DEFAULT_PALETTE,
+    MAX_AUDIO_SAMPLERATE,
     NUM_STEPS,
     NUM_TRACKS,
     SEQ_MAX_COLS,
@@ -51,6 +53,13 @@ midi_learn_mode: bool = False
 
 
 midi_learn_pending: tuple[str, dict[str, Any]] | None = None
+
+
+# e84: the mode layer a `+`-armed learn targets (None = the generic rule: the most
+# recently activated mode; "" = the base layer). The Bindings list knows the layer
+# of the function being extended, so adding a control never lands in another layer
+# just because a mode happened to be active at that moment.
+midi_learn_target_mode: str | None = None
 
 
 midi_learn_started_at: float = 0.0  # e14: learn-session start, for the safety timeout
@@ -297,6 +306,8 @@ def _pristine_step() -> dict[str, Any]:
         "frames": 4,
         "msgs": 1,
         "color": [1.0, 1.0, 1.0],
+        # e92: an optional SECOND, mirrored OSC output (fixed value per beat).
+        "secondary_output": None,
         "last_rand_v1": 0.0,
         "last_rand_seek": 0.0,
         "last_rand_color": [0, 0, 0],
@@ -541,7 +552,7 @@ def pending_delete_slot() -> int | None:
     return _pending_delete
 
 
-samplerate = 44100
+samplerate: float = 44100.0
 
 
 is_audio_analyzing: bool = False
@@ -554,11 +565,18 @@ lowpass_enabled: bool = True  # mirrors the "Use Low-Pass Filter" checkbox (read
 
 
 audio_buffer: np.ndarray = np.zeros(
-    samplerate * 6, dtype=np.float32
-)  # preallocated ring buffer (L-2)
+    MAX_AUDIO_SAMPLERATE * AUDIO_BUFFER_SECONDS, dtype=np.float32
+)  # preallocated ring buffer, sized for the highest supported rate (L-2)
 
 
 audio_buffer_head: int = 0  # next write position in audio_buffer (modulo its length)
+
+
+# e85s05: the callback counts over/underruns and logs at most one per
+# AUDIO_STATUS_LOG_INTERVAL_S; a per-block print on the PortAudio thread is a
+# stutter/CPU trap (terminal I/O + more xruns).
+audio_status_events: int = 0
+audio_status_logged_at: float = 0.0
 
 
 current_bpm: float = DEFAULT_MANUAL_BPM
@@ -581,6 +599,20 @@ beat_confidence: float = 0.0
 
 
 spectrum_bars_cache: np.ndarray = np.zeros(SPECTRUM_BARS, dtype=np.float32)
+
+
+# e85s02: latest-wins handoff from the spectrum worker to the main thread. At most
+# ONE update is queued; `spectrum_pending_bars` is overwritten by newer frames, so
+# a slow UI frame can never accumulate a backlog.
+spectrum_update_pending: bool = False
+spectrum_pending_bars: np.ndarray | None = None
+
+# e85s07: is anything actually CONSUMING the spectrum? The Audio window being
+# visible, or an enabled band used by a Mapper Mapping / the band-1 beat. The
+# main thread refreshes this (and `band_consumers`) at a low cadence; the
+# spectrum worker reads it and stops the 20 Hz compute when false.
+spectrum_consumed: bool = False
+band_consumers: set[int] = set()
 
 
 spec_peak_hold: float = 0.0  # AGC running spectral peak (spectrum worker only, e10s09)
@@ -659,6 +691,105 @@ _controller_lock = threading.Lock()
 _controller_profiles: dict[str, dict[str, Any]] = {}
 
 
+# e90: the tracking host. `child` runs camera capture + inference in a
+# supervised child process (crash isolation: a native abort there cannot take
+# the show down); `inline` is the reference in-process path and the fallback.
+# `tracking_status` is the HOST state; the engines keep their own status too.
+tracking_host: str = "inline"  # inline | child
+tracking_status: str = "off"  # off | starting | live | stalled | offline | mismatch | inline
+tracking_engine_status: str = ""  # the child's own engine status (live, searching, ...)
+tracking_frame_age: float = 0.0  # seconds since the newest accepted frame
+tracking_restarts: int = 0
+tracking_needs_decision: bool = False  # RESTART_LIMIT reached: the operator chooses
+tracking_frozen: bool = False  # the drives ignore new snapshots (safety hold)
+# e90s07: tracking events -> cue. The bindings are PROJECT content (they belong
+# to the show); the bus state and the counter are runtime.
+tracking_event_bindings: list[dict[str, Any]] = []
+tracking_event_count: int = 0
+tracking_event_last: str = ""
+tracking_last_error: str = ""
+
+# e87: webcam hand engine (worker-owned). The SNAPSHOT is the same
+# `leap_values` dict under `leap_lock` — only the ACTIVE engine writes it, so the
+# Mapper keeps one hand source and one drive path (specs/HAND_TRACKING_MODES_LATEST.md).
+hand_provider: str = "leap"  # leap | webcam — exactly one engine runs at a time
+handtrack_enabled: bool = False
+handtrack_device: str = ""
+handtrack_mirror: bool = True
+handtrack_box: float = 0.60
+handtrack_max_hz: float = 12.0
+handtrack_preview: bool = False
+handtrack_ready: bool = False  # the boot applied the config: only then may the worker run
+handtrack_status: str = "off"  # off | missing-deps | no-camera | lost | searching | tracking
+handtrack_fps: float = 0.0
+handtrack_latency_ms: float = 0.0
+handtrack_frame_age_ms: float = 0.0  # age of the last camera frame (stall detector)
+handtrack_worker_tick: float = 0.0
+# s04 preview: the ACTIVE engine publishes one finished RGB frame + a sequence;
+# the main-thread tick uploads it at PREVIEW_HZ only while a window is shown.
+# e90s03: ONE block for hand, body and zones (they are mutually exclusive camera
+# owners, so there is never more than one preview producer at a time).
+tracking_preview_frame: Any = None
+tracking_preview_engine: str = ""  # hand | body | zones
+tracking_preview_seq: int = 0
+tracking_preview_uploaded_seq: int = -1
+tracking_preview_uploaded_at: float = 0.0
+tracking_preview_lock = threading.Lock()
+
+# e89: body-tracking camera engine (T1). `body_enabled` is the camera-owner flag
+# shared through vjmixapp/camera.py; the snapshot is {body1|body2|body3: {...}},
+# written only by the body worker under body_lock.
+body_enabled: bool = False
+body_ready: bool = False
+body_device: str = ""
+body_width: int = 640
+body_height: int = 480
+body_max_hz: float = 8.0
+body_max_bodies: int = 2
+body_detect_every: int = 3
+body_score: float = 0.5
+body_roi: list[float] = [0.0, 0.0, 1.0, 1.0]
+body_mirror: bool = False
+body_preview: bool = False
+body_status: str = "off"  # off | missing-deps | no-camera | stalled | lost | live
+body_fps: float = 0.0
+body_latency_ms: float = 0.0
+body_frame_age_ms: float = 0.0
+body_worker_tick: float = 0.0
+body_snapshot: dict[str, dict[str, float]] = {}
+body_lock = threading.Lock()
+body_reset_seq: int = 0
+body_restart_requested: bool = False
+
+# e88: stage-zones camera engine (T0, no ML). `zones_enabled` is the camera-owner
+# flag shared with handtrack through vjmixapp/camera.py; the options mirror the
+# `zones` config block. The snapshot is `{zone<id>|motion: {signal: value}}` and
+# is written only by the zones worker under `zones_lock`.
+zones_enabled: bool = False
+zones_ready: bool = False  # the boot applied the config: only then may the worker run
+zones_device: str = ""
+zones_width: int = 320
+zones_height: int = 240
+zones_processing_width: int = 320
+zones_threshold: float = 18.0
+zones_min_area: float = 0.004
+zones_bg_tau_s: float = 2.0
+zones_max_hz: float = 10.0
+zones_mirror: bool = False
+zones_preview: bool = False
+zones_config: list[dict[str, Any]] = []  # the sanitized operator polygons
+zones_status: str = "off"  # off | missing-deps | no-camera | stalled | lost | live
+zones_fps: float = 0.0
+zones_latency_ms: float = 0.0
+zones_frame_age_ms: float = 0.0
+zones_worker_tick: float = 0.0
+zones_snapshot: dict[str, dict[str, float]] = {}
+zones_lock = threading.Lock()
+zones_edit: bool = False  # the polygon editor is armed (main thread)
+zones_draft: list[list[float]] = []  # normalized points of the draft polygon
+zones_reset_seq: int = 0  # bumped by the action; the worker resets the background
+zones_restart_requested: bool = False  # set by the action; the worker reopens the camera
+
 # e26: Leap Motion engine state (worker-owned). leap_values is mutated IN
 # PLACE (clear + update under leap_lock) so facade re-exports stay live; the
 # worker writes it from its own thread, the UI reads copies on the main thread.
@@ -717,6 +848,8 @@ leap_monitor_cache: dict[str, str] = {}
 # e26s03: per-mapping drive bookkeeping (mapping id -> {last_raw, last_push}).
 # Written by the leap worker listener thread when it pushes a mapped value.
 leap_drive_state: dict[int, dict[str, Any]] = {}
+zone_drive_state: dict[int, dict[str, Any]] = {}  # e88: rate gate per zone mapping
+body_drive_state: dict[int, dict[str, Any]] = {}  # e89: rate gate per body mapping
 
 
 # e16: Mapper state — OSC property mappings (see vjmixapp/mapper.py).
@@ -727,6 +860,10 @@ mapper_mappings: list[dict[str, Any]] = []
 
 mapper_counter: int = 0
 
+# e86: the Mapper's global Configure view (session-only). ON forces every card
+# FULL; OFF honours each mapping's `compact` flag (performance).
+mapper_configure_mode: bool = False
+
 
 # e51s02: the Mapper clipboard — a captured Mapping snapshot (MAPPER_PERSISTED_KEYS
 # minus the id) awaiting a Paste, mirroring `copied_step_data` for the sequencer.
@@ -734,6 +871,12 @@ mapper_clipboard: dict[str, Any] | None = None
 # e74s11: when the clipboard was ARMED (a monotonic stamp set by copy/cut). The Paste
 # buttons derive from `mapper_clipboard`; the tick expires it so they do not ride forever.
 mapper_clipboard_at: float = 0.0
+
+
+# BUG-2026-10-24T082004: the line assignment waiting for the Merge/Cancel answer —
+# {"target": <assigned line target>, "source": <chosen source>} while the modal is
+# open, None otherwise. Confirming applies it; cancelling drops it.
+mapper_merge_pending: dict[str, str] | None = None
 
 
 # e35s02: active cue runs — written by the cue engine (vjmixapp/cue.py) from

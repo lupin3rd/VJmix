@@ -29,6 +29,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from vjmixapp import state
 from vjmixapp.config import load_config, save_config
+from vjmixapp.queues import log_error
 
 # The two tracked hands (HandType.Left/Right of the LeapC API).
 LEAP_HANDS: tuple[str, ...] = ("left", "right")
@@ -601,23 +602,44 @@ def normalize_tracking_event(event: Any) -> dict[str, float]:
 
 
 def leap_init_from_config(cfg: dict[str, Any]) -> None:
-    """Load the Leap engine mirrors from the config (boot, e26s01/e26s04)."""
-    leap_cfg = cfg.get("leap") or {}
-    state.leap_enabled = bool(leap_cfg.get("enabled", False))
+    """Load the Leap engine mirrors from the config (boot, e26s01/e26s04).
+
+    A hand-edited block (``"leap": true``) must never stop the boot: anything
+    that is not a dict reads as "both flags off" (BUG-2026-10-21T223421).
+    """
+    leap_cfg = cfg.get("leap")
+    if not isinstance(leap_cfg, dict):
+        leap_cfg = {}
+    # e90: the enable switch is project content; the config block no longer holds it
+    leap_cfg.pop("enabled", None)
     state.leap_visualizer = bool(leap_cfg.get("visualizer", False))
 
 
+def _leap_config_block(cfg: dict[str, Any]) -> dict[str, Any]:
+    """The writable ``cfg['leap']`` mapping, healed in place when malformed.
+
+    The app owns this block; a stale or hand-edited config must not make a
+    persisted toggle raise (BUG-2026-10-21T223421: a non-dict block used to raise
+    TypeError inside the checkbox callback, after `state.leap_enabled` had
+    already flipped, so the UI looked right and the file never changed).
+    """
+    block = cfg.get("leap")
+    if not isinstance(block, dict):
+        block = {}
+        cfg["leap"] = block
+    return block
+
+
 def set_leap_enabled(enabled: bool) -> None:
-    """Enable/disable the Leap engine and persist the flag (main thread).
+    """Enable/disable the Leap engine (main thread). STATE only: the switch is
+    PROJECT content (specs/TRACKING_PERSISTENCE_LATEST.md), so it is saved with
+    the show, never into the machine's config.
 
     The worker loop watches state.leap_enabled and opens/closes the LeapC
-    connection on its own cadence, so no direct connect/disconnect happens
-    here (mirrors the midi engine's set_midi_enabled contract).
+    connection on its own cadence, so no direct connect/disconnect happens here
+    (mirrors the midi engine's set_midi_enabled contract).
     """
     state.leap_enabled = bool(enabled)
-    cfg = load_config()
-    cfg["leap"]["enabled"] = bool(enabled)
-    save_config(cfg)
 
 
 def leap_engine_stalled(now: float, tick: float) -> bool:
@@ -654,8 +676,9 @@ def set_leap_visualizer(enabled: bool) -> None:
     """
     state.leap_visualizer = bool(enabled)
     cfg = load_config()
-    cfg["leap"]["visualizer"] = bool(enabled)
-    save_config(cfg)
+    _leap_config_block(cfg)["visualizer"] = bool(enabled)
+    if not save_config(cfg):
+        log_error("Leap", "visualizer flag not persisted — the engine follows this session only")
 
 
 # ---------- e26s04: embedded visualizer (pure, dpg-free) ----------

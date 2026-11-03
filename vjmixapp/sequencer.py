@@ -152,11 +152,26 @@ def fire_step(
     if not step_data["active"]:
         return
     tracks[row]["active_fade"]["active"] = False
+    # e92: the SO is an INDEPENDENT beat output. It fires once per active step,
+    # before the Vimix dispatch, so a NONE cell (a pure OSC beat) and a step
+    # whose Vimix send fails both still reach their receiver.
+    _send_step_secondary_output(step_data)
     try:
         # e36s04: the property+mode engine replaces the hard-coded AlphaV/AlphaR/AlphaF/
         # ColorV/ColorR/SeekR if/elif chain
         execute_step(tracks[row], row, column, beat_seconds, tag_prefix)
     except Exception as e:
+        print(f"[VJmix OSC Error] {e}")
+
+
+def _send_step_secondary_output(step_data: dict[str, Any]) -> None:
+    """Fire one step's SO with its fixed value; never raises into the beat (e92)."""
+    spec = step_data.get("secondary_output")
+    if not isinstance(spec, dict) or not spec.get("enabled", True):
+        return
+    try:
+        osc.send_secondary_output(spec, float(spec.get("fixed", 0.0)))
+    except Exception as e:  # defensive: the sender already logs its own failures
         print(f"[VJmix OSC Error] {e}")
 
 

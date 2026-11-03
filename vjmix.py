@@ -1,5 +1,6 @@
 import contextlib
 import copy
+import io
 import json
 import os
 import queue
@@ -8,7 +9,6 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,9 @@ from pythonosc import dispatcher, udp_client
 import vjmixapp  # noqa: F401  scaffold hook (REFACTOR_LATEST.md commit 1): proves the package import path works at boot
 from vjmixapp import (
     actions,
+    bodyio,
+    bodytrack,
+    camera,
     caret,
     catalog,
     cue,
@@ -29,6 +32,8 @@ from vjmixapp import (
     drafts,
     emission,
     fsclient,
+    handio,
+    handtrack,
     iomonitor,
     leap,
     mapper,
@@ -42,7 +47,12 @@ from vjmixapp import (
     state,
     textmarkup,
     textplay,
+    trackchild,
+    trackevents,
+    trackmonitor,
+    trackpipe,
     viosccfg,
+    zonetrack,
 )
 from vjmixapp import (
     help as helpprose,
@@ -187,6 +197,9 @@ from vjmixapp.constants import (
     MAPPING_OSC_DEFAULT_ADDRESS,
     MAPPING_OSC_DEFAULT_HOST,
     MAPPING_OSC_DEFAULT_PORT,
+    MAPPING_SO_DEFAULT_ADDRESS,
+    MAPPING_SO_DEFAULT_HOST,
+    MAPPING_SO_DEFAULT_PORT,
     MAPPING_STEPS_CONTINUOUS,
     MAPPING_TICK_INTERVAL_S,
     MARKER_GROUP_GAP,
@@ -209,6 +222,10 @@ from vjmixapp.constants import (
     MEDIA_TITLE_MAX_LINES,
     MEDIA_TITLE_WRAP,
     MIDI_ACTION_BEAT_SOURCE,
+    MIDI_ACTION_BODY_OVERLAY,
+    MIDI_ACTION_BODY_RESET_TRACKS,
+    MIDI_ACTION_BODY_RESTART,
+    MIDI_ACTION_BODY_TOGGLE,
     MIDI_ACTION_DRAFT_LOAD,
     MIDI_ACTION_DRAFT_NEXT,
     MIDI_ACTION_DRAFT_PREV,
@@ -219,6 +236,8 @@ from vjmixapp.constants import (
     MIDI_ACTION_FILE_NEXT,
     MIDI_ACTION_FILE_PREV,
     MIDI_ACTION_FILE_STEP,
+    MIDI_ACTION_HANDTRACK_RESTART,
+    MIDI_ACTION_HANDTRACK_TOGGLE,
     MIDI_ACTION_IO_MONITOR_TOGGLE,
     MIDI_ACTION_MAPPER_BAND,
     MIDI_ACTION_MAPPER_CUE_OPEN,
@@ -231,6 +250,7 @@ from vjmixapp.constants import (
     MIDI_ACTION_MAPPING_CUT,
     MIDI_ACTION_MAPPING_MOVE,
     MIDI_ACTION_MAPPING_PASTE,
+    MIDI_ACTION_MAPPING_SO,
     MIDI_ACTION_MAPPING_TOGGLE,
     MIDI_ACTION_MODE_TOGGLE,
     MIDI_ACTION_MODES_CLEAR,
@@ -265,11 +285,26 @@ from vjmixapp.constants import (
     MIDI_ACTION_TEXT_WORD,
     MIDI_ACTION_TEXT_WORD_PLUS,
     MIDI_ACTION_TRACK_ASSIGN,
+    MIDI_ACTION_TRACKING_ADD_ROW,
+    MIDI_ACTION_TRACKING_EVENT_TEST,
+    MIDI_ACTION_TRACKING_EVENTS_CLEAR,
+    MIDI_ACTION_TRACKING_FORCE_INLINE,
+    MIDI_ACTION_TRACKING_FREEZE,
+    MIDI_ACTION_TRACKING_PANIC,
+    MIDI_ACTION_TRACKING_RETRY,
     MIDI_ACTION_TRANSPORT_PLAY,
     MIDI_ACTION_TRANSPORT_RESYNC,
     MIDI_ACTION_TRANSPORT_TAP,
+    MIDI_ACTION_ZONES_EDIT,
+    MIDI_ACTION_ZONES_OVERLAY,
+    MIDI_ACTION_ZONES_RESET_ACTIVITY,
+    MIDI_ACTION_ZONES_RESTART,
+    MIDI_ACTION_ZONES_TOGGLE,
     MIDI_CC_TRIGGER_THRESHOLD,
+    MIDI_CLOCK_IDLE_SLEEP_SECONDS,
+    MIDI_CLOCK_POLL_SECONDS,
     MIDI_CLOCK_PULSES_PER_BEAT,
+    MIDI_CONTROL_POLL_SECONDS,
     MIDI_KIND_CC,
     MIDI_KIND_NOTE,
     MIDI_LEARN_RED_RGBA,
@@ -299,6 +334,7 @@ from vjmixapp.constants import (
     PROJECT_VERSIONS_READABLE,
     RAW_FLASH_SECONDS,  # e82s08: how long a changed raw cell stays bright
     RECENT_PROJECTS_MAX,
+    SECONDARY_OUTPUT_ARGS,
     SEQ_BEAT_BOX_HEIGHT,
     SEQ_BEAT_BOX_PAD_Y,
     SEQ_BEAT_BOX_WIDTHS,
@@ -409,6 +445,7 @@ from vjmixapp.constants import (
     TRANSPORT_ROW_DEFAULT_WIDTH,
     TRANSPORT_ROW_MIN_WIDTH,
     TRANSPORT_ROW_SIDE_PAD,
+    VIMIX_MEDIA_WINDOW_W,
     VIOSC_IP,
     VIOSC_LISTEN_PORT,
     VIOSC_PORT,
@@ -421,6 +458,10 @@ from vjmixapp.leap import (
     set_leap_visualizer,
 )
 from vjmixapp.midi import (
+    MODE_RENAME_DUPLICATE,
+    MODE_RENAME_EMPTY,
+    MODE_RENAME_OK,
+    MODE_RENAME_UNKNOWN,
     _clock_port_name,
     _close_midi_input,
     _parse_midi_msg,
@@ -445,6 +486,7 @@ from vjmixapp.midi import (
     grid_flash_playhead,
     grid_mirror_step,
     grid_role,
+    group_bindings,
     led_bindings_for_message,
     midi_init_from_config,
     midi_open_retry_due,
@@ -457,7 +499,9 @@ from vjmixapp.midi import (
     project_mode_bindings,
     reapply_mode_leds,
     refresh_binding_leds,
+    remove_mapping_bindings,
     remove_mode,
+    rename_mode,
     reregister_grid_bindings,
     reset_step_memory,
     resolve_binding_led,
@@ -476,6 +520,7 @@ from vjmixapp.midi import (
     set_mode_led,
     stale_ports,
     toggle_mode,
+    upsert_binding,
 )
 from vjmixapp.osc import (
     ALL_PROPERTIES,
@@ -486,11 +531,14 @@ from vjmixapp.osc import (
     next_thumb_frame_index,
     osc_client,
     request_thumbnail_over_osc,
+    sanitize_secondary_output,
     send_mapping_osc,
+    send_secondary_output,
     size_receive_buffer,
     state_poll_worker,
     thumbnail_decoder_worker,
     thumbnail_fetch_worker,
+    validate_secondary_output,
 )
 from vjmixapp.osc import (
     validate_destination as validate_osc_destination,
@@ -500,6 +548,7 @@ from vjmixapp.palette import (
     _preset_key,
     _set_media_cell,
     dpg_color_rgba,
+    dpg_color_value,
     on_theme_color,
     on_theme_preset,
     palette_rgba,
@@ -544,7 +593,6 @@ from vjmixapp.state import (
     midi_controllers,
     osc_log_history,
     request_timestamps,
-    samplerate,
     sync_event_beat,
     sync_event_led,
     sync_event_seq,
@@ -577,6 +625,11 @@ Image.MAX_IMAGE_PIXELS = 25_000_000  # PIL's hard ceiling (~25 MP)
 
 # VJmix application version — single source of truth (matches specs/release-plan.yaml, e08s02).
 # e13s01: this is the first real release of VJmix (user decision).
+# 1.2.0 — webcam hand tracking, stage zones, body tracking and one Tracking instrument
+# (camera/inference in a supervised child process, one window/status/preview/signal
+# monitor, tracking events -> cue), the SO secondary OSC output, Mapper compact mode,
+# MIDI multi-binding and the CPU pass, plus the accumulated Mapper/MIDI/UI/tracking
+# fixes.
 # 1.1.0 — the viOSC link is HTTP (snapshot + delta stream, tile status strip), the shader
 # pack grows to 60 assets with mappable uniform slots, two sequencers with their own
 # geometry, five audio bands, Ableton Link as a beat source, and the UI pass (sources
@@ -603,7 +656,7 @@ Image.MAX_IMAGE_PIXELS = 25_000_000  # PIL's hard ceiling (~25 MP)
 # 0.4.0 — Leap Motion mapper source, per-mapping reset, project save + OSC config persist,
 # Mapper tile/row workflows (thumb assign, Add-to-Mapper submenu, line numbers).
 # 0.3.0 — Mapper family (rows/rescale/enable/cycle), compact Vimix-sources grid, windows, XDG.
-APP_VERSION: str = "1.1.0"
+APP_VERSION: str = "1.2.0"
 
 # The VJmix project repository, shown as a link in the Info window (e08s01; retargeted from the
 # author's profile to the project by e08s03, user request).
@@ -797,8 +850,13 @@ def ensure_user_dirs() -> None:
 
 
 def _step_persisted(step: dict[str, Any]) -> dict[str, Any]:
-    """Reduce a runtime step dict to its persisted fields (e11s01)."""
-    return {key: copy.deepcopy(step[key]) for key in STEP_PERSISTED_KEYS if key in step}
+    """Reduce a runtime step dict to its persisted fields (e11s01).
+
+    Every persisted key is written, even when a live dict predates it: the project
+    schema stays complete and an older runtime shape cannot drop a new field (e92).
+    """
+    defaults = _default_step()
+    return {key: copy.deepcopy(step.get(key, defaults[key])) for key in STEP_PERSISTED_KEYS}
 
 
 def _capture_audio_state() -> dict[str, Any]:
@@ -938,6 +996,19 @@ def capture_project_state() -> dict[str, Any]:
             "uniforms": copy.deepcopy(state.shader_uniforms),
         },
         "mapper": _capture_mapper_state(),
+        # e88s06: zones are show content (the polygons over the stage), so they
+        # travel with the project. Camera/motion options stay in the app config.
+        "zones": zonetrack.capture_project_zones(),
+        # e90s07: the event bindings are show content (which pose fires which cue).
+        "tracking_events": copy.deepcopy(state.tracking_event_bindings),
+        # e90 (TRACKING_PERSISTENCE_LATEST): which engines THIS show uses. The
+        # device and its options stay in the config: those belong to the rig.
+        "tracking": {
+            "hand_enabled": bool(state.handtrack_enabled),
+            "body_enabled": bool(state.body_enabled),
+            "zones_enabled": bool(state.zones_enabled),
+            "leap_enabled": bool(state.leap_enabled),
+        },
         # 2026-09-07: the project also carries the MIDI rows that drive ITS
         # Mapper mappings, so opening the project restores its MIDI routing.
         # e52s03: and its modes (definitions + LED) with their Binding rows.
@@ -958,7 +1029,9 @@ def capture_project_state() -> dict[str, Any]:
 # constantly during playback, so like the last_rand_* step keys they are
 # runtime state, never a dirt source (they still ride along on every save).
 UNSAVED_PROJECT_LABEL = "Untitled"
-PROJECT_DIRTY_POLL_SECONDS = 0.5
+# e85s03: the unsaved marker may lag by up to 2 s; the full project capture +
+# canonical JSON is too heavy to run twice a second (0.75% of one core measured).
+PROJECT_DIRTY_POLL_SECONDS = 2.0
 
 
 def _project_content_fingerprint() -> str:
@@ -1112,6 +1185,10 @@ def apply_project_state(doc: dict[str, Any]) -> None:
     if isinstance(mapper_section, dict):
         mapper.restore_mappings(mapper_section.get("mappings"), document_registry)
         refresh_mapper_ui()
+    zonetrack.apply_project_zones(doc.get("zones"))  # e88s06: project show content
+    state.tracking_event_bindings = trackevents.sanitize_bindings(doc.get("tracking_events"))
+    _apply_project_tracking(doc.get("tracking"))
+    _refresh_zones_rows()
     midi_section = doc.get("midi")
     if isinstance(midi_section, dict):  # 2026-09-07: restore the project's MIDI routing
         live_ids = {int(m["id"]) for m in state.mapper_mappings}
@@ -1192,6 +1269,14 @@ def pristine_project_state() -> dict[str, Any]:
             "uniforms": {},
         },
         "mapper": {"mappings": []},
+        "zones": [],  # e88s06: a fresh project has no stage zones
+        "tracking_events": [],  # e90s07: no bindings until the operator makes them
+        "tracking": {  # e90: a fresh show uses no engine until the operator says so
+            "hand_enabled": False,
+            "body_enabled": False,
+            "zones_enabled": False,
+            "leap_enabled": False,
+        },
     }
 
 
@@ -1211,6 +1296,9 @@ def apply_new_project() -> None:
     _apply_sequencer_state(pristine_project_state()["sequencers"][0])
     mapper.restore_mappings([])
     refresh_mapper_ui()
+    zonetrack.apply_project_zones([])  # e88s06: New project clears the zones
+    _refresh_zones_rows()
+    _apply_project_tracking(None)  # e90: and turns every tracking engine off
     _apply_text_state({"document": "", "target": "", "path": ""})
     hide_all_workspace_windows()
 
@@ -1283,6 +1371,7 @@ def _default_step() -> dict[str, Any]:
         "frames": 4,
         "msgs": 1,
         "color": [1.0, 1.0, 1.0],
+        "secondary_output": None,  # e92: the optional mirrored OSC output
     }
 
 
@@ -1293,6 +1382,8 @@ def _sanitize_step(step: Any) -> dict[str, Any]:
         for key in STEP_PERSISTED_KEYS:
             if key in step:
                 base[key] = step[key]
+    # e92: the SO is an additive object; an invalid one loads as 'no SO'.
+    base["secondary_output"] = sanitize_secondary_output(base.get("secondary_output"))
     if base.get("type") == "FlagX":
         # e36s07: flag is a VALUE step now; the legacy fire token always meant
         # "next", which the value form preserves as -1.
@@ -1352,6 +1443,44 @@ def _sanitize_audio_state(audio: Any) -> dict[str, Any]:
     if "bpm" in audio:
         clean["bpm"] = bool(audio.get("bpm"))
     return clean
+
+
+def _apply_project_tracking(raw: Any) -> None:
+    """Turn the project's engine switches on, and every engine it does not name off.
+
+    One camera owner (hand > body > zones): a document naming two is healed to the
+    first, logged, and NOT rewritten — the operator decides what to save.
+    """
+    section = raw if isinstance(raw, dict) else {}
+    hand = bool(section.get("hand_enabled", False))
+    body = bool(section.get("body_enabled", False))
+    zones = bool(section.get("zones_enabled", False))
+    if sum((hand, body, zones)) > 1:
+        append_log("Tracking", "the project names more than one camera engine: keeping the first")
+    if hand and state.hand_provider != handtrack.PROVIDER_WEBCAM:
+        handtrack.set_hand_provider(handtrack.PROVIDER_WEBCAM)
+    engine = camera.CAMERA_NONE
+    if hand:
+        engine = camera.CAMERA_HAND
+    elif body:
+        engine = camera.CAMERA_BODY
+    elif zones:
+        engine = camera.CAMERA_ZONES
+    camera.set_camera_engine(engine)
+    if bool(section.get("leap_enabled", False)) != state.leap_enabled:
+        set_leap_enabled(bool(section.get("leap_enabled", False)))
+    _sync_camera_owner_widgets()
+
+
+def project_tracking_section(raw: Any) -> dict[str, bool]:
+    """Heal one project `tracking` section (pure; used by load and tests)."""
+    section = raw if isinstance(raw, dict) else {}
+    return {
+        "hand_enabled": bool(section.get("hand_enabled", False)),
+        "body_enabled": bool(section.get("body_enabled", False)),
+        "zones_enabled": bool(section.get("zones_enabled", False)),
+        "leap_enabled": bool(section.get("leap_enabled", False)),
+    }
 
 
 def _sanitize_project_state(raw: dict[str, Any]) -> dict[str, Any]:
@@ -1425,6 +1554,13 @@ def _sanitize_project_state(raw: dict[str, Any]) -> dict[str, Any]:
     # coerces to the GENERATOR profile, the crash-safe direction: a wrong
     # 'generator' only disables /uniform, while a wrong 'effect' would let VJmix
     # send /uniform to a ShaderSource, which the rig showed kills vimix.
+    # e88s06: the zones section is project show content. A pre-e88s06 project
+    # carries none and opens with no zones; the camera options stay in config.
+    raw_zones = raw.get("zones")
+    if isinstance(raw_zones, list):
+        clean["zones"] = zonetrack.sanitize_zones(raw_zones)
+    clean["tracking_events"] = trackevents.sanitize_bindings(raw.get("tracking_events"))
+    clean["tracking"] = project_tracking_section(raw.get("tracking"))
     raw_shader = raw.get("shader")
     if isinstance(raw_shader, dict):
         kind = str(raw_shader.get("kind") or "")
@@ -1713,6 +1849,22 @@ def apply_boot_config() -> None:
     cfg = load_config()
     midi_init_from_config(cfg)  # e09: MIDI control mirrors (enabled, port, bindings)
     leap_init_from_config(cfg)  # e26: Leap Motion engine mirror (enabled flag)
+    handtrack.handtrack_init_from_config(cfg)  # e87: provider + webcam settings
+    trackchild.init_from_config(cfg)  # e90: inline | child (the crash-isolated host)
+    zonetrack.init_from_config(cfg)  # e88: zones camera engine (T0, no ML)
+    bodytrack.init_from_config(cfg)  # e89: body camera engine (T1)
+    if dpg.does_item_exist("handtrack_enable_cb"):
+        # BUG-2026-10-29 (operator rig): the hand widgets were NEVER synced at
+        # boot. A persisted `enabled: true` left the checkbox unchecked while the
+        # engine ran — "all engines off" on screen, camera open and values live.
+        _sync_handtrack_widgets()
+    if dpg.does_item_exist("zones_enable"):
+        # the window is built before the config is applied: mirror the stored
+        # preview/enable flags and the persisted zone rows into it at boot.
+        _sync_zones_widgets()
+        _refresh_zones_rows()
+    if dpg.does_item_exist("body_enable"):
+        _sync_body_widgets()
     state.hover_help = hover_help_enabled(cfg)  # e76: display preference, not project content
     apply_hover_help(state.hover_help)  # drop the cards built at import when it is off
     if dpg.does_item_exist("help_hover_cb"):
@@ -1913,9 +2065,13 @@ def flash_led(tag: str) -> None:
 
 
 def frame_sleep() -> float:
-    """Main-loop sleep: full rate while animating, throttled while idle (perf e07 P1)."""
-    if state.is_playing or state.is_audio_analyzing:
-        return FRAME_SLEEP_ANIMATED
+    """Main-loop sleep: 16 ms only while a video preview PLAYS (e85s01).
+
+    e07s02 introduced the throttle; e85s01 narrowed the animated branch to the one
+    thing that needs sub-33 ms frames. The spectrum already produces 20 frames/s
+    (so rendering faster adds nothing), and a playing sequencer is a discrete
+    worker clock, not a UI animation.
+    """
     if state.preview_active is not None and state.preview_playing:
         return FRAME_SLEEP_ANIMATED  # e38: a playing preview keeps full rate
     return FRAME_SLEEP_IDLE
@@ -2310,6 +2466,46 @@ def _clear_step_cell(row: int, col: int, prefix: str = SEQ_TAG_PREFIX) -> None:
             dpg.delete_item(child)
 
 
+STEP_SO_MARKER = 10  # e92: the corner square; 10 px keeps the 80 px cell copy inside
+
+
+def _render_step_so_marker(
+    step_data: dict[str, Any],
+    index: int,
+    row: int,
+    col: int,
+    prefix: str,
+    layout: Any,
+) -> None:
+    """The SO corner square of one cell: status light + editor opener (e92).
+
+    It is rendered ONLY for a cell that carries an SO, so every other cell is
+    byte-identical to before. Colors follow the Mapper rule (accent when
+    enabled, amber when muted).
+    """
+    spec = step_data.get("secondary_output") or {}
+    tag = f"{prefix}_so_{row}_{col}"
+    indent = max(0, layout.cell - 2 * layout.content_padding - STEP_SO_MARKER)
+    with dpg.group(horizontal=True, parent=f"{prefix}_cell_{row}_{col}"):
+        dpg.add_spacer(width=indent)
+        dpg.add_button(
+            label="",
+            width=STEP_SO_MARKER,
+            height=STEP_SO_MARKER,
+            tag=tag,
+            callback=open_step_so_editor,
+            user_data=(index, row, col),
+        )
+    dpg.bind_item_theme(tag, theme_mapper_micro)
+    if bool(spec.get("enabled", True)):
+        _style_trigger_theme(tag, True)
+    else:
+        dpg.bind_item_theme(tag, theme_so_muted)
+    with dpg.tooltip(tag, delay=HELP_HOVER_DELAY_S) as tip_tag:
+        dpg.add_text("Secondary OSC output")
+    dpg.bind_item_theme(tip_tag, HELP_THEME_TOOLTIP)
+
+
 def update_step_ui(row: int, col: int, prefix: str = SEQ_TAG_PREFIX, index: int = 0) -> None:
     layout = seqlayout.cell_layout(state.sequencer(index)["zoom"])  # e67s05: THIS instance's level
     cell_tag = f"{prefix}_cell_{row}_{col}"
@@ -2380,6 +2576,11 @@ def update_step_ui(row: int, col: int, prefix: str = SEQ_TAG_PREFIX, index: int 
             dpg.add_menu_item(
                 label="More properties...",
                 callback=open_step_picker,
+                user_data=(index, row, col),
+            )
+            dpg.add_menu_item(
+                label="Secondary output...",
+                callback=open_step_so_editor,
                 user_data=(index, row, col),
             )
             dpg.add_separator()
@@ -2629,6 +2830,8 @@ def update_step_ui(row: int, col: int, prefix: str = SEQ_TAG_PREFIX, index: int 
                 indent=layout.text_indent,
             )
 
+    if isinstance(step_data.get("secondary_output"), dict):
+        _render_step_so_marker(step_data, index, row, col, prefix, layout)
     update_step_theme(row, col, is_head=(state.is_playing and state.current_step == col))
 
 
@@ -2654,13 +2857,14 @@ def on_tile_add_to_mapper_line(
     first-appearance window order) — the popup can outlive mapper changes — and
     re-pointed onto the right-clicked source with the e29 retarget core; a stale
     index or a row already carrying the clicked source is a no-op (no refresh).
+    BUG-2026-10-24T082004: when the clicked source already owns a line the two
+    fuse, so this surface asks through the same request path as the row thumb.
     """
     target_id, line_index = user_data
     rows = mapper.row_targets()
     if line_index >= len(rows):
         return
-    if mapper.retarget_source(rows[line_index], target_id):
-        refresh_mapper_ui()
+    _request_mapper_line_source(rows[line_index], target_id, interactive=True)
 
 
 # e74s13: the wiki's `blending` table (the catalog mirror), reused by the tile menu and
@@ -6320,6 +6524,10 @@ def _exec_mapper_line(params: dict[str, Any], value: int) -> None:
     onto state.vjmix_selected_source, mirroring the e29 row-thumb click rules:
     no selection, same-source row or a stale line index are no-ops (a stale
     line is logged).
+
+    BUG-2026-10-24T082004: a selection that already owns another line would
+    FUSE the two lines, and a controller press cannot answer the confirmation
+    modal the mouse surfaces show — so that case is refused and logged.
     """
     line = int(params.get("line", -1))
     rows = mapper.row_targets()
@@ -6332,8 +6540,7 @@ def _exec_mapper_line(params: dict[str, Any], value: int) -> None:
     selected = state.vjmix_selected_source
     if selected is None or selected == target:
         return
-    if mapper.retarget_source(target, selected):
-        refresh_mapper_ui()
+    _request_mapper_line_source(target, selected, interactive=False)
 
 
 def _exec_mapper_band(params: dict[str, Any], value: int) -> None:
@@ -6703,7 +6910,9 @@ _MIDI_EXECUTORS: dict[str, Callable[[dict[str, Any], int], None]] = {
         int(p.get("row", 0)), int(p.get("seq", 0))
     ),
     # e18: a learned MIDI control drives a Mapper mapping (raw 0..127 value)
-    MIDI_ACTION_MAPPER_MAPPING: lambda p, v: midi_mapping_value(int(p.get("mapping_id", 0)), v),
+    MIDI_ACTION_MAPPER_MAPPING: lambda p, v: midi_mapping_value(
+        int(p.get("mapping_id", 0)), v, str(p.get("source_type") or "")
+    ),
     # e33s02: card caption learn markers (armed flag, reset)
     MIDI_ACTION_MAPPER_ENABLE: _exec_mapper_enable,
     MIDI_ACTION_MAPPER_RESET: _exec_mapper_reset,
@@ -6728,9 +6937,30 @@ _MIDI_EXECUTORS: dict[str, Callable[[dict[str, Any], int], None]] = {
     MIDI_ACTION_SET_BLENDING: _exec_set_blending,
     MIDI_ACTION_SOURCES_DATA_REFRESH: lambda p, v: _exec_sources_data_refresh(p, v),
     # e39s01: the I/O Monitor window toggle (mappable per the e33 rule)
+    # e87: the hand engine from a MIDI control (e33 rule)
+    MIDI_ACTION_HANDTRACK_TOGGLE: lambda p, v: _exec_handtrack_toggle(v),
+    MIDI_ACTION_HANDTRACK_RESTART: lambda p, v: _exec_handtrack_restart(v),
+    MIDI_ACTION_TRACKING_FORCE_INLINE: lambda p, v: _exec_tracking_force_inline(v),
+    MIDI_ACTION_TRACKING_RETRY: lambda p, v: _exec_tracking_retry(v),
+    MIDI_ACTION_TRACKING_FREEZE: lambda p, v: _exec_tracking_freeze(v),
+    MIDI_ACTION_TRACKING_PANIC: lambda p, v: _exec_tracking_panic(v),
+    MIDI_ACTION_TRACKING_ADD_ROW: lambda p, v: _exec_tracking_add_row(v),
+    MIDI_ACTION_TRACKING_EVENTS_CLEAR: lambda p, v: _exec_tracking_events_clear(v),
+    MIDI_ACTION_TRACKING_EVENT_TEST: lambda p, v: _exec_tracking_event_test(v),
+    MIDI_ACTION_ZONES_TOGGLE: lambda p, v: _exec_zones_toggle(v),
+    MIDI_ACTION_ZONES_RESTART: lambda p, v: _exec_zones_restart(v),
+    MIDI_ACTION_ZONES_OVERLAY: lambda p, v: _exec_zones_overlay(v),
+    MIDI_ACTION_ZONES_EDIT: lambda p, v: _exec_zones_edit(v),
+    MIDI_ACTION_ZONES_RESET_ACTIVITY: lambda p, v: _exec_zones_reset_activity(v),
+    MIDI_ACTION_BODY_TOGGLE: lambda p, v: _exec_body_toggle(v),
+    MIDI_ACTION_BODY_RESTART: lambda p, v: _exec_body_restart(v),
+    MIDI_ACTION_BODY_OVERLAY: lambda p, v: _exec_body_overlay(v),
+    MIDI_ACTION_BODY_RESET_TRACKS: lambda p, v: _exec_body_reset_tracks(v),
     MIDI_ACTION_IO_MONITOR_TOGGLE: lambda p, v: _exec_monitor_toggle(p, v),
     # e40s01: arm/disarm a Mapping's Enabled gate
     MIDI_ACTION_MAPPING_TOGGLE: lambda p, v: _exec_mapping_toggle(p, v),
+    # e92: mute/resume a Mapping's Secondary Output
+    MIDI_ACTION_MAPPING_SO: lambda p, v: _exec_mapping_so(p, v),
     # e40s08: create a State Mapping on a source line (the State box '+')
     MIDI_ACTION_MAPPING_ADD: lambda p, v: _exec_mapping_add(p, v),
     # e51s02: clipboard + in-line moves (MIDI-mappable per the e33 rule)
@@ -6840,7 +7070,9 @@ def _monitor_outcome_for(action: str, params: dict[str, Any], value: int) -> tup
         mapping_id = int(params.get("mapping_id", 0))
         mapping = mapper.find_mapping(mapping_id)
         if mapping is not None:
-            effective, tag = mapper.preview_mapping_value(mapping, float(value))
+            effective, tag = mapper.preview_mapping_value(
+                mapping, float(value), str(params.get("source_type") or "")
+            )
             prop = str(mapping.get("property", "?"))
             return tag, f"mapping #{mapping_id} {prop} -> {effective:.2f}"
     return IO_MONITOR_OUTCOME_MATCH, f"{action} v={value}"
@@ -6948,6 +7180,7 @@ def _exit_midi_learn() -> None:
     """Turn MIDI Learn off and restore the button/status (cancel, complete, disable)."""
     state.midi_learn_mode = False
     state.midi_learn_pending = None
+    state.midi_learn_target_mode = None
     if state.midi_learn_armed_tag:  # an armed M returns to red before the surfaces drop it
         _style_learn_marker(state.midi_learn_armed_tag, False)
     state.midi_learn_armed_tag = None
@@ -6983,6 +7216,10 @@ def _refresh_learn_surfaces() -> None:
     _sync_shader_learn_markers()  # e61s03
     _sync_text_mode_learn_markers()  # e59s08
     _sync_sources_data_learn_marker()  # e82s08
+    _sync_hand_engine_learn_markers()  # e87s04: the two hand-engine actions
+    _sync_zones_learn_markers()  # e88s04: the five zone actions
+    _sync_body_learn_markers()  # e89s06: the four body actions
+    _sync_tracking_learn_markers()  # e90s05: the four safety actions
     _sync_map_actions_panel()  # e33s05
 
 
@@ -7227,6 +7464,7 @@ def on_learn_marker_click(sender: Any = None, app_data: Any = None, user_data: A
         return
     action_id, params = user_data
     state.midi_learn_pending = (action_id, params)
+    state.midi_learn_target_mode = None  # a marker click follows the active mode (e52s08)
     state.midi_learn_started_at = time.time()
     # The clicked M turns AMBER so the user sees which control the next MIDI
     # message binds; the previously armed M returns to red (user, 2026-09-07).
@@ -7238,16 +7476,132 @@ def on_learn_marker_click(sender: Any = None, app_data: Any = None, user_data: A
         dpg.set_value("midi_learn_status", "Now press your MIDI button")
 
 
+# BUG-2026-10-21T202949: the bar wraps to the window width. A horizontal DPG
+# group never wraps, so the bar is tokenised and split into rows that fit.
+MEDIA_LEARN_ITEM_SPACING = 8  # the default theme's ItemSpacing.x between markers
+
+
+def learn_bar_rows(
+    tokens: list[tuple[str, dict[str, Any]]], available: int
+) -> list[list[tuple[str, dict[str, Any]]]]:
+    """Split the media learn bar into rows that fit `available` px (BUG-2026-10-21).
+
+    A `marker` costs MAPPER_MARKER_W, a `gap` MARKER_GROUP_GAP and every item
+    after the first adds the theme's item spacing. A `break` token forces a new
+    row (the blending block), and a gap that would START a row is dropped: it
+    would render as invisible padding. Markers are never dropped, whatever the
+    width.
+    """
+    rows: list[list[tuple[str, dict[str, Any]]]] = []
+    current: list[tuple[str, dict[str, Any]]] = []
+    used = 0
+    for kind, spec in tokens:
+        if kind == "break":
+            if current:
+                rows.append(current)
+                current = []
+                used = 0
+            continue
+        width = MARKER_GROUP_GAP if kind == "gap" else MAPPER_MARKER_W
+        extra = width if not current else width + MEDIA_LEARN_ITEM_SPACING
+        if current and used + extra > available:
+            rows.append(current)
+            current = []
+            used = 0
+            if kind == "gap":
+                continue  # a gap cannot open a row
+            extra = width
+        if kind == "gap" and not current:
+            continue
+        current.append((kind, spec))
+        used += extra
+    if current:
+        rows.append(current)
+    return rows
+
+
+def _media_learn_tokens() -> list[tuple[str, dict[str, Any]]]:
+    """The media learn bar as ordered tokens (marker / group gap / break)."""
+    tokens: list[tuple[str, dict[str, Any]]] = [
+        ("marker", {"action": MIDI_ACTION_SOURCE_NEXT, "tag": "media_mk_next"}),
+        ("marker", {"action": MIDI_ACTION_SOURCE_PREV, "tag": "media_mk_prev"}),
+        (
+            "marker",
+            {
+                "action": MIDI_ACTION_SOURCE_STEP,
+                "tag": "media_mk_step",
+                "tooltip": "Map: step sources by rotation",
+            },
+        ),
+        ("marker", {"action": MIDI_ACTION_REGEN_SELECTED, "tag": "media_mk_regen"}),
+        ("marker", {"action": MIDI_ACTION_ENABLE_CORRECTION, "tag": "media_mk_cc"}),
+        ("marker", {"action": MIDI_ACTION_SET_CURRENT, "tag": "media_mk_setcurrent"}),
+        # e74s03: the Sources-data window joins the media learn bar (the new surface's
+        # red-M marker), so the window is MIDI-openable from the same bar.
+        (
+            "marker",
+            {
+                "action": MIDI_ACTION_SHOW_WINDOW,
+                "params": {"window": SOURCES_DATA_WINDOW_TAG},
+                "tag": "media_mk_sources_data",
+                "tooltip": "Map: Sources data window",
+            },
+        ),
+        ("gap", {}),
+    ]
+    for slot in range(1, NUM_TRACKS + 1):
+        tokens.append(
+            (
+                "marker",
+                {
+                    "action": MIDI_ACTION_SEQ_ROW_ASSIGN,
+                    "params": {"row": slot - 1},
+                    "tag": f"media_mk_seq_{slot}",
+                    "tooltip": f"Map: sequencer line {slot} (selected source)",
+                },
+            )
+        )
+    tokens.append(("gap", {}))
+    for slot in range(1, MAPPER_LEARN_SLOTS + 1):
+        tokens.append(
+            (
+                "marker",
+                {
+                    "action": MIDI_ACTION_MAPPER_LINE,
+                    "params": {"line": slot - 1},
+                    "tag": f"media_mk_map_{slot}",
+                    "tooltip": f"Map: mapper line {slot} (selected source)",
+                },
+            )
+        )
+    # e74s13: the 8 blending modes on their own block (the tile menu's mouse twin).
+    tokens.append(("break", {}))
+    for mode_index, option in enumerate(BLENDING_OPTIONS):
+        tokens.append(
+            (
+                "marker",
+                {
+                    "action": MIDI_ACTION_SET_BLENDING,
+                    "params": {"blending": mode_index},
+                    "tag": f"media_mk_blend_{mode_index}",
+                    "tooltip": f"Map: blending {option} (selected source)",
+                },
+            )
+        )
+    return tokens
+
+
 def _sync_media_learn_bar() -> None:
     """Create or drop the Mediagrid source-browsing learn bar (e33s04).
 
-    While MIDI Learn is on, the sources window shows a marker bar
-    above the grid — fixed slots with separators: the generic markers
-    (next/prev/step/regen/correction/set-current/window), a dash, the
-    8 step-sequencer slots, a dash, the 4 Mapper slots; a SECOND row carries
-    the 8 blending modes (e74s13). Slot bindings are selection-relative and
-    pre-bindable even when fewer rows exist (a missing line is a logged no-op).
-    Leaving learn mode removes the bar; rebuilt from scratch each time.
+    While MIDI Learn is on, the sources window shows a marker bar above the grid
+    — the generic markers (next/prev/step/regen/correction/set-current/window),
+    the 8 step-sequencer slots, the 4 Mapper slots, then the 8 blending modes.
+    Slot bindings are selection-relative and pre-bindable even when fewer rows
+    exist (a missing line is a logged no-op). BUG-2026-10-21: the rows WRAP to
+    the live window width (a horizontal group would clip the tail), and the
+    window's resize handler calls this again while learning. Leaving learn mode
+    removes the bar; it is rebuilt from scratch each time.
     """
     bar_tag = "media_learn_bar"
     if dpg.does_item_exist(bar_tag):
@@ -7262,59 +7616,24 @@ def _sync_media_learn_bar() -> None:
     }
     if dpg.does_item_exist("media_grid"):
         bar_kwargs["before"] = "media_grid"  # stay above the tiles
-    # e74s13: the bar is a COLUMN of rows — the blending modes (8) would overflow a single
-    # row, so they get a row of their own under the browsing/slot markers.
+    window_width = int(dpg.get_item_width("vimix_media_window") or 0)
+    if window_width <= 0:  # before the first frame the window reports no size
+        window_width = VIMIX_MEDIA_WINDOW_W
+    available = int(media_available_width(window_width))
     with dpg.group(**bar_kwargs):
-        with dpg.group(horizontal=True) as row1:
-            learn_marker(MIDI_ACTION_SOURCE_NEXT, {}, parent=row1, tag="media_mk_next")
-            learn_marker(MIDI_ACTION_SOURCE_PREV, {}, parent=row1, tag="media_mk_prev")
-            learn_marker(
-                MIDI_ACTION_SOURCE_STEP,
-                {},
-                parent=row1,
-                tag="media_mk_step",
-                tooltip="Map: step sources by rotation",
-            )
-            learn_marker(MIDI_ACTION_REGEN_SELECTED, {}, parent=row1, tag="media_mk_regen")
-            learn_marker(MIDI_ACTION_ENABLE_CORRECTION, {}, parent=row1, tag="media_mk_cc")
-            learn_marker(MIDI_ACTION_SET_CURRENT, {}, parent=row1, tag="media_mk_setcurrent")
-            # e74s03: the Sources-data window joins the media learn bar (the new surface's
-            # red-M marker), so the window is MIDI-openable from the same bar.
-            learn_marker(
-                MIDI_ACTION_SHOW_WINDOW,
-                {"window": SOURCES_DATA_WINDOW_TAG},
-                parent=row1,
-                tag="media_mk_sources_data",
-                tooltip="Map: Sources data window",
-            )
-            _learn_group_gap(row1)
-            for slot in range(1, NUM_TRACKS + 1):
-                learn_marker(
-                    MIDI_ACTION_SEQ_ROW_ASSIGN,
-                    {"row": slot - 1},
-                    parent=row1,
-                    tag=f"media_mk_seq_{slot}",
-                    tooltip=f"Map: sequencer line {slot} (selected source)",
-                )
-            _learn_group_gap(row1)
-            for slot in range(1, MAPPER_LEARN_SLOTS + 1):
-                learn_marker(
-                    MIDI_ACTION_MAPPER_LINE,
-                    {"line": slot - 1},
-                    parent=row1,
-                    tag=f"media_mk_map_{slot}",
-                    tooltip=f"Map: mapper line {slot} (selected source)",
-                )
-        # e74s13: the 8 blending modes on their own row (the tile menu's mouse twin).
-        with dpg.group(horizontal=True) as row2:
-            for mode_index, option in enumerate(BLENDING_OPTIONS):
-                learn_marker(
-                    MIDI_ACTION_SET_BLENDING,
-                    {"blending": mode_index},
-                    parent=row2,
-                    tag=f"media_mk_blend_{mode_index}",
-                    tooltip=f"Map: blending {option} (selected source)",
-                )
+        for row_tokens in learn_bar_rows(_media_learn_tokens(), available):
+            with dpg.group(horizontal=True) as row:
+                for kind, spec in row_tokens:
+                    if kind == "gap":
+                        _learn_group_gap(row)
+                        continue
+                    learn_marker(
+                        str(spec["action"]),
+                        dict(spec.get("params") or {}),
+                        parent=row,
+                        tag=str(spec["tag"]),
+                        tooltip=spec.get("tooltip"),
+                    )
 
 
 def _learn_group_gap(parent: Any) -> None:
@@ -7434,7 +7753,14 @@ def midi_learn_complete(binding: dict[str, Any], port_name: str | None = None) -
     binding["params"] = params
     # e52s08: the learned Binding also takes the mode that is active right now
     # (the most recently activated one); a MODE_TOGGLE never gates itself.
-    learned_mode = "" if action == MIDI_ACTION_MODE_TOGGLE else (most_recent_mode() or "")
+    # e84: a `+`-armed learn names the layer explicitly (base included), so the
+    # new control joins the function it was added to.
+    target = state.midi_learn_target_mode
+    learned_mode = (
+        ""
+        if action == MIDI_ACTION_MODE_TOGGLE
+        else (target if target is not None else (most_recent_mode() or ""))
+    )
     if learned_mode:
         set_binding_mode(binding, learned_mode)
     controller = find_controller_by_port(port_name) if port_name else None
@@ -7450,7 +7776,8 @@ def midi_learn_complete(binding: dict[str, Any], port_name: str | None = None) -
         if dpg.does_item_exist("midi_learn_status"):
             dpg.set_value("midi_learn_status", "No controller owns that port")
         return
-    controller.setdefault("bindings", []).append(binding)
+    bindings = controller.setdefault("bindings", [])
+    replaced = upsert_binding(bindings, binding)
     save_midi_controllers()  # 2026-09-07: a learned mapping persists immediately
     state.midi_learn_pending = None
     _exit_midi_learn()
@@ -7462,10 +7789,10 @@ def midi_learn_complete(binding: dict[str, Any], port_name: str | None = None) -
         dpg.set_item_label("midi_learn_btn", "Learn mapping...")
     if dpg.does_item_exist("midi_learn_status"):
         mode_suffix = f" [mode {learned_mode}]" if learned_mode else ""
+        status = "Replaced: " if replaced else "Bound: "
         dpg.set_value(
             "midi_learn_status",
-            "Bound: "
-            f"{actions.action_label(action)} <- "
+            f"{status}{actions.action_label(action)} <- "
             f"{binding['device']} {binding['type']} {binding['number']}{mode_suffix}",
         )
 
@@ -7487,6 +7814,7 @@ def learnable(callback: Any, action_builder: Callable[[Any], tuple[str, dict[str
                 callback(sender, app_data, user_data)
                 return
             state.midi_learn_pending = action_builder(user_data)
+            state.midi_learn_target_mode = None  # a control click follows the active mode
             if dpg.does_item_exist("midi_learn_status"):
                 dpg.set_value("midi_learn_status", "Now press your MIDI button")
             return
@@ -7506,6 +7834,7 @@ def toggle_midi_learn(sender: Any = None, app_data: Any = None, user_data: Any =
         return
     state.midi_learn_mode = True
     state.midi_learn_pending = None
+    state.midi_learn_target_mode = None  # a generic learn follows the active mode (e52s08)
     state.midi_learn_started_at = time.time()
     if dpg.does_item_exist("midi_learn_btn"):
         dpg.set_item_label("midi_learn_btn", "Cancel learn")
@@ -7643,31 +7972,98 @@ def _midi_binding_row_label(binding: dict[str, Any]) -> str:
     )
 
 
+def _midi_binding_source_label(binding: dict[str, Any]) -> str:
+    """One control line under a multi-control function header (e84s02)."""
+    return f"{binding.get('type', '?')} {binding.get('number', '?')}"
+
+
+def _midi_binding_group_label(binding: dict[str, Any], count: int) -> str:
+    """The function header: the row label plus how many controls drive it (e84s02)."""
+    return f"{_midi_binding_row_label(binding)}  x{count}"
+
+
+def _add_binding_control_button(binding: dict[str, Any]) -> None:
+    """The `+` shortcut: arm learn to ADD another control to this function (e84s02)."""
+    dpg.add_button(
+        label="+",
+        width=18,
+        callback=arm_add_binding_control,
+        user_data=(
+            str(binding.get("action") or ""),
+            dict(binding.get("params") or {}),
+            binding_mode(binding) or "",
+        ),
+    )
+
+
+def _render_midi_binding_widgets(idx: int, binding: dict[str, Any]) -> None:
+    """One Binding's second line: Mode combo + LED editor + Delete (e84s02 extracted)."""
+    choices = [MIDI_MODE_BASE_CHOICE, *mode_names()]
+    with dpg.group(horizontal=True):
+        dpg.add_combo(
+            items=choices,
+            default_value=binding_mode(binding) or MIDI_MODE_BASE_CHOICE,
+            width=110,
+            callback=on_binding_mode_change,
+            user_data=idx,
+        )
+        _midi_binding_led_editor(idx, binding)
+        dpg.add_button(label="Delete", callback=delete_midi_binding, user_data=idx)
+
+
+def arm_add_binding_control(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    """Bindings list > `+`: arm MIDI Learn to ADD another control to a function (e84s02).
+
+    This is a learn affordance, not a new MIDI action: the next message captured by
+    the worker lands on the SAME action/params through `midi_learn_complete`, which
+    appends a new source or replaces the one already in that mode layer (e84s01).
+    """
+    action, params, mode = user_data
+    if not state.midi_enabled:
+        if dpg.does_item_exist("midi_learn_status"):
+            dpg.set_value("midi_learn_status", "Enable MIDI first (tick Enable MIDI above)")
+        return
+    state.midi_learn_mode = True
+    state.midi_learn_pending = (str(action), dict(params))
+    state.midi_learn_target_mode = str(mode or "")
+    state.midi_learn_started_at = time.time()
+    if dpg.does_item_exist("midi_learn_btn"):
+        dpg.set_item_label("midi_learn_btn", "Cancel learn")
+    if dpg.does_item_exist("midi_learn_status"):
+        dpg.set_value("midi_learn_status", "Now press the NEW control to add it")
+    _refresh_learn_surfaces()
+    refresh_toolbar_learn_icon()
+
+
 def refresh_midi_mappings_ui() -> None:
     """Rebuild the Bindings list for the selected controller (main thread) (e14s03).
 
     e52s02: each row carries a Mode combo (base + the registered modes), so ANY
     Binding — not just a Mapper one — can be tagged. e53: the Mode + LED controls
     live on a SECOND line, because one line (the long label plus six widgets)
-    overflows the 520 px window and the LED fields become unclickable.
+    overflows the 520 px window and the LED fields become unclickable. e84s02:
+    the rows are GROUPED by function; a function with one control keeps its row
+    label and gains a `+`, a function with N controls gets an `xN` header and a
+    `+` (each control keeps its own Mode/LED/Delete).
     """
     if not dpg.does_item_exist("midi_mappings_group"):
         return
     dpg.delete_item("midi_mappings_group", children_only=True)
-    choices = [MIDI_MODE_BASE_CHOICE, *mode_names()]
-    for idx, binding in enumerate(selected_bindings()):
+    for _key, group in group_bindings(selected_bindings()):
         with dpg.group(parent="midi_mappings_group"):
-            dpg.add_text(_midi_binding_row_label(binding))
+            idx, first = group[0]
             with dpg.group(horizontal=True):
-                dpg.add_combo(
-                    items=choices,
-                    default_value=binding_mode(binding) or MIDI_MODE_BASE_CHOICE,
-                    width=110,
-                    callback=on_binding_mode_change,
-                    user_data=idx,
-                )
-                _midi_binding_led_editor(idx, binding)
-                dpg.add_button(label="Delete", callback=delete_midi_binding, user_data=idx)
+                _add_binding_control_button(first)
+                if len(group) == 1:
+                    dpg.add_text(_midi_binding_row_label(first))
+                else:
+                    dpg.add_text(_midi_binding_group_label(first, len(group)))
+            for idx, binding in group:
+                if len(group) > 1:
+                    dpg.add_text(_midi_binding_source_label(binding))
+                _render_midi_binding_widgets(idx, binding)
             dpg.add_spacer(height=2)
 
 
@@ -7802,6 +8198,12 @@ MIDI_MODE_STATUS_TAG = "midi_mode_status"
 MIDI_MODES_SCROLL_TAG = "midi_modes_scroll"
 MIDI_MODES_GROUP_TAG = "midi_modes_group"
 MIDI_MODE_DELETE_CONFIRM_TAG = "midi_mode_delete_confirm"
+# e52s11: the rename dialog and the mode it is renaming (module state because the
+# window's widgets are rebuilt on every open).
+MIDI_MODE_RENAME_TAG = "midi_mode_rename"
+MIDI_MODE_RENAME_INPUT_TAG = "midi_mode_rename_input"
+MIDI_MODE_RENAME_STATUS_TAG = "midi_mode_rename_status"
+_mode_rename_source: str = ""
 MIDI_MODE_LED_FIELDS: tuple[str, ...] = ("number", "on_value", "off_value")
 MIDI_MODE_LED_FIELD_DEFAULTS: dict[str, int] = {
     "number": 0,
@@ -7809,9 +8211,14 @@ MIDI_MODE_LED_FIELD_DEFAULTS: dict[str, int] = {
     "off_value": MIDI_MODE_LED_OFF_DEFAULT,
 }
 MODE_BADGE_GROUP_TAG = "mode_badges"
-MODE_BADGE_ABBREV_CHARS = 3
-MODE_BADGE_W = 26
+MODE_BADGE_ABBREV_CHARS = 5
+# Five ProggyTiny glyphs at 6 px advance + the button's frame padding (e52s09).
+MODE_BADGE_W = 34
 MODE_BADGE_H = 18
+# e52s09: the compact 10 px ProggyTiny (6 px advance) is what lets five characters
+# fit inside the badge; the default 13 px font only fit three.
+MODE_BADGE_FONT_SIZE = 10
+_mode_badge_font: Any = None
 MODE_BADGE_TIP = "Mode {name} - click to turn it off"
 # e52s06 (rig feedback 2026-09-20): the strip is a SEPARATE window, decoupled
 # from the toolbar. Coupling it to the bar's width broke the bar itself (the
@@ -7902,6 +8309,82 @@ def confirm_midi_mode_delete(
     refresh_mapper_ui()
 
 
+def on_rename_midi_mode(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Modes row: the name button opens the rename dialog (e52s11)."""
+    show_midi_mode_rename(str(user_data or ""))
+
+
+def show_midi_mode_rename(name: str) -> None:
+    """Open the pre-filled rename dialog for a registered mode (e52s11)."""
+    definition = mode_definition(name)
+    if definition is None:
+        return
+    if dpg.does_item_exist(MIDI_MODE_RENAME_TAG):
+        dpg.delete_item(MIDI_MODE_RENAME_TAG)
+    global _mode_rename_source
+    _mode_rename_source = str(definition.get("name") or "")
+    with dpg.window(
+        label="Rename mode",
+        tag=MIDI_MODE_RENAME_TAG,
+        modal=True,
+        width=380,
+        height=170,
+        no_resize=True,
+    ):
+        themed_text(f"Rename mode '{_mode_rename_source}'", slot="text")
+        dpg.add_input_text(
+            tag=MIDI_MODE_RENAME_INPUT_TAG,
+            default_value=_mode_rename_source,
+            width=320,
+            on_enter=True,
+            callback=confirm_midi_mode_rename,
+        )
+        themed_text("", slot="text_dim", tag=MIDI_MODE_RENAME_STATUS_TAG)
+        dpg.add_separator()
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Cancel", callback=cancel_midi_mode_rename, width=140)
+            dpg.add_button(label="Rename", callback=confirm_midi_mode_rename, width=140)
+    show_centered_window(MIDI_MODE_RENAME_TAG)
+    if dpg.does_item_exist(MIDI_MODE_RENAME_INPUT_TAG):
+        dpg.focus_item(MIDI_MODE_RENAME_INPUT_TAG)
+
+
+def cancel_midi_mode_rename(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    """Rename dialog Cancel: close it, nothing changes (e52s11)."""
+    global _mode_rename_source
+    _mode_rename_source = ""
+    if dpg.does_item_exist(MIDI_MODE_RENAME_TAG):
+        dpg.delete_item(MIDI_MODE_RENAME_TAG)
+
+
+def confirm_midi_mode_rename(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    """Rename dialog Rename/Enter: migrate every reference or state why not (e52s11)."""
+    old_name = _mode_rename_source
+    new_name = ""
+    if dpg.does_item_exist(MIDI_MODE_RENAME_INPUT_TAG):
+        new_name = str(dpg.get_value(MIDI_MODE_RENAME_INPUT_TAG) or "").strip()
+    result = rename_mode(old_name, new_name)
+    if result != MODE_RENAME_OK:
+        message = {
+            MODE_RENAME_EMPTY: "Enter a non-empty mode name",
+            MODE_RENAME_DUPLICATE: "That name is already used",
+            MODE_RENAME_UNKNOWN: "Mode no longer exists",
+        }.get(result, "Rename failed")
+        if dpg.does_item_exist(MIDI_MODE_RENAME_STATUS_TAG):
+            dpg.set_value(MIDI_MODE_RENAME_STATUS_TAG, message)
+        return
+    cancel_midi_mode_rename()
+    if dpg.does_item_exist(MIDI_MODE_STATUS_TAG):
+        dpg.set_value(MIDI_MODE_STATUS_TAG, f"Mode '{old_name}' renamed to '{new_name}'")
+    refresh_midi_modes_ui()
+    refresh_midi_mappings_ui()
+    refresh_mapper_ui()
+
+
 def on_midi_mode_led_change(
     sender: Any = None, app_data: Any = None, user_data: Any = None
 ) -> None:
@@ -7951,13 +8434,26 @@ def _midi_mode_led_editor(name: str) -> None:
 
 
 def refresh_midi_modes_ui() -> None:
-    """Rebuild the Modes list of the MIDI window (e52s01)."""
+    """Rebuild the Modes list of the MIDI window (e52s01).
+
+    e52s11: the name is the rename affordance — a button that opens the pre-filled
+    dialog (the row is already full with the LED editor and Delete).
+    """
     if not dpg.does_item_exist(MIDI_MODES_GROUP_TAG):
         return
     dpg.delete_item(MIDI_MODES_GROUP_TAG, children_only=True)
-    for name in mode_names():
+    for index, name in enumerate(mode_names()):
         with dpg.group(horizontal=True, parent=MIDI_MODES_GROUP_TAG) as row:
-            dpg.add_text(name)
+            name_tag = f"midi_mode_name_{index}"
+            dpg.add_button(
+                label=name,
+                tag=name_tag,
+                callback=on_rename_midi_mode,
+                user_data=name,
+            )
+            with dpg.tooltip(name_tag, delay=HELP_HOVER_DELAY_S) as tip_tag:
+                dpg.add_text("Rename this mode")
+            dpg.bind_item_theme(tip_tag, HELP_THEME_TOOLTIP)
             _midi_mode_led_editor(name)
             if state.midi_learn_mode:
                 learn_marker(
@@ -8055,6 +8551,8 @@ def refresh_mode_chip() -> None:
             callback=on_mode_badge_click,
             user_data=name,
         )
+        if _mode_badge_font is not None:
+            dpg.bind_item_font(tag, _mode_badge_font)
         dpg.bind_item_theme(tag, TOOLBAR_THEME_LEARN)
         with dpg.tooltip(tag, delay=HELP_HOVER_DELAY_S) as tip_tag:
             dpg.add_text(MODE_BADGE_TIP.format(name=name))
@@ -8514,6 +9012,23 @@ def _exec_mapping_toggle(params: dict[str, Any], value: int) -> None:
     refresh_binding_leds()  # e53s02
 
 
+def _exec_mapping_so(params: dict[str, Any], value: int) -> None:
+    """e92: a momentary press mutes/resumes a Mapping's Secondary Output.
+
+    The SO belongs to the Mapping; a stale id, or a Mapping with no SO, is a
+    logged no-op. The card's square is rebuilt by refresh_mapper_ui, so its
+    accent/amber state follows immediately.
+    """
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    mapping = mapper.find_mapping(int(params.get("mapping_id", 0)))
+    if mapping is None or not mapper.mapping_has_secondary_output(mapping):
+        _log_stale_midi_target(MIDI_ACTION_MAPPING_SO, f"no mapping SO {params.get('mapping_id')}")
+        return
+    mapper.toggle_mapping_secondary_output(int(mapping["id"]))
+    refresh_mapper_ui()
+
+
 def _exec_mapping_add(params: dict[str, Any], value: int) -> None:
     """e40s08/e40s10: a momentary press opens the Mapping creator.
 
@@ -8746,7 +9261,7 @@ def assign_control_to_mapping(control: tuple[str, str, int, int, str], mapping_i
         "number": int(number),
     }
     binding = {**source, "action": MIDI_ACTION_MAPPER_MAPPING, "params": {"mapping_id": mapping_id}}
-    controller.setdefault("bindings", []).append(binding)
+    upsert_binding(controller.setdefault("bindings", []), binding)
     save_midi_controllers()
     mapper.set_mapping_midi(mapping_id, binding)
     refresh_midi_mappings_ui()
@@ -9056,10 +9571,22 @@ def tick_mapper_clipboard(now: float | None = None) -> None:
     refresh_mapper_ui()
 
 
+def _select_tracking_tab(tab_tag: str) -> None:
+    """Select one engine tab (the window must be shown first)."""
+    if dpg.does_item_exist(tab_tag) and dpg.does_item_exist("tracking_tab_bar"):
+        dpg.set_value("tracking_tab_bar", tab_tag)
+
+
+def show_tracking_window(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Open the ONE Tracking window (engine tabs) from the toolbar."""
+    dpg.show_item(TRACKING_WINDOW_TAG)
+    dpg.focus_item(TRACKING_WINDOW_TAG)
+
+
 def show_leap_window(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
-    """Open the Leap Motion window from Settings > Leap Motion (e26s01)."""
-    dpg.show_item("leap_window")
-    dpg.focus_item("leap_window")  # e17: a shown window must come to the front
+    """Open Tracking on the hand engines (the old Hand-trackings entry point)."""
+    show_tracking_window()
+    _select_tracking_tab("tracking_tab_hands")  # e17: a shown window must come to the front
 
 
 def on_leap_enable(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
@@ -9115,6 +9642,1721 @@ def _apply_leap_viz_layout(shown: bool) -> None:
         dpg.hide_item("leap_viz_panel")
 
 
+# ---------- e87: the ONE Hand tracking window (provider combo + webcam block) ----------
+
+
+def _apply_hand_provider_layout(provider: str) -> None:
+    """Select the provider and refresh its camera list (e90s04: tabs, no hiding).
+
+    The Leap and webcam blocks used to show/hide inside ONE window; they now live
+    in their own tabs, so this only keeps the combo and the device list honest.
+    """
+    if dpg.does_item_exist("handtrack_provider_cb"):
+        dpg.set_value("handtrack_provider_cb", handtrack.PROVIDER_LABELS.get(provider, provider))
+    if provider != handtrack.PROVIDER_LEAP and dpg.does_item_exist("handtrack_camera_cb"):
+        devices = handio.list_devices()
+        dpg.configure_item("handtrack_camera_cb", items=devices)
+        dpg.set_value(
+            "handtrack_camera_cb",
+            state.handtrack_device or (devices[0] if devices else ""),
+        )
+
+
+def _apply_handtrack_preview_layout(shown: bool) -> None:
+    """Fold/unfold the webcam preview panel (the window scrollbar absorbs it)."""
+    if dpg.does_item_exist("handtrack_preview_panel"):
+        dpg.configure_item("handtrack_preview_panel", show=shown)
+
+
+def _sync_camera_owner_widgets() -> None:
+    """After ANY camera-owner change, all three engine panels show the truth.
+
+    Operator rig 2026-10-29: enabling Bodies left "Enable webcam" ticked, because
+    each Enable callback only synced its own panel while the owner policy turns
+    the other two off. The camera is one device; the UI must say so everywhere.
+    """
+    _sync_handtrack_widgets()
+    _sync_zones_widgets()
+    _sync_body_widgets()
+
+
+def _sync_handtrack_widgets() -> None:
+    """Push the live hand-engine state onto the window widgets (if built)."""
+    if dpg.does_item_exist("handtrack_provider_cb"):
+        dpg.set_value("handtrack_provider_cb", handtrack.PROVIDER_LABELS[state.hand_provider])
+    if dpg.does_item_exist("handtrack_enable_cb"):
+        dpg.set_value("handtrack_enable_cb", state.handtrack_enabled)
+    if dpg.does_item_exist("handtrack_mirror_cb"):
+        dpg.set_value("handtrack_mirror_cb", state.handtrack_mirror)
+    if dpg.does_item_exist("handtrack_box_slider"):
+        dpg.set_value("handtrack_box_slider", state.handtrack_box)
+    if dpg.does_item_exist("handtrack_maxhz_slider"):
+        dpg.set_value("handtrack_maxhz_slider", state.handtrack_max_hz)
+    if dpg.does_item_exist("handtrack_preview_cb"):
+        dpg.set_value("handtrack_preview_cb", state.handtrack_preview)
+    # BUG-2026-10-24: the panel used to follow ONLY the checkbox callback, so a
+    # persisted `preview: true` opened the window checked but FOLDED and the
+    # frames went into a hidden child window ("the preview does not start until I
+    # toggle it off and on").
+    _apply_handtrack_preview_layout(state.handtrack_preview)
+    _apply_hand_provider_layout(state.hand_provider)
+
+
+def _hand_widget_value(tag: str, fallback: Any) -> Any:
+    """The widget's own value: a programmatic sync is not a user edit.
+
+    BUG-2026-10-23T201500: DearPyGui dispatches an item's value-changed event on
+    the next frame even when the value was set by ``_sync_handtrack_widgets``, so
+    ``app_data`` can carry a stale value. Trusting it rewrote the persisted hand
+    config with widget defaults at every boot and turned the webcam engine ON
+    (the config said enabled=false). Read the widget; fall back to app_data only
+    when the item does not exist (a unit call).
+    """
+    return dpg.get_value(tag) if dpg.does_item_exist(tag) else fallback
+
+
+def _hand_window_active() -> bool:
+    """True only while the Hand tracking window is on screen.
+
+    BUG-2026-10-23T201500: DearPyGui dispatches value-changed events for the
+    widgets of this window during boot even though it is hidden, and the payload
+    of those events is not the value we pushed (a checkbox reported True while
+    the item and the state were False). Persisting them rewrote the config at
+    every boot and turned the webcam engine on. A hidden window cannot have been
+    edited by the operator, so its callbacks are ignored.
+    """
+    return dpg.does_item_exist(TRACKING_WINDOW_TAG) and dpg.is_item_shown(TRACKING_WINDOW_TAG)
+
+
+def on_hand_provider_change(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    """Engine combo: switch the active provider (the other one is disabled)."""
+    if not _hand_window_active():
+        return  # a hidden window cannot have been edited
+    label = str(_hand_widget_value("handtrack_provider_cb", app_data))
+    provider = next(
+        (p for p, text in handtrack.PROVIDER_LABELS.items() if text == label),
+        handtrack.PROVIDER_LEAP,
+    )
+    if provider == state.hand_provider:
+        # The dispatch may carry the provider we already have; the window still
+        # has to show THAT provider's block (otherwise the operator has to
+        # switch twice to see the webcam options).
+        _apply_hand_provider_layout(provider)
+        return
+    handtrack.set_hand_provider(provider)
+    _sync_handtrack_widgets()
+
+
+def on_handtrack_enable(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Webcam Enable: select the provider, then persist + apply the toggle."""
+    if not _hand_window_active():
+        return  # a hidden window cannot have been edited
+    enabled = bool(_hand_widget_value("handtrack_enable_cb", app_data))
+    if enabled == state.handtrack_enabled:
+        return  # the sync pushed the value we already have
+    if enabled:
+        handtrack.set_hand_provider(handtrack.PROVIDER_WEBCAM)
+    handtrack.set_handtrack_enabled(enabled)
+    _apply_hand_provider_layout(handtrack.PROVIDER_WEBCAM)
+    _sync_camera_owner_widgets()
+
+
+def on_handtrack_camera(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Camera combo: persist the device and rebuild the capture."""
+    if not _hand_window_active():
+        return  # a hidden window cannot have been edited
+    device = str(_hand_widget_value("handtrack_camera_cb", app_data))
+    if device == state.handtrack_device:
+        return
+    handtrack.set_handtrack_option("device", device)
+    handtrack_restart()
+
+
+def on_handtrack_mirror(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Mirror switch: x follows the hand as in a mirror (the default)."""
+    if not _hand_window_active():
+        return  # a hidden window cannot have been edited
+    mirror = bool(_hand_widget_value("handtrack_mirror_cb", app_data))
+    if mirror == state.handtrack_mirror:
+        return
+    handtrack.set_handtrack_option("mirror", mirror)
+
+
+def on_handtrack_box(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Interaction box size (fraction of the frame)."""
+    if not _hand_window_active():
+        return  # a hidden window cannot have been edited
+    box = float(_hand_widget_value("handtrack_box_slider", app_data))
+    if abs(box - state.handtrack_box) < 1e-6:
+        return
+    handtrack.set_handtrack_option("box", box)
+
+
+def on_handtrack_maxhz(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Inference cadence above the sensor rate."""
+    if not _hand_window_active():
+        return  # a hidden window cannot have been edited
+    max_hz = float(_hand_widget_value("handtrack_maxhz_slider", app_data))
+    if abs(max_hz - state.handtrack_max_hz) < 1e-6:
+        return
+    handtrack.set_handtrack_option("max_hz", max_hz)
+
+
+def on_handtrack_preview(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Preview on/off (off by default: it costs render + a frame copy)."""
+    if not _hand_window_active():
+        return  # a hidden window cannot have been edited
+    shown = bool(_hand_widget_value("handtrack_preview_cb", app_data))
+    # The panel is the only thing that folds/unfolds with the checkbox: it must
+    # follow the widget even when there is nothing to persist (a stale dispatch
+    # used to leave the preview folded, so "the preview no longer starts").
+    _apply_handtrack_preview_layout(shown)
+    if shown == state.handtrack_preview:
+        return
+    handtrack.set_handtrack_option("preview", shown)
+
+
+_handtrack_monitor_cache: dict[str, str] = {}
+
+
+def _handtrack_set_text(tag: str, text: str) -> None:
+    """Write one window text only when it changed (the e26s02 discipline)."""
+    if _handtrack_monitor_cache.get(tag) != text:
+        _handtrack_monitor_cache[tag] = text
+        if dpg.does_item_exist(tag):
+            dpg.set_value(tag, text)
+
+
+def _handtrack_field_text(hand: str, field: str, snapshot: dict[str, float]) -> str:
+    """One monitor cell: the value with the provider's decimals, or the placeholder.
+
+    Operator request 2026-10-24: the monitor is one COLUMN per hand (the Leap
+    window's shape), so a narrow window never hides a signal from the hand the
+    operator is not reading - each cell clips on its own instead of a whole line.
+    """
+    raw = snapshot.get(f"{hand}.{field}")
+    if raw is None:
+        return handtrack.MONITOR_PLACEHOLDER
+    return f"{float(raw):.{handtrack.field_decimals(field, state.hand_provider)}f}"
+
+
+TRACKING_DECISION_TAG = "tracking_decision_window"
+# The main loop asks "is a decision pending?" every frame: the modal must be
+# built ONCE (rebuilding it per frame made it flash and stole the input).
+_tracking_decision_open = False
+TRACKING_EVENTS_WINDOW = "tracking_events_window"
+_tracking_bus = trackevents.EventBus()
+
+
+def tracking_event_snapshot() -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]:
+    """The two snapshots the bus reads, copied under their locks."""
+    with state.zones_lock:
+        zones = {group: dict(row) for group, row in state.zones_snapshot.items()}
+    with state.body_lock:
+        bodies = {group: dict(row) for group, row in state.body_snapshot.items()}
+    return zones, bodies
+
+
+def tracking_event_step(now: float) -> list[trackevents.TrackingEvent]:
+    """One bus step + the cue dispatch (main thread: cue.cue_start lives here)."""
+    zones, bodies = tracking_event_snapshot()
+    events = _tracking_bus.step(now, zones, bodies)
+    for event in events:
+        state.tracking_event_count += 1
+        state.tracking_event_last = f"{event.label}: {event.detail}"
+        for mapping_id in trackevents.targets(state.tracking_event_bindings, event):
+            cue.cue_start(mapping_id, allow_restart=True)
+    return events
+
+
+def tick_tracking_events() -> None:
+    """Main-loop cadence: the same 10 Hz the monitor uses (cheap edge detection)."""
+    if not state.tracking_event_bindings:
+        return
+    tracking_event_step(time.monotonic())
+
+
+def on_tracking_events_clear(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    _tracking_bus.reset()
+    append_log("Tracking", "event state cleared")
+
+
+def _event_detail_hint(kind: str) -> str:
+    if kind in (trackevents.EVENT_ZONE_ENTER, trackevents.EVENT_ZONE_EXIT):
+        return "zone1"
+    if kind == trackevents.EVENT_TRACK_LOST:
+        return "body1"
+    return "body1.arms_up"
+
+
+def _selected_event_kind() -> str:
+    return trackevents.kind_from_label(str(dpg.get_value("tracking_event_kind")))
+
+
+def _add_tracking_binding() -> None:
+    kind = _selected_event_kind()
+    detail = str(dpg.get_value("tracking_event_detail")).strip()
+    mapping_id = int(dpg.get_value("tracking_event_mapping"))
+    binding = trackevents.sanitize_binding(
+        {"kind": kind, "detail": detail, "mapping_id": mapping_id}
+    )
+    if binding is None:
+        log_warn("Tracking", "a binding needs a cue mapping id")
+        return
+    state.tracking_event_bindings = trackevents.sanitize_bindings(
+        [*state.tracking_event_bindings, binding]
+    )
+    _refresh_tracking_bindings()
+    _sync_project_dirty()  # e90s07: the bindings are project content
+
+
+def _remove_tracking_binding(index: int) -> None:
+    bindings = list(state.tracking_event_bindings)
+    if 0 <= index < len(bindings):
+        del bindings[index]
+        state.tracking_event_bindings = bindings
+        _refresh_tracking_bindings()
+        _sync_project_dirty()  # e90s07: the bindings are project content
+
+
+def _refresh_tracking_bindings() -> None:
+    if not dpg.does_item_exist("tracking_bindings_group"):
+        return
+    dpg.delete_item("tracking_bindings_group", children_only=True)
+    if not state.tracking_event_bindings:
+        dpg.add_text("No event bound yet.", parent="tracking_bindings_group")
+        return
+    for index, binding in enumerate(state.tracking_event_bindings):
+        label = trackevents.EVENT_LABELS.get(binding["kind"], binding["kind"])
+        dpg.add_text(
+            f"{label} {binding['detail'] or '(any)'} -> cue {binding['mapping_id']}",
+            parent="tracking_bindings_group",
+        )
+        dpg.add_button(
+            label="Remove",
+            parent="tracking_bindings_group",
+            callback=lambda s=None, a=None, u=None, i=index: _remove_tracking_binding(i),
+        )
+
+
+def on_tracking_event_test(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Fire the selected event synthetically so a cue can be wired in an empty room."""
+    kind = _selected_event_kind()
+    detail = str(dpg.get_value("tracking_event_detail")).strip() or _event_detail_hint(kind)
+    event = trackevents.TrackingEvent(kind, detail, trackevents.EVENT_LABELS.get(kind, kind))
+    state.tracking_event_count += 1
+    state.tracking_event_last = f"{event.label}: {event.detail}"
+    for mapping_id in trackevents.targets(state.tracking_event_bindings, event):
+        cue.cue_start(mapping_id, allow_restart=True)
+    append_log("Tracking", f"test event {kind} {detail}")
+
+
+def show_tracking_events_window(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    """The bindings editor: event kind, detail, target cue, add/remove/test."""
+    if dpg.does_item_exist(TRACKING_EVENTS_WINDOW):
+        dpg.delete_item(TRACKING_EVENTS_WINDOW)
+    with dpg.window(
+        label="Tracking events",
+        tag=TRACKING_EVENTS_WINDOW,
+        modal=True,
+        width=480,
+        height=420,
+    ):
+        dpg.add_text("A held pose or a zone entry fires the cue ONCE (edge).", wrap=440)
+        with dpg.group(horizontal=True):
+            dpg.add_combo(
+                items=[trackevents.EVENT_LABELS[kind] for kind in trackevents.EVENT_KINDS],
+                default_value=trackevents.EVENT_LABELS[trackevents.EVENT_ZONE_ENTER],
+                tag="tracking_event_kind",
+                width=190,
+            )
+            dpg.add_input_text(
+                hint=_event_detail_hint(trackevents.EVENT_ZONE_ENTER),
+                tag="tracking_event_detail",
+                width=120,
+            )
+            dpg.add_input_int(tag="tracking_event_mapping", width=110, default_value=1, min_value=1)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Add binding", callback=lambda: _add_tracking_binding())
+            dpg.add_button(label="Test", callback=on_tracking_event_test)
+            dpg.add_button(label="Clear events", callback=on_tracking_events_clear)
+        dpg.add_separator()
+        with dpg.child_window(height=230, tag="tracking_bindings_group"):
+            _refresh_tracking_bindings()
+    show_centered_window(TRACKING_EVENTS_WINDOW)
+
+
+TRACKING_PICKER_WINDOW = "tracking_signals_window"
+PICKER_SIGNAL_PREFIX = "tracking_sig_"
+PICKER_REFRESH_HZ = 10.0
+
+_tracking_rows: list[Any] = []
+_tracking_row_tags: dict[str, Any] = {}
+_tracking_last_signal: tuple[str, str, str] | None = None
+_tracking_picker_at = 0.0
+
+
+def tracking_rows() -> list[Any]:
+    """The live monitor rows, built from the catalogs + the current snapshots."""
+    with state.leap_lock:
+        leap_values = dict(state.leap_values)
+    with state.body_lock:
+        body_snapshot = dict(state.body_snapshot)
+    with state.zones_lock:
+        zones_snapshot = dict(state.zones_snapshot)
+    return trackmonitor.monitor_rows(
+        state.hand_provider, leap_values, body_snapshot, zones_snapshot, list(state.zones_config)
+    )
+
+
+def _seed_signal_mapping(mapping_id: int, engine: str, group_id: str, key: str) -> None:
+    if engine in (trackmonitor.ENGINE_LEAP, trackmonitor.ENGINE_HAND):
+        provider = (
+            handtrack.PROVIDER_LEAP
+            if engine == trackmonitor.ENGINE_LEAP
+            else (handtrack.PROVIDER_WEBCAM)
+        )
+        mapper.set_mapping_leap(mapping_id, key, provider)
+    elif engine == trackmonitor.ENGINE_BODY:
+        mapper.set_mapping_body(mapping_id, int(group_id.replace("body", "")), key)
+    else:
+        mapper.set_mapping_zone(mapping_id, int(group_id.replace("zone", "")), key)
+
+
+def add_mapping_for_signal(engine: str, group_id: str, key: str) -> dict[str, Any] | None:
+    """e90s06: turn one monitor row into a Mapper line for the current source."""
+    target = state.vjmix_selected_source
+    if not target:
+        log_warn("Tracking", "select a vimix source before adding a mapping")
+        return None
+    mapping = mapper.add_mapping(target, "alpha", "slider")
+    _seed_signal_mapping(int(mapping["id"]), engine, group_id, key)
+    refresh_mapper_ui()
+    global _tracking_last_signal
+    _tracking_last_signal = (engine, group_id, key)
+    append_log("Tracking", f"mapped {engine} {group_id} {key}")
+    return mapping
+
+
+def on_tracking_signal_click(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    if not isinstance(user_data, tuple) or len(user_data) != 3:
+        return
+    engine, group_id, key = user_data
+    add_mapping_for_signal(str(engine), str(group_id), str(key))
+
+
+def show_tracking_source_picker(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    """The ONE signals picker: every row is clickable and becomes a Mapper line."""
+    global _tracking_rows, _tracking_row_tags
+    if dpg.does_item_exist(TRACKING_PICKER_WINDOW):
+        dpg.delete_item(TRACKING_PICKER_WINDOW)
+    _tracking_rows = tracking_rows()
+    _tracking_row_tags = {}
+    with dpg.window(
+        label="Tracking signals",
+        tag=TRACKING_PICKER_WINDOW,
+        modal=True,
+        width=560,
+        height=600,
+    ):
+        dpg.add_text("Click a signal to add a Mapper line for the current vimix source.", wrap=520)
+        with dpg.child_window(height=520, tag="tracking_signals_scroll"):
+            for index, (title, rows) in enumerate(trackmonitor.group_rows(_tracking_rows)):
+                themed_text(title, slot="text_bright")
+                for row in rows:
+                    tag = f"{PICKER_SIGNAL_PREFIX}{index}_{row.group_id}_{row.key}"
+                    _tracking_row_tags[tag] = row
+                    dpg.add_button(
+                        label=row.text(),
+                        tag=tag,
+                        width=-1,
+                        callback=on_tracking_signal_click,
+                        user_data=(row.engine, row.group_id, row.key),
+                    )
+                dpg.add_separator()
+    show_centered_window(TRACKING_PICKER_WINDOW)
+
+
+def tick_tracking_source_picker() -> None:
+    """Refresh the visible values at 10 Hz (only while the picker is open)."""
+    global _tracking_picker_at
+    if not dpg.does_item_exist(TRACKING_PICKER_WINDOW):
+        return
+    if state.tracking_frozen:
+        return
+    now = time.time()
+    if now - _tracking_picker_at < 1.0 / PICKER_REFRESH_HZ:
+        return
+    _tracking_picker_at = now
+    fresh = {f"{row.engine}|{row.group_id}|{row.key}": row for row in tracking_rows()}
+    for tag, row in _tracking_row_tags.items():
+        updated = fresh.get(f"{row.engine}|{row.group_id}|{row.key}")
+        if updated is not None and dpg.does_item_exist(tag):
+            dpg.configure_item(tag, label=updated.text())
+
+
+def tracking_set_frozen(frozen: bool) -> None:
+    """Safety hold: the Mapper keeps its values, the engines keep running."""
+    state.tracking_frozen = bool(frozen)
+    append_log("Tracking", "values frozen" if state.tracking_frozen else "values following")
+
+
+def tracking_force_inline() -> None:
+    """Drop the child for this session: tracking continues in-process."""
+    trackchild.set_host(trackchild.HOST_INLINE)
+    if _track_child is not None:
+        _track_child.stop()
+    state.tracking_needs_decision = False
+    state.tracking_status = trackchild.STATUS_INLINE
+    append_log("Tracking", "running inline for this session")
+
+
+def tracking_retry() -> None:
+    """Clear the decision and start the child again."""
+    state.tracking_needs_decision = False
+    if state.tracking_host != trackchild.HOST_CHILD:
+        trackchild.set_host(trackchild.HOST_CHILD)
+    if _track_child is not None:
+        _track_child.restart()
+    append_log("Tracking", "child retry requested")
+
+
+def tracking_panic() -> None:
+    """The show-safety net: every engine off, every value held, no OSC burst.
+
+    BUG-2026-10-29 (operator rig): panic also left `tracking_frozen` ON, so after
+    a panic every drive returned early and NO mapping moved again, even after
+    re-enabling and re-mapping. The hold does not need the freeze flag: with the
+    engines off nothing publishes a new snapshot, so the values simply stop
+    where they are. Freeze stays a separate, explicit choice.
+    """
+    if _track_child is not None:
+        _track_child.stop()
+    camera.set_camera_engine(camera.CAMERA_NONE)
+    if state.leap_enabled:
+        set_leap_enabled(False)
+    state.tracking_needs_decision = False
+    _sync_handtrack_widgets()
+    _sync_zones_widgets()
+    _sync_body_widgets()
+    append_log("Tracking", "PANIC: every engine off; re-enable one to resume")
+
+
+def on_tracking_host_change(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    """Switch where the camera + models run (persisted; applies on the next worker pass)."""
+    label = str(app_data)
+    host = next(
+        (key for key, value in TRACKING_HOST_LABELS.items() if value == label),
+        trackchild.HOST_INLINE,
+    )
+    if host == state.tracking_host:
+        return
+    trackchild.set_host(host)
+    if host == trackchild.HOST_INLINE and _track_child is not None:
+        _track_child.stop()
+    if dpg.does_item_exist("tracking_host_hint"):
+        dpg.set_value("tracking_host_hint", TRACKING_HOST_HINTS[host])
+    append_log("Tracking", f"host {host}")
+
+
+def on_tracking_freeze(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    tracking_set_frozen(not state.tracking_frozen)
+
+
+def on_tracking_panic(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    tracking_panic()
+
+
+def on_tracking_inline(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    tracking_force_inline()
+
+
+def on_tracking_retry(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    tracking_retry()
+
+
+def _close_tracking_decision() -> None:
+    global _tracking_decision_open
+    _tracking_decision_open = False
+    if dpg.does_item_exist(TRACKING_DECISION_TAG):
+        dpg.delete_item(TRACKING_DECISION_TAG)
+
+
+def _decision_retry(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    _close_tracking_decision()
+    tracking_retry()
+
+
+def _decision_inline(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    _close_tracking_decision()
+    tracking_force_inline()
+
+
+def _decision_disable(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    _close_tracking_decision()
+    tracking_panic()
+
+
+def show_tracking_decision() -> None:
+    """Ask the operator what to do after RESTART_LIMIT failures (decision 4)."""
+    global _tracking_decision_open
+    if _tracking_decision_open and dpg.does_item_exist(TRACKING_DECISION_TAG):
+        return
+    if dpg.does_item_exist(TRACKING_DECISION_TAG):
+        dpg.delete_item(TRACKING_DECISION_TAG)
+    _tracking_decision_open = True
+    with dpg.window(
+        label="Tracking",
+        tag=TRACKING_DECISION_TAG,
+        modal=True,
+        width=470,
+        height=190,
+        no_resize=True,
+        no_close=True,
+    ):
+        dpg.add_text("The tracker process failed three times.", wrap=430)
+        dpg.add_text(
+            "Tracking is running inline: it works, but a native crash can now take "
+            "the application down.",
+            wrap=430,
+        )
+        dpg.add_separator()
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Retry", callback=_decision_retry, width=130)
+            dpg.add_button(label="Run inline", callback=_decision_inline, width=130)
+            dpg.add_button(label="Disable tracking", callback=_decision_disable, width=160)
+    show_centered_window(TRACKING_DECISION_TAG)
+
+
+# The matrix colours by STATUS, not by decoration: green = working, amber =
+# searching/starting, red = broken, dim = switched off. One glance, no reading.
+_MATRIX_OK = frozenset({"live", "tracking", "connected"})
+_MATRIX_WARN = frozenset({"searching", "starting", "inline", ""})
+_MATRIX_ERROR_COLOR: tuple[int, int, int] = (230, 90, 90)
+_matrix_color_cache: dict[str, list[int]] = {}
+
+
+def _matrix_row_color(enabled: bool, status: str) -> list[int]:
+    """The colour of one matrix row (pure: the UI only applies it)."""
+    if not enabled:
+        return palette_rgba(state.active_palette["text_dim"])
+    if status in _MATRIX_OK:
+        return palette_rgba(state.active_palette["accent"])
+    if status in _MATRIX_WARN:
+        return palette_rgba(state.active_palette["warning"])
+    return list(_MATRIX_ERROR_COLOR)
+
+
+def _owner_text(engine: str) -> str:
+    """``camera`` on the engine that owns the device, ``-`` on the others.
+
+    The matrix used to print ``camera`` on ALL three camera rows: true once,
+    misleading twice (operator rig, 2026-10-28).
+    """
+    return "camera" if camera.camera_engine() == engine else "-"
+
+
+def _hands_owner_text() -> str:
+    """Owner + the restart streak, so the 3-strike rule is visible on the rig."""
+    text = _owner_text(camera.CAMERA_HAND)
+    restarts = int(state.tracking_restarts or 0)
+    return f"{text}  R{restarts}" if restarts else text
+
+
+# One vocabulary for the operator: the engines emit technical status codes, the
+# matrix speaks English (operator rig 2026-10-28).
+STATUS_TEXT: dict[str, str] = {
+    "off": "off",
+    "on": "on",
+    "missing": "not installed",
+    "missing-deps": "models missing",
+    "no-camera": "no camera",
+    "stalled": "camera not responding",
+    "lost": "camera lost",
+    "disconnected": "not connected",
+    "connected": "connected",
+    "offline": "offline",
+    "mismatch": "protocol mismatch",
+    "starting": "starting",
+    "inline": "inline",
+    "searching": "searching",
+    "tracking": "tracking",
+    "live": "live",
+}
+# An engine in one of these states is not a problem, just quiet.
+QUIET_STATUSES = frozenset(
+    {"off", "searching", "starting", "inline", "connected", "live", "tracking"}
+)
+TRACKING_TABS: tuple[tuple[str, str, str], ...] = (
+    ("tracking_tab_leap", "Leap", "leap"),
+    ("tracking_tab_hands", "Hands", "hand"),
+    ("tracking_tab_bodies", "Bodies", "body"),
+    ("tracking_tab_zones", "Zones", "zones"),
+)
+_tab_label_cache: dict[str, str] = {}
+
+
+def human_status(status: str) -> str:
+    """The operator-facing word for an engine status code."""
+    return STATUS_TEXT.get(status, status or "off")
+
+
+def _engine_triplet(engine: str) -> tuple[bool, str, float, float]:
+    """(enabled, status, fps, latency) for one camera engine."""
+    if engine == "hand":
+        return (
+            state.handtrack_enabled,
+            state.handtrack_status,
+            state.handtrack_fps,
+            state.handtrack_latency_ms,
+        )
+    if engine == "body":
+        return (state.body_enabled, state.body_status, state.body_fps, state.body_latency_ms)
+    return (state.zones_enabled, state.zones_status, state.zones_fps, state.zones_latency_ms)
+
+
+def _state_cell(enabled: bool, status: str, fps: float, latency_ms: float) -> str:
+    """State cell: the word, plus the live cadence while it is actually working."""
+    if not enabled:
+        return "off"  # a disabled engine's last status is history, not state
+    if status in ("live", "tracking"):
+        return f"{human_status(status)} {fps:.1f} Hz {latency_ms:.0f} ms"
+    return human_status(status)
+
+
+def _matrix_cells() -> list[tuple[str, str, list[int]]]:
+    """Every cell of the status table: (tag, text, colour)."""
+    dim = palette_rgba(state.active_palette["text_dim"])
+    text = palette_rgba(state.active_palette["text"])
+    cells: list[tuple[str, str, list[int]]] = []
+    for key, engine, label, enabled, status, fps, latency, owner in (
+        (
+            "tracking_matrix_leap",
+            "leap",
+            "Leap",
+            state.leap_enabled,
+            state.leap_status,
+            0.0,
+            0.0,
+            "usb",
+        ),
+        ("tracking_matrix_hands", "hand", "Hands", *_engine_triplet("hand"), None),
+        ("tracking_matrix_body", "body", "Bodies", *_engine_triplet("body"), None),
+        ("tracking_matrix_zones", "zones", "Zones", *_engine_triplet("zones"), None),
+    ):
+        if owner is None:
+            owner = _hands_owner_text() if engine == "hand" else _owner_text(engine)
+        cells.append((f"{key}_engine", label, text))
+        on_text = "on" if enabled else "off"
+        cells.append((f"{key}_on", on_text, _matrix_row_color(enabled, on_text)))
+        cells.append(
+            (key, _state_cell(enabled, status, fps, latency), _matrix_row_color(enabled, status))
+        )
+        cells.append((f"{key}_owner", str(owner), dim))
+        note = "FROZEN" if state.tracking_frozen else ""
+        cells.append((f"{key}_note", note, _matrix_row_color(True, "offline")))
+    return cells
+
+
+def _write_cells(cells: list[tuple[str, str, list[int]]]) -> None:
+    """Write the cells, repainting only the colours that changed (60 fps tick)."""
+    for tag, value, colour in cells:
+        if not dpg.does_item_exist(tag):
+            continue
+        if dpg.get_value(tag) != value:
+            dpg.set_value(tag, value)
+        if _matrix_color_cache.get(tag) != colour:
+            _matrix_color_cache[tag] = colour
+            dpg.configure_item(tag, color=colour)
+
+
+def _sync_tracking_tabs() -> None:
+    """Mark a broken engine in its TAB label, so it is visible without the matrix."""
+    for tab_tag, name, engine in TRACKING_TABS:
+        if not dpg.does_item_exist(tab_tag):
+            continue
+        enabled, status, _fps, _latency = (
+            _engine_triplet(engine)
+            if engine != "leap"
+            else (
+                state.leap_enabled,
+                state.leap_status,
+                0.0,
+                0.0,
+            )
+        )
+        broken = enabled and status not in QUIET_STATUSES
+        label = f"{name} (!)" if broken else name
+        if _tab_label_cache.get(tab_tag) != label:
+            _tab_label_cache[tab_tag] = label
+            dpg.configure_item(tab_tag, label=label)
+
+
+def tick_tracking_window() -> None:
+    """Refresh the status table and the host row: the ONE place that answers "is tracking ok?"."""
+    if not dpg.does_item_exist(TRACKING_WINDOW_TAG) or not dpg.is_item_shown(TRACKING_WINDOW_TAG):
+        return
+    if dpg.does_item_exist("tracking_host_hint"):
+        dpg.set_value("tracking_host_hint", TRACKING_HOST_HINTS.get(state.tracking_host, ""))
+    label = TRACKING_HOST_LABELS.get(state.tracking_host)
+    if (
+        label
+        and dpg.does_item_exist("tracking_host_cb")
+        and dpg.get_value("tracking_host_cb") != label
+    ):
+        # an escalation to inline must be VISIBLE, not a stale "Child process"
+        dpg.set_value("tracking_host_cb", label)
+    _write_cells(_matrix_cells())
+    _sync_tracking_tabs()
+    if state.tracking_needs_decision and not _tracking_decision_open:
+        show_tracking_decision()
+
+
+def tick_handtrack_window() -> None:
+    """Status + signal monitor of the webcam engine (main loop, changed-only)."""
+    if state.hand_provider != handtrack.PROVIDER_WEBCAM:
+        return
+    if not dpg.does_item_exist(TRACKING_WINDOW_TAG) or not dpg.is_item_shown(TRACKING_WINDOW_TAG):
+        return
+    _handtrack_set_text("handtrack_status_text", handtrack.status_label())
+    _handtrack_set_text(
+        "handtrack_fps_text",
+        f"{state.handtrack_fps:.0f} fps - {state.handtrack_latency_ms:.0f} ms"
+        f" - frame {state.handtrack_frame_age_ms:.0f} ms",
+    )
+    with state.leap_lock:
+        snapshot = dict(state.leap_values)
+    for hand in handtrack.MONITOR_HANDS:
+        for field in handtrack.MONITOR_FIELDS:
+            _handtrack_set_text(
+                f"handtrack_mon_{hand}_{field}",
+                _handtrack_field_text(hand, field, snapshot),
+            )
+    # e90 rig 2026-10-28: no extra "No hand in view" line — the status line above
+    # the preview already says it, and the rows show their placeholder.
+
+
+def tick_handtrack_preview() -> None:
+    """Upload the finished preview frame at 10 Hz, only while shown + enabled."""
+    if state.hand_provider != handtrack.PROVIDER_WEBCAM or not state.handtrack_preview:
+        return
+    if not dpg.does_item_exist(TRACKING_WINDOW_TAG) or not dpg.is_item_shown(TRACKING_WINDOW_TAG):
+        return
+    now = time.time()
+    if now - state.tracking_preview_uploaded_at < 1.0 / handtrack.PREVIEW_HZ:
+        return
+    if state.tracking_preview_engine != "hand":
+        return
+    with state.tracking_preview_lock:
+        seq = state.tracking_preview_seq
+        frame = state.tracking_preview_frame
+    if frame is None:
+        if dpg.does_item_exist("handtrack_preview_img"):
+            dpg.configure_item("handtrack_preview_img", show=False)
+        if dpg.does_item_exist("handtrack_preview_wait_text"):
+            dpg.show_item("handtrack_preview_wait_text")
+        return
+    if seq == state.tracking_preview_uploaded_seq:
+        return
+    height, width = frame.shape[:2]
+    rgba = np.dstack([frame.astype(np.float32) / 255.0, np.ones((height, width), dtype=np.float32)])
+    if "handtrack_preview_tex" not in _preview_textures:
+        dpg.add_raw_texture(
+            width=width,
+            height=height,
+            default_value=rgba.reshape(-1),
+            tag="handtrack_preview_tex",
+            parent="texture_registry",
+        )
+        dpg.add_image(
+            "handtrack_preview_tex",
+            tag="handtrack_preview_img",
+            parent="handtrack_preview_panel_slot",
+        )
+        _preview_textures.add("handtrack_preview_tex")
+    else:
+        dpg.set_value("handtrack_preview_tex", rgba.reshape(-1))
+    if dpg.does_item_exist("handtrack_preview_img"):
+        dpg.configure_item("handtrack_preview_img", show=True)
+    if dpg.does_item_exist("handtrack_preview_wait_text"):
+        dpg.hide_item("handtrack_preview_wait_text")
+    state.tracking_preview_uploaded_seq = seq
+    state.tracking_preview_uploaded_at = now
+
+
+# ---------- e88: the Stage zones window (T0) ----------
+# The window is a CONFIG panel like Hand tracking: hidden at boot, opened from the
+# toolbar, preview off by default. The worker owns the camera and the snapshots;
+# every dpg call below runs on the main thread (HIGH-1).
+ZONES_WINDOW_TAG = "zones_window"
+ZONES_PREVIEW_PANEL_H: int = 250
+ZONES_TOGGLE_LEARN_SLOT = "zones_toggle_learn_slot"
+ZONES_EDIT_LEARN_SLOT = "zones_edit_learn_slot"
+ZONES_OVERLAY_LEARN_SLOT = "zones_overlay_learn_slot"
+ZONES_RESTART_LEARN_SLOT = "zones_restart_learn_slot"
+ZONES_RESET_LEARN_SLOT = "zones_reset_learn_slot"
+
+
+def show_zones_window(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Open Tracking on the Zones tab (the old Stage-zones entry point)."""
+    _sync_zones_camera_combo()
+    show_tracking_window()
+    _select_tracking_tab("tracking_tab_zones")
+
+
+def _zones_next_id(zones: list[dict[str, Any]]) -> int | None:
+    """The first free zone id, or None when the cap is reached."""
+    used = {int(zone["id"]) for zone in zones}
+    return next(
+        (candidate for candidate in range(1, zonetrack.ZONE_MAX + 1) if candidate not in used), None
+    )
+
+
+def _zones_close_draft(
+    points: list[list[float]], zones: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Turn a draft polygon into a zone (None under 3 points or at the cap)."""
+    if len(points) < zonetrack.ZONE_MIN_POINTS:
+        return None
+    zone_id = _zones_next_id(zones)
+    if zone_id is None:
+        return None
+    return zonetrack.sanitize_zone(
+        {
+            "id": zone_id,
+            "name": f"Zone {zone_id}",
+            "color": list(zonetrack.DEFAULT_COLOR),
+            "points": points,
+        }
+    )
+
+
+def set_zones_edit(edit: bool) -> None:
+    """Arm/disarm the polygon editor (main thread; the draft is dropped on exit)."""
+    state.zones_edit = bool(edit)
+    if not state.zones_edit:
+        state.zones_draft = []
+    if dpg.does_item_exist("zones_edit_check"):
+        dpg.set_value("zones_edit_check", state.zones_edit)
+
+
+def on_zones_enable(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Enable/disable the zones engine through the camera-owner policy."""
+    enabled = bool(app_data)
+    if enabled == state.zones_enabled:
+        return  # a programmatic sync is not a user edit
+    engine = camera.CAMERA_ZONES if enabled else camera.CAMERA_NONE
+    camera.set_camera_engine(engine)
+    if state.zones_enabled and state.zones_preview:
+        # a preview that was already ON must not wait for a seq that never came
+        state.tracking_preview_uploaded_seq = -1
+        state.tracking_preview_uploaded_at = 0.0
+    _sync_camera_owner_widgets()
+
+
+def on_zones_camera(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Camera combo: persist a CHANGE and ask the worker to reopen the device."""
+    device = str(app_data)
+    if device == state.zones_device:
+        return
+    zonetrack.set_option("device", device)
+    state.zones_restart_requested = True
+
+
+def on_zones_processing(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    zonetrack.set_option("processing_width", int(app_data))
+
+
+def on_zones_threshold(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    zonetrack.set_option("threshold", float(app_data))
+
+
+def on_zones_min_area(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    zonetrack.set_option("min_area", float(app_data))
+
+
+def on_zones_max_hz(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    zonetrack.set_option("max_hz", float(app_data))
+
+
+def on_zones_preview(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    zonetrack.set_option("preview", bool(app_data))
+    if dpg.does_item_exist("zones_preview_panel"):
+        dpg.configure_item("zones_preview_panel", show=state.zones_preview)
+    _sync_zones_camera_combo()
+
+
+def on_zones_edit(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    set_zones_edit(bool(app_data))
+
+
+def on_zones_new(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Start a fresh draft polygon (the next click on the preview adds a point)."""
+    if len(state.zones_config) >= zonetrack.ZONE_MAX:
+        append_log("Stage zones", f"at most {zonetrack.ZONE_MAX} zones")
+        return
+    state.zones_draft = []
+    set_zones_edit(True)
+
+
+def on_zones_restart(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Ask the worker to release and reopen the camera."""
+    state.zones_restart_requested = True
+    _sync_zones_camera_combo()
+    append_log("Stage zones", "restart requested")
+
+
+def on_zones_reset_activity(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    """Ask the worker to relearn the background and reset occupancy."""
+    state.zones_reset_seq += 1
+
+
+def _zone_point_from_mouse() -> tuple[float, float] | None:
+    """The preview mouse position in normalized image coordinates (None outside)."""
+    if not dpg.does_item_exist("zones_preview_img"):
+        return None
+    mouse_x, mouse_y = dpg.get_mouse_pos(local=False)
+    origin_x, origin_y = dpg.get_item_rect_min("zones_preview_img")
+    width, height = dpg.get_item_rect_size("zones_preview_img")
+    if width <= 0 or height <= 0:
+        return None
+    x = (mouse_x - origin_x) / width
+    y = (mouse_y - origin_y) / height
+    if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+        return None
+    return float(x), float(y)
+
+
+def on_zones_preview_left_click(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    """Left click on the preview adds a draft point (e88s04)."""
+    if not state.zones_edit:
+        return
+    point = _zone_point_from_mouse()
+    if point is None:
+        return
+    state.zones_draft.append([point[0], point[1]])
+
+
+def on_zones_preview_right_click(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    """Right click closes the draft polygon and persists the new zone (e88s04)."""
+    if not state.zones_edit:
+        return
+    zone = _zones_close_draft(state.zones_draft, state.zones_config)
+    if zone is None:
+        return
+    zonetrack.set_zones([*state.zones_config, zone])
+    state.zones_draft = []
+    _refresh_zones_rows()
+    append_log("Stage zones", f"zone {zone['id']} created")
+
+
+def on_zones_escape(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Escape drops the draft; a second Escape (no draft) leaves the editor."""
+    if state.zones_draft:
+        state.zones_draft = []
+    elif state.zones_edit:
+        set_zones_edit(False)
+
+
+def on_zone_delete(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    zone_id = int(user_data)
+    zonetrack.set_zones([zone for zone in state.zones_config if int(zone["id"]) != zone_id])
+    _refresh_zones_rows()
+
+
+def on_zone_name(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    zone_id = int(user_data)
+    zones = [dict(zone) for zone in state.zones_config]
+    for zone in zones:
+        if int(zone["id"]) == zone_id:
+            zone["name"] = str(app_data)
+    zonetrack.set_zones(zones)
+
+
+def _zone_color_from_payload(raw: Any) -> list[int]:
+    """A color widget payload on the 0..255 scale (normalized 0..1 or already 0..255).
+
+    DPG 2.3.1 delivers a color callback payload normalized 0..1 while
+    default_value/get_value use 0..255; accepting both keeps the zone colour
+    correct if a widget variant ever changes the payload.
+    """
+    values = [float(channel) for channel in list(raw or [])[:3]]
+    if not values:
+        return list(zonetrack.DEFAULT_COLOR)
+    if any(channel > 1.0 for channel in values):
+        return [round(max(0.0, min(255.0, channel))) for channel in values]
+    return [round(channel) for channel in dpg_color_value(values)]
+
+
+ZONE_COLOR_WINDOW = "zone_color_window"
+ZONE_COLOR_WINDOW_W: int = 340
+ZONE_COLOR_WINDOW_H: int = 490
+ZONE_COLOR_PICKER_W: int = 290
+ZONE_COLOR_PICKER_H: int = 370
+
+
+def open_zone_color_picker(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Open the zone-colour modal (a text button is unambiguous, e88s04 follow-up)."""
+    zone_id = int(user_data)
+    zone = next((z for z in state.zones_config if int(z["id"]) == zone_id), None)
+    if zone is None:
+        return
+    if dpg.does_item_exist(ZONE_COLOR_WINDOW):
+        dpg.delete_item(ZONE_COLOR_WINDOW)
+    with dpg.window(
+        label="Zone colour",
+        tag=ZONE_COLOR_WINDOW,
+        modal=True,
+        width=ZONE_COLOR_WINDOW_W,
+        height=ZONE_COLOR_WINDOW_H,
+        no_resize=True,
+    ):
+        themed_text(f"Colour of {zone['name']}", slot="text")
+        dpg.add_color_picker(
+            default_value=[*zone["color"], 255],
+            tag="zone_color_picker",
+            width=ZONE_COLOR_PICKER_W,
+            height=ZONE_COLOR_PICKER_H,
+            no_alpha=True,
+        )
+        dpg.add_spacer(height=8)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Apply", callback=zone_color_confirm, user_data=zone_id, width=90)
+            dpg.add_button(label="Cancel", callback=zone_color_cancel, width=90)
+    show_centered_window(ZONE_COLOR_WINDOW)
+
+
+def zone_color_confirm(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Store the picked colour on the 0..255 scale and close the modal."""
+    zone_id = int(user_data)
+    color = _zone_color_from_payload(dpg.get_value("zone_color_picker"))
+    zones = [dict(zone) for zone in state.zones_config]
+    for zone in zones:
+        if int(zone["id"]) == zone_id:
+            zone["color"] = color
+    zonetrack.set_zones(zones)
+    if dpg.does_item_exist(ZONE_COLOR_WINDOW):
+        dpg.delete_item(ZONE_COLOR_WINDOW)
+    _refresh_zones_rows()
+
+
+def zone_color_cancel(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Close the zone-colour modal without changing the zone."""
+    if dpg.does_item_exist(ZONE_COLOR_WINDOW):
+        dpg.delete_item(ZONE_COLOR_WINDOW)
+
+
+def _sync_zones_camera_combo() -> None:
+    """Show the EFFECTIVE device in the combo (the first one when none is stored)."""
+    if not dpg.does_item_exist("zones_camera"):
+        return
+    devices = handio.list_devices()
+    dpg.configure_item("zones_camera", items=devices)
+    dpg.set_value("zones_camera", state.zones_device or (devices[0] if devices else ""))
+
+
+def _refresh_zones_rows() -> None:
+    """Rebuild the per-zone rows from ``state.zones_config`` (main thread).
+
+    Layout items are added with EXPLICIT parents and the drawlist is NOT used as
+    a context manager: the swatch, the energy text and the delete button must not
+    depend on DPG's container stack (the earlier tooltip/registry inside the row
+    swallowed the rest of the row and the following rows).
+    """
+    if dpg.does_item_exist("zones_count_text"):
+        dpg.set_value("zones_count_text", f"Zones: {len(state.zones_config)}")
+    for zone_id in range(1, zonetrack.ZONE_MAX + 1):
+        for stale in (f"zones_color_reg_{zone_id}", f"zones_color_theme_{zone_id}"):
+            if dpg.does_item_exist(stale):
+                dpg.delete_item(stale)
+    if not dpg.does_item_exist("zones_rows_group"):
+        return
+    dpg.delete_item("zones_rows_group", children_only=True)
+    if not state.zones_config:
+        themed_text(
+            "No zones yet. New zone, then click 3+ points on the preview.",
+            slot="text_dim",
+            parent="zones_rows_group",
+        )
+        return
+    for zone in state.zones_config:
+        zone_id = int(zone["id"])
+        row_tag = f"zones_row_{zone_id}"
+        draw_tag = f"zones_color_{zone_id}"
+        with dpg.group(horizontal=True, tag=row_tag, parent="zones_rows_group"):
+            dpg.add_input_text(
+                default_value=zone["name"],
+                width=150,
+                tag=f"zones_name_{zone_id}",
+                callback=on_zone_name,
+                user_data=zone_id,
+            )
+            theme_tag = f"zones_color_theme_{zone_id}"
+            with dpg.theme(tag=theme_tag), dpg.theme_component(dpg.mvButton):
+                dpg.add_theme_color(dpg.mvThemeCol_Button, [*zone["color"], 255])
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, [*zone["color"], 255])
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, [*zone["color"], 255])
+            dpg.add_button(
+                label=" ",
+                width=30,
+                height=22,
+                tag=draw_tag,
+                callback=open_zone_color_picker,
+                user_data=zone_id,
+                parent=row_tag,
+            )
+            dpg.bind_item_theme(draw_tag, theme_tag)
+            dpg.add_text("-", tag=f"zones_energy_{zone_id}", parent=row_tag)
+            dpg.add_button(
+                label="X",
+                width=24,
+                tag=f"zones_delete_{zone_id}",
+                callback=on_zone_delete,
+                user_data=zone_id,
+                parent=row_tag,
+            )
+    # Tooltips are attached AFTER every row exists, so a mis-parented tooltip
+    # can never hide the row or the next rows. The swatch is a real BUTTON with a
+    # per-zone theme: an item-clicked registry on a drawlist did not receive the
+    # click reliably (the button callback does).
+    for zone in state.zones_config:
+        zone_id = int(zone["id"])
+        with dpg.tooltip(parent=f"zones_color_{zone_id}", delay=HELP_HOVER_DELAY_S):
+            dpg.add_text("Zone colour - click to change")
+
+
+def _sync_zones_widgets() -> None:
+    """Mirror the state into the window checkboxes (actions and boot)."""
+    for tag, value in (
+        ("zones_enable", state.zones_enabled),
+        ("zones_preview_check", state.zones_preview),
+        ("zones_edit_check", state.zones_edit),
+    ):
+        if dpg.does_item_exist(tag):
+            dpg.set_value(tag, value)
+    if dpg.does_item_exist("zones_preview_panel"):
+        dpg.configure_item("zones_preview_panel", show=state.zones_preview)
+    _sync_zones_camera_combo()
+
+
+def _sync_zones_learn_markers() -> None:
+    """(Re)render the five zone learn markers (e33 rule, e88s04)."""
+    for slot, action_id, tag in (
+        (ZONES_TOGGLE_LEARN_SLOT, MIDI_ACTION_ZONES_TOGGLE, "zones_mk_toggle"),
+        (ZONES_EDIT_LEARN_SLOT, MIDI_ACTION_ZONES_EDIT, "zones_mk_edit"),
+        (ZONES_OVERLAY_LEARN_SLOT, MIDI_ACTION_ZONES_OVERLAY, "zones_mk_overlay"),
+        (ZONES_RESTART_LEARN_SLOT, MIDI_ACTION_ZONES_RESTART, "zones_mk_restart"),
+        (ZONES_RESET_LEARN_SLOT, MIDI_ACTION_ZONES_RESET_ACTIVITY, "zones_mk_reset"),
+    ):
+        if not dpg.does_item_exist(slot):
+            continue
+        dpg.delete_item(slot, children_only=True)
+        if not state.midi_learn_mode:
+            continue
+        learn_marker(
+            action_id,
+            {},
+            parent=slot,
+            tag=tag,
+            tooltip=f"Map: {actions.action_label(action_id)}",
+        )
+
+
+def tick_zones_window() -> None:
+    """Status, fps and the live per-zone readouts (main thread, shown only)."""
+    if not dpg.does_item_exist(TRACKING_WINDOW_TAG) or not dpg.is_item_shown(TRACKING_WINDOW_TAG):
+        return
+    fps = state.zones_fps if state.zones_enabled else 0.0
+    text = state.zones_status
+    if state.zones_enabled and state.zones_status == "live":
+        text = f"live - {fps:.1f} fps - {state.zones_latency_ms:.0f} ms"
+    dpg.set_value("zones_status", text)
+    dpg.set_value("zones_fps", f"{fps:.1f} fps")
+    with state.zones_lock:
+        snapshot = dict(state.zones_snapshot)
+    for zone in state.zones_config:
+        zone_id = int(zone["id"])
+        signals = snapshot.get(f"zone{zone_id}", {})
+        energy = float(signals.get("energy", 0.0))
+        occupied = "on" if signals.get("occupancy", 0.0) >= 0.5 else "off"
+        if dpg.does_item_exist(f"zones_energy_{zone_id}"):
+            dpg.set_value(f"zones_energy_{zone_id}", f"{energy:.2f} {occupied}")
+
+
+def tick_zones_preview() -> None:
+    """Upload the overlay frame at 10 Hz, only while shown + enabled (e88s04)."""
+    if not state.zones_preview:
+        return
+    if not dpg.does_item_exist(TRACKING_WINDOW_TAG) or not dpg.is_item_shown(TRACKING_WINDOW_TAG):
+        return
+    now = time.time()
+    if now - state.tracking_preview_uploaded_at < 1.0 / zonetrack.PREVIEW_HZ:
+        return
+    if state.tracking_preview_engine != "zones":
+        return
+    with state.tracking_preview_lock:
+        seq = state.tracking_preview_seq
+        frame = state.tracking_preview_frame
+    if frame is None:
+        if dpg.does_item_exist("zones_preview_img"):
+            dpg.configure_item("zones_preview_img", show=False)
+        if dpg.does_item_exist("zones_preview_wait_text"):
+            dpg.show_item("zones_preview_wait_text")
+        return
+    if seq == state.tracking_preview_uploaded_seq and not state.zones_draft:
+        return
+    if state.zones_edit and state.zones_draft:
+        frame = zonetrack.draw_draft(frame, state.zones_draft)
+    height, width = frame.shape[:2]
+    rgba = np.dstack([frame.astype(np.float32) / 255.0, np.ones((height, width), dtype=np.float32)])
+    if "zones_preview_tex" not in _preview_textures:
+        dpg.add_raw_texture(
+            width=width,
+            height=height,
+            default_value=rgba.reshape(-1),
+            tag="zones_preview_tex",
+            parent="texture_registry",
+        )
+        dpg.add_image(
+            "zones_preview_tex", tag="zones_preview_img", parent="zones_preview_panel_slot"
+        )
+        with dpg.item_handler_registry(tag="zones_preview_reg"):
+            dpg.add_item_clicked_handler(0, callback=on_zones_preview_left_click)
+            dpg.add_item_clicked_handler(1, callback=on_zones_preview_right_click)
+        dpg.bind_item_handler_registry("zones_preview_img", "zones_preview_reg")
+        _preview_textures.add("zones_preview_tex")
+    else:
+        dpg.set_value("zones_preview_tex", rgba.reshape(-1))
+    if dpg.does_item_exist("zones_preview_img"):
+        dpg.configure_item("zones_preview_img", show=True)
+    if dpg.does_item_exist("zones_preview_wait_text"):
+        dpg.hide_item("zones_preview_wait_text")
+    state.tracking_preview_uploaded_seq = seq
+    state.tracking_preview_uploaded_at = now
+
+
+# The Tracking window's geometry lives here, before the tab builders that use it.
+TRACKING_WINDOW_W: int = 640
+TRACKING_WINDOW_H: int = 820
+# Header (host + table + help) + footer: what the engine tabs may NOT use.
+TRACKING_TABS_H: int = TRACKING_WINDOW_H - 260
+TRACKING_TAB_INNER_W: int = TRACKING_WINDOW_W - 56
+# Every preview is encoded at 320x240, so one centring offset serves all three:
+# the image sits in the middle of the tab instead of hugging the left edge.
+TRACKING_PREVIEW_PAD: int = max(0, (TRACKING_TAB_INNER_W - 320) // 2)
+HANDTRACK_PREVIEW_PAD = TRACKING_PREVIEW_PAD
+ZONES_PREVIEW_PAD = TRACKING_PREVIEW_PAD
+BODY_PREVIEW_PAD = TRACKING_PREVIEW_PAD
+
+
+def _build_zones_tab() -> None:
+    """Build the hidden Stage zones window (called once, at UI construction)."""
+    with dpg.tab(label="Zones", tag="tracking_tab_zones"):
+        with dpg.group(horizontal=True):
+            dpg.add_checkbox(
+                label="Enable zones",
+                tag="zones_enable",
+                default_value=state.zones_enabled,
+                callback=on_zones_enable,
+            )
+            dpg.add_group(horizontal=True, tag=ZONES_TOGGLE_LEARN_SLOT)
+        with dpg.group(horizontal=True):
+            themed_text("Camera", slot="text_dim")
+            _zones_devices = handio.list_devices()
+            dpg.add_combo(
+                items=_zones_devices,
+                default_value=state.zones_device or (_zones_devices[0] if _zones_devices else ""),
+                width=190,
+                tag="zones_camera",
+                callback=on_zones_camera,
+            )
+        with dpg.group(horizontal=True):
+            dpg.add_drag_int(
+                label="Processing",
+                tag="zones_processing",
+                width=120,
+                min_value=zonetrack.PROCESSING_WIDTH_MIN,
+                max_value=zonetrack.PROCESSING_WIDTH_MAX,
+                default_value=state.zones_processing_width,
+                callback=on_zones_processing,
+            )
+            dpg.add_slider_float(
+                label="Threshold",
+                tag="zones_threshold",
+                width=120,
+                min_value=zonetrack.THRESHOLD_MIN,
+                max_value=zonetrack.THRESHOLD_MAX,
+                default_value=state.zones_threshold,
+                callback=on_zones_threshold,
+            )
+        with dpg.group(horizontal=True):
+            dpg.add_slider_float(
+                label="Min area",
+                tag="zones_min_area",
+                width=120,
+                min_value=zonetrack.MIN_AREA_MIN,
+                max_value=zonetrack.MIN_AREA_MAX,
+                default_value=state.zones_min_area,
+                callback=on_zones_min_area,
+            )
+            dpg.add_slider_float(
+                label="Max Hz",
+                tag="zones_max_hz",
+                width=120,
+                min_value=zonetrack.MAX_HZ_MIN,
+                max_value=zonetrack.MAX_HZ_MAX,
+                default_value=state.zones_max_hz,
+                callback=on_zones_max_hz,
+            )
+        with dpg.group(horizontal=True):
+            dpg.add_checkbox(
+                label="Preview",
+                tag="zones_preview_check",
+                default_value=state.zones_preview,
+                callback=on_zones_preview,
+            )
+            dpg.add_group(horizontal=True, tag=ZONES_OVERLAY_LEARN_SLOT)
+            dpg.add_checkbox(
+                label="Edit zones",
+                tag="zones_edit_check",
+                default_value=state.zones_edit,
+                callback=on_zones_edit,
+            )
+            dpg.add_group(horizontal=True, tag=ZONES_EDIT_LEARN_SLOT)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="New zone", tag="zones_new", callback=on_zones_new)
+            dpg.add_button(label="Restart", tag="zones_restart", callback=on_zones_restart)
+            dpg.add_group(horizontal=True, tag=ZONES_RESTART_LEARN_SLOT)
+            dpg.add_button(
+                label="Reset activity", tag="zones_reset", callback=on_zones_reset_activity
+            )
+            dpg.add_group(horizontal=True, tag=ZONES_RESET_LEARN_SLOT)
+        dpg.add_separator()
+        dpg.add_text("", tag="zones_status")
+        dpg.add_text("", tag="zones_fps")
+        with (
+            dpg.child_window(
+                height=ZONES_PREVIEW_PANEL_H,
+                show=state.zones_preview,
+                tag="zones_preview_panel",
+            ),
+            dpg.group(horizontal=True),
+        ):
+            dpg.add_spacer(width=ZONES_PREVIEW_PAD)
+            with dpg.group(tag="zones_preview_panel_slot"):
+                dpg.add_text("Waiting for the camera...", tag="zones_preview_wait_text")
+        dpg.add_separator()
+        dpg.add_text("Zones: 0", tag="zones_count_text")
+        with dpg.group(tag="zones_rows_group"):
+            pass
+    _refresh_zones_rows()
+
+
+# ---------- e89: the Body tracking window (T1) ----------
+BODY_WINDOW_TAG = "body_window"
+BODY_PREVIEW_PANEL_H: int = 250
+BODY_TOGGLE_LEARN_SLOT = "body_toggle_learn_slot"
+BODY_RESTART_LEARN_SLOT = "body_restart_learn_slot"
+BODY_OVERLAY_LEARN_SLOT = "body_overlay_learn_slot"
+BODY_RESET_LEARN_SLOT = "body_reset_learn_slot"
+
+
+def show_body_window(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Open Tracking on the Bodies tab (the old Body-tracking entry point)."""
+    _sync_body_camera_combo()
+    show_tracking_window()
+    _select_tracking_tab("tracking_tab_bodies")
+
+
+def _sync_body_camera_combo() -> None:
+    if not dpg.does_item_exist("body_camera"):
+        return
+    devices = handio.list_devices()
+    dpg.configure_item("body_camera", items=devices)
+    dpg.set_value("body_camera", state.body_device or (devices[0] if devices else ""))
+
+
+def on_body_enable(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    enabled = bool(app_data)
+    if enabled == state.body_enabled:
+        return  # a programmatic sync is not a user edit
+    engine = camera.CAMERA_BODY if enabled else camera.CAMERA_NONE
+    camera.set_camera_engine(engine)
+    if state.body_enabled and state.body_preview:
+        state.tracking_preview_uploaded_seq = -1
+        state.tracking_preview_uploaded_at = 0.0
+    _sync_camera_owner_widgets()
+
+
+def on_body_camera(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    device = str(app_data)
+    if device == state.body_device:
+        return
+    bodytrack.set_option("device", device)
+    state.body_restart_requested = True
+
+
+def on_body_max_hz(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    bodytrack.set_option("max_hz", float(app_data))
+
+
+def on_body_max_bodies(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    bodytrack.set_option("max_bodies", int(app_data))
+
+
+def on_body_detect_every(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    bodytrack.set_option("detect_every", int(app_data))
+
+
+def on_body_preview(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    bodytrack.set_option("preview", bool(app_data))
+    if dpg.does_item_exist("body_preview_panel"):
+        dpg.configure_item("body_preview_panel", show=state.body_preview)
+
+
+def on_body_restart(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    state.body_restart_requested = True
+    _sync_body_camera_combo()
+    append_log("Body tracking", "restart requested")
+
+
+def on_body_reset_tracks(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    state.body_reset_seq += 1
+
+
+def _sync_body_widgets() -> None:
+    for tag, value in (
+        ("body_enable", state.body_enabled),
+        ("body_preview_check", state.body_preview),
+    ):
+        if dpg.does_item_exist(tag):
+            dpg.set_value(tag, value)
+    if dpg.does_item_exist("body_preview_panel"):
+        dpg.configure_item("body_preview_panel", show=state.body_preview)
+    _sync_body_camera_combo()
+
+
+def _sync_body_learn_markers() -> None:
+    for slot, action_id, tag in (
+        (BODY_TOGGLE_LEARN_SLOT, MIDI_ACTION_BODY_TOGGLE, "body_mk_toggle"),
+        (BODY_RESTART_LEARN_SLOT, MIDI_ACTION_BODY_RESTART, "body_mk_restart"),
+        (BODY_OVERLAY_LEARN_SLOT, MIDI_ACTION_BODY_OVERLAY, "body_mk_overlay"),
+        (BODY_RESET_LEARN_SLOT, MIDI_ACTION_BODY_RESET_TRACKS, "body_mk_reset"),
+    ):
+        if not dpg.does_item_exist(slot):
+            continue
+        dpg.delete_item(slot, children_only=True)
+        if not state.midi_learn_mode:
+            continue
+        learn_marker(
+            action_id,
+            {},
+            parent=slot,
+            tag=tag,
+            tooltip=f"Map: {actions.action_label(action_id)}",
+        )
+
+
+def tick_body_window() -> None:
+    if not dpg.does_item_exist(TRACKING_WINDOW_TAG) or not dpg.is_item_shown(TRACKING_WINDOW_TAG):
+        return
+    fps = state.body_fps if state.body_enabled else 0.0
+    text = state.body_status
+    if state.body_enabled and state.body_status == "live":
+        text = f"live - {fps:.1f} fps - {state.body_latency_ms:.0f} ms"
+    dpg.set_value("body_status", text)
+    dpg.set_value("body_fps", f"{fps:.1f} fps")
+    with state.body_lock:
+        snapshot = dict(state.body_snapshot)
+    for slot in range(1, bodytrack.BODY_MAX + 1):
+        signals = snapshot.get(f"body{slot}", {})
+        if dpg.does_item_exist(f"body_track_{slot}"):
+            if signals:
+                text = (
+                    f"x {signals.get('x', 0.0):+.2f}  y {signals.get('y', 0.0):+.2f}  "
+                    f"h {signals.get('height', 0.0):.2f}  c {signals.get('conf', 0.0):.2f}"
+                )
+            else:
+                text = "no body"
+            dpg.set_value(f"body_track_{slot}", text)
+        if dpg.does_item_exist(f"body_pose_{slot}"):
+            poses = [
+                name for name in bodytrack.POSE_NAMES if signals.get(f"pose_{name}", 0.0) >= 0.5
+            ]
+            dpg.set_value(f"body_pose_{slot}", " | ".join(poses) or "-")
+
+
+def tick_body_preview() -> None:
+    if not state.body_preview:
+        return
+    if not dpg.does_item_exist(TRACKING_WINDOW_TAG) or not dpg.is_item_shown(TRACKING_WINDOW_TAG):
+        return
+    now = time.time()
+    if now - state.tracking_preview_uploaded_at < 1.0 / BODY_PREVIEW_HZ:
+        return
+    if state.tracking_preview_engine != "body":
+        return
+    with state.tracking_preview_lock:
+        seq = state.tracking_preview_seq
+        frame = state.tracking_preview_frame
+    if frame is None:
+        if dpg.does_item_exist("body_preview_img"):
+            dpg.configure_item("body_preview_img", show=False)
+        if dpg.does_item_exist("body_preview_wait_text"):
+            dpg.show_item("body_preview_wait_text")
+        return
+    if seq == state.tracking_preview_uploaded_seq:
+        return
+    height, width = frame.shape[:2]
+    rgba = np.dstack([frame.astype(np.float32) / 255.0, np.ones((height, width), dtype=np.float32)])
+    if "body_preview_tex" not in _preview_textures:
+        dpg.add_raw_texture(
+            width=width,
+            height=height,
+            default_value=rgba.reshape(-1),
+            tag="body_preview_tex",
+            parent="texture_registry",
+        )
+        dpg.add_image("body_preview_tex", tag="body_preview_img", parent="body_preview_panel_slot")
+        _preview_textures.add("body_preview_tex")
+    else:
+        dpg.set_value("body_preview_tex", rgba.reshape(-1))
+    if dpg.does_item_exist("body_preview_img"):
+        dpg.configure_item("body_preview_img", show=True)
+    if dpg.does_item_exist("body_preview_wait_text"):
+        dpg.hide_item("body_preview_wait_text")
+    state.tracking_preview_uploaded_seq = seq
+    state.tracking_preview_uploaded_at = now
+
+
+def _build_body_tab() -> None:
+    devices = handio.list_devices()
+    with dpg.tab(label="Bodies", tag="tracking_tab_bodies"):
+        with dpg.group(horizontal=True):
+            dpg.add_checkbox(
+                label="Enable body",
+                tag="body_enable",
+                default_value=state.body_enabled,
+                callback=on_body_enable,
+            )
+            dpg.add_group(horizontal=True, tag=BODY_TOGGLE_LEARN_SLOT)
+        with dpg.group(horizontal=True):
+            themed_text("Camera", slot="text_dim")
+            dpg.add_combo(
+                items=devices,
+                default_value=state.body_device or (devices[0] if devices else ""),
+                width=190,
+                tag="body_camera",
+                callback=on_body_camera,
+            )
+        with dpg.group(horizontal=True):
+            dpg.add_slider_float(
+                label="Max Hz",
+                tag="body_max_hz",
+                width=110,
+                min_value=bodytrack.MAX_HZ_MIN,
+                max_value=bodytrack.MAX_HZ_MAX,
+                default_value=state.body_max_hz,
+                callback=on_body_max_hz,
+            )
+            dpg.add_drag_int(
+                label="Bodies",
+                tag="body_max_bodies",
+                width=110,
+                min_value=1,
+                max_value=bodytrack.BODY_MAX,
+                default_value=state.body_max_bodies,
+                callback=on_body_max_bodies,
+            )
+            dpg.add_drag_int(
+                label="Detect every",
+                tag="body_detect_every",
+                width=110,
+                min_value=1,
+                max_value=6,
+                default_value=state.body_detect_every,
+                callback=on_body_detect_every,
+            )
+        with dpg.group(horizontal=True):
+            dpg.add_checkbox(
+                label="Preview",
+                tag="body_preview_check",
+                default_value=state.body_preview,
+                callback=on_body_preview,
+            )
+            dpg.add_group(horizontal=True, tag=BODY_OVERLAY_LEARN_SLOT)
+            dpg.add_button(label="Restart", tag="body_restart", callback=on_body_restart)
+            dpg.add_group(horizontal=True, tag=BODY_RESTART_LEARN_SLOT)
+            dpg.add_button(label="Reset tracks", tag="body_reset", callback=on_body_reset_tracks)
+            dpg.add_group(horizontal=True, tag=BODY_RESET_LEARN_SLOT)
+        dpg.add_separator()
+        dpg.add_text("", tag="body_status")
+        dpg.add_text("", tag="body_fps")
+        with dpg.group(tag="body_tracks_group"):
+            for slot in range(1, bodytrack.BODY_MAX + 1):
+                with dpg.group(horizontal=True):
+                    themed_text(f"B{slot}", slot="text_bright")
+                    dpg.add_text("no body", tag=f"body_track_{slot}")
+                    dpg.add_text("-", tag=f"body_pose_{slot}")
+        with (
+            dpg.child_window(
+                height=BODY_PREVIEW_PANEL_H,
+                show=state.body_preview,
+                tag="body_preview_panel",
+            ),
+            dpg.group(horizontal=True),
+        ):
+            dpg.add_spacer(width=BODY_PREVIEW_PAD)
+            with dpg.group(tag="body_preview_panel_slot"):
+                dpg.add_text("Waiting for the camera...", tag="body_preview_wait_text")
+    _sync_body_widgets()
+
+
+def _exec_body_toggle(value: int) -> None:
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    engine = camera.CAMERA_NONE if state.body_enabled else camera.CAMERA_BODY
+    camera.set_camera_engine(engine)
+    _sync_camera_owner_widgets()
+
+
+def _exec_body_restart(value: int) -> None:
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    on_body_restart()
+
+
+def _exec_body_overlay(value: int) -> None:
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    bodytrack.set_option("preview", not state.body_preview)
+    _sync_body_widgets()
+
+
+def _exec_body_reset_tracks(value: int) -> None:
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    on_body_reset_tracks()
+
+
 def _leap_monitor_set_text(tag: str, text: str) -> None:
     """Update one leap-window text tag only when its rendered text changed (e26s02)."""
     if state.leap_monitor_cache.get(tag) != text:
@@ -9131,9 +11373,9 @@ def tick_leap_visualizer() -> None:
     enabled; this tick lazily creates ONE raw texture on the first frame and
     set_value only when a NEW frame arrived — a still feed costs nothing.
     """
-    if not dpg.does_item_exist("leap_window"):
+    if not dpg.does_item_exist(TRACKING_WINDOW_TAG):
         return
-    if not dpg.is_item_shown("leap_window"):
+    if not dpg.is_item_shown(TRACKING_WINDOW_TAG):
         return
     if not (state.leap_enabled and state.leap_visualizer):
         return
@@ -9180,9 +11422,9 @@ def tick_leap_monitor() -> None:
     absent hand or a disabled engine shows the placeholder (cache-gated, so a
     still hand or an idle window costs nothing).
     """
-    if not dpg.does_item_exist("leap_window"):
+    if not dpg.does_item_exist(TRACKING_WINDOW_TAG):
         return
-    if not dpg.is_item_shown("leap_window"):
+    if not dpg.is_item_shown(TRACKING_WINDOW_TAG):
         return
     enabled = state.leap_enabled
     stalled = enabled and leap.leap_engine_stalled(time.time(), state.leap_worker_tick)
@@ -9226,9 +11468,18 @@ def _bind_mapper_font(tag: str) -> None:
         dpg.bind_item_font(tag, font)
 
 
-def _mapper_caption_spacer(
-    label: str, spec: dict[str, Any], has_reset: bool = True, extra_px: int = 0
-) -> int:
+def _bind_mapper_readout_font(tag: str) -> None:
+    """Bind the 9 px ProggyTiny to a readout DRAG (e92).
+
+    One step below the 10 px labels, so a two-box OUT row plus the SO square fits
+    the band's 96 px column. A missing asset falls back to the mapper font.
+    """
+    font = _mapper_kind_font if _mapper_kind_font is not None else _mapper_font()
+    if font is not None and dpg.does_item_exist(tag):
+        dpg.bind_item_font(tag, font)
+
+
+def _mapper_caption_spacer(label: str, spec: dict[str, Any], has_reset: bool = True) -> int:
     """Spacer width that right-aligns the enable checkbox + X on a caption (e24).
 
     The caption is ONE row: label + spacer + enable checkbox + X. Labels render
@@ -9236,8 +11487,7 @@ def _mapper_caption_spacer(
     the budget uses that advance and subtracts the checkbox + X blocks + item
     gaps: every catalog property label fits on a single caption row. A
     cue-list card drops the R button (UAT e35) — the spacer must not reserve
-    its width, or its enable + X would sit left of the right edge. e52s02:
-    `extra_px` reserves the mode badge when the card carries a gate tag.
+    its width, or its enable + X would sit left of the right edge.
     """
     return max(
         2,
@@ -9246,12 +11496,11 @@ def _mapper_caption_spacer(
         - MAPPER_SMALL_CHAR_PX * len(label)
         - (MAPPER_RESET_W if has_reset else 0)
         - MAPPER_CB_W
-        - MAPPER_X_W
-        - extra_px,
+        - MAPPER_X_W,
     )
 
 
-def _mapper_caption_budget(has_reset: bool, extra_px: int = 0) -> int:
+def _mapper_caption_budget(has_reset: bool) -> int:
     """How many 6 px chars fit in a caption row once the buttons are reserved.
 
     BUG-2026-10-14T181712b: the spacer used to floor at 2 px without shrinking a
@@ -9259,20 +11508,14 @@ def _mapper_caption_budget(has_reset: bool, extra_px: int = 0) -> int:
     SAME arithmetic, exposed as a char budget for the label itself.
     """
     reserved = (
-        MAPPER_MINI_W
-        - 24
-        - (MAPPER_RESET_W if has_reset else 0)
-        - MAPPER_CB_W
-        - MAPPER_X_W
-        - extra_px
-        - 2
+        MAPPER_MINI_W - 24 - (MAPPER_RESET_W if has_reset else 0) - MAPPER_CB_W - MAPPER_X_W - 2
     )
     return max(1, reserved // MAPPER_SMALL_CHAR_PX)
 
 
-def _fit_mapper_caption(text: str, has_reset: bool, extra_px: int = 0) -> str:
+def _fit_mapper_caption(text: str, has_reset: bool) -> str:
     """Cut a card caption to the room the buttons leave (BUG-2026-10-14T181712b)."""
-    budget = _mapper_caption_budget(has_reset, extra_px)
+    budget = _mapper_caption_budget(has_reset)
     if len(text) <= budget:
         return text
     keep = max(0, budget - len(MEDIA_TITLE_ELLIPSIS))
@@ -9425,18 +11668,129 @@ def on_mapper_row_thumb_click(
     Mirrors the sequencer clip-slot click: the media selected in the Vimix
     sources grid (state.vjmix_selected_source) becomes the row's source —
     every mapping of the row re-targets onto it and the Mapper body rebuilds
-    (rows regroup by first appearance; an existing row of the new source
-    merges). A click with NO grid selection, or on a row already targeting
-    the selection, is a no-op: deliberately NOT the sequencer's
-    get_current_target_id() vimix-current fallback (user-confirmed) — the
-    source of a mapper row is a deliberate choice.
+    (rows regroup by first appearance). A click with NO grid selection, or on
+    a row already targeting the selection, is a no-op: deliberately NOT the
+    sequencer's get_current_target_id() vimix-current fallback (user-confirmed)
+    — the source of a mapper row is a deliberate choice.
+
+    BUG-2026-10-24T082004: the selection may already own another line, and
+    applying it then FUSES the two lines. That case asks first.
     """
     target_id = user_data
     selected = state.vjmix_selected_source
     if selected is None or selected == target_id:
         return
-    if mapper.retarget_source(target_id, selected):
-        refresh_mapper_ui()
+    _request_mapper_line_source(target_id, selected, interactive=True)
+
+
+# --- BUG-2026-10-24T082004: a line assign that would merge asks first ---------
+# The three user-facing assign surfaces (row thumb, tile menu, MIDI `mapper_line`)
+# share one request path. A source that already owns a line cannot be "added" to
+# another one: the model is one line per source (e22s01/e29s01), so the two lines
+# FUSE and the assigned line disappears. That is intended, but it used to happen
+# with no question and no report, and it renumbers the following lines — the MIDI
+# line bindings are learned by index, so they silently changed target.
+MAPPER_MERGE_CONFIRM_TAG = "mapper_merge_confirm"
+MAPPER_MERGE_CONFIRM_WIDTH = 460
+MAPPER_MERGE_CONFIRM_HEIGHT = 190
+
+
+def _request_mapper_line_source(target_id: str, source: str, *, interactive: bool) -> None:
+    """Apply a source to a Mapper line, asking first when two lines would fuse.
+
+    ``interactive`` is the surface's ability to ask: the two mouse surfaces pass
+    True and get the Merge/Cancel modal; a controller press passes False and is
+    REFUSED with a logged reason, because nobody can answer a modal from a
+    footswitch and an unconfirmed merge is exactly the reported defect.
+    """
+    blocking_line = mapper.line_number(source)
+    if blocking_line is None:
+        _apply_mapper_line_source(target_id, source)
+        return
+    if not interactive:
+        log_warn(
+            "Mapper",
+            f"line {blocking_line} already carries {source}: assign it from the Mapper window",
+        )
+        return
+    state.mapper_merge_pending = {"target": target_id, "source": source}
+    _show_mapper_merge_confirm(target_id, source, blocking_line)
+
+
+def _apply_mapper_line_source(target_id: str, source: str) -> None:
+    """Re-point a line (the e29 core) and report a merge in the Logs window.
+
+    A plain assign stays silent — it is the one-click performance gesture. A
+    MERGE is reported with both line numbers and the moved count, because it
+    deletes a line and renumbers the ones after it: without the line the
+    operator cannot tell what the click did.
+    """
+    origin_line = mapper.line_number(target_id)
+    destination_line = mapper.line_number(source)
+    moved = mapper.retarget_source(target_id, source)
+    if not moved:
+        return
+    refresh_mapper_ui()
+    if origin_line is not None and destination_line is not None:
+        append_log(
+            "Mapper",
+            f"line {origin_line} merged into line {destination_line}: {moved} mappings",
+        )
+
+
+def _show_mapper_merge_confirm(target_id: str, source: str, blocking_line: int) -> None:
+    """The Merge/Cancel modal of an assignment that would fuse two lines.
+
+    Rebuilt per request (the pending state is in ``state.mapper_merge_pending``,
+    the same shape as the drafts confirmation) and centered like every dialog.
+    The second line states the consequence the operator cannot see: his MIDI
+    ``mapper_line`` bindings follow the NUMBERS, not the sources.
+    """
+    if dpg.does_item_exist(MAPPER_MERGE_CONFIRM_TAG):
+        dpg.delete_item(MAPPER_MERGE_CONFIRM_TAG)
+    origin_line = mapper.line_number(target_id) or 0
+    moving = sum(1 for mapping in state.mapper_mappings if mapping["target_id"] == target_id)
+    wrap = MAPPER_MERGE_CONFIRM_WIDTH - 40
+    with dpg.window(
+        label="Merge Mapper lines",
+        tag=MAPPER_MERGE_CONFIRM_TAG,
+        modal=True,
+        width=MAPPER_MERGE_CONFIRM_WIDTH,
+        height=MAPPER_MERGE_CONFIRM_HEIGHT,
+        no_resize=True,
+    ):
+        dpg.add_text(f"{source} already has line {blocking_line}.", wrap=wrap)
+        dpg.add_text(
+            f"Moving line {origin_line}'s {moving} mappings there removes line "
+            f"{origin_line}; the lines after it shift up and the MIDI line bindings "
+            "follow the numbers.",
+            wrap=wrap,
+        )
+        dpg.add_separator()
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Cancel", width=130, callback=cancel_mapper_merge)
+            dpg.add_button(label="Merge", width=130, callback=confirm_mapper_merge)
+    show_centered_window(MAPPER_MERGE_CONFIRM_TAG)  # e55: dialogs open centered
+
+
+def confirm_mapper_merge(*_args: Any) -> None:
+    """Merge: apply the assignment the operator confirmed (BUG-2026-10-24T082004)."""
+    pending = state.mapper_merge_pending
+    _close_mapper_merge_confirm()
+    if not pending:
+        return
+    _apply_mapper_line_source(str(pending["target"]), str(pending["source"]))
+
+
+def cancel_mapper_merge(*_args: Any) -> None:
+    """Cancel: nothing moves, the Mapper is left exactly as it was."""
+    _close_mapper_merge_confirm()
+
+
+def _close_mapper_merge_confirm() -> None:
+    state.mapper_merge_pending = None
+    if dpg.does_item_exist(MAPPER_MERGE_CONFIRM_TAG):
+        dpg.delete_item(MAPPER_MERGE_CONFIRM_TAG)
 
 
 def _mapper_add_slot_width() -> int:
@@ -9517,7 +11871,8 @@ def _mapper_marker_slot(mapping: dict[str, Any], parent: Any) -> None:
     """
     mid = mapping["id"]
     has_cue_open = mapping["control"] == "cue list"
-    marker_count = 4 if has_cue_open else 3
+    has_so = mapper.mapping_has_secondary_output(mapping)
+    marker_count = 3 + (1 if has_cue_open else 0) + (1 if has_so else 0)
     cluster_w = marker_count * MAPPER_MARKER_W  # the M buttons + item gaps
     indent = max(0, (MAPPER_MINI_W - cluster_w) // 2)
     slot_tag = f"mapper_mk_slot_{mid}"
@@ -9547,6 +11902,13 @@ def _mapper_marker_slot(mapping: dict[str, Any], parent: Any) -> None:
             {"mapping_id": mid},
             parent=slot_tag,
             tag=f"mapper_mk_cue_open_{mid}",
+        )
+    if has_so:  # e92: mute/resume this Mapping's Secondary Output
+        learn_marker(
+            MIDI_ACTION_MAPPING_SO,
+            {"mapping_id": mid},
+            parent=slot_tag,
+            tag=f"mapper_mk_so_{mid}",
         )
     dpg.add_spacer(width=max(0, MAPPER_MINI_W - indent - cluster_w), parent=slot_tag)
 
@@ -9605,6 +11967,51 @@ def _mapper_card_has_source(mapping: dict[str, Any]) -> bool:
     )
 
 
+# e92: the SO button geometry. The band column is 44 px tall with the readout
+# rows inside it, so the square there is 10 px (out + inp + 10 = 44 exactly);
+# the slider's readout line has room for a 12 px square at its end.
+MAPPER_SO_SIZE = 12
+MAPPER_SO_BAND = 10
+
+
+def _mapper_so_capable(mapping: dict[str, Any]) -> bool:
+    """True when this Mapping can carry an SO (Control value kind, e92)."""
+    return (
+        mapper.origin_of(mapping) == ORIGIN_CONTROL
+        and str(mapping.get("control") or "") in mapper.SECONDARY_OUTPUT_CONTROLS
+        and str(mapping.get("property") or "") != catalog.SET_CURRENT_PROPERTY
+    )
+
+
+def _mapper_so_button(mapping: dict[str, Any], mid: int, *, size: int = MAPPER_SO_SIZE) -> None:
+    """One small SO square: status light + editor opener (e92).
+
+    Three states: neutral when no SO is stored, AMBER when it is stored but the
+    SO or the Mapping is muted, ACCENT when it is stored + enabled and the
+    Mapping is enabled. The square carries no label (the tooltip names it), so
+    it fits the readout column without changing any row height.
+    """
+    tag = f"mapper_so_{mid}"
+    dpg.add_button(
+        label="",
+        width=size,
+        height=size,
+        callback=open_mapping_so_editor,
+        user_data=mid,
+        tag=tag,
+    )
+    dpg.bind_item_theme(tag, theme_mapper_micro)
+    spec = mapping.get("secondary_output")
+    if isinstance(spec, dict):
+        if bool(spec.get("enabled", True)) and bool(mapping.get("enabled", False)):
+            _style_trigger_theme(tag, True)
+        else:
+            dpg.bind_item_theme(tag, theme_so_muted)
+    with dpg.tooltip(tag, delay=HELP_HOVER_DELAY_S) as tip_tag:
+        dpg.add_text("Secondary OSC output")
+    dpg.bind_item_theme(tip_tag, HELP_THEME_TOOLTIP)
+
+
 def _mapper_readout_line(
     label: str,
     mid: int,
@@ -9612,6 +12019,8 @@ def _mapper_readout_line(
     from_value: float,
     to_value: float,
     width: int,
+    *,
+    show_so: dict[str, Any] | None = None,
 ) -> None:
     """One from/to readout row: a short label + two drag boxes (e34s02).
 
@@ -9619,6 +12028,9 @@ def _mapper_readout_line(
     and the compact out/inp column beside the band control (label 'out'/'inp',
     MAPPER_BAND_DRAG_W boxes). Tags and handler wire-up stay the same for both
     so on_mapper_output/input and the card right-click registry keep working.
+    e92: the SO square rides the OUT row at its right end (both the band and the
+    slider), and the DRAGS use the 9 px readout font with 2 px frame padding so
+    the row still fits the 96 px band column.
     """
     callback = on_mapper_output if kind == "out" else on_mapper_input
     with dpg.group(horizontal=True):
@@ -9641,13 +12053,20 @@ def _mapper_readout_line(
             user_data=(mid, "to"),
             tag=f"mapper_{kind}_to_{mid}",
         )
+        if show_so is not None and _mapper_so_capable(show_so):
+            _mapper_so_button(show_so, mid)
     _bind_mapper_font(f"mapper_{kind}_lbl_{mid}")
-    _bind_mapper_font(f"mapper_{kind}_from_{mid}")
-    _bind_mapper_font(f"mapper_{kind}_to_{mid}")
+    _bind_mapper_readout_font(f"mapper_{kind}_from_{mid}")
+    _bind_mapper_readout_font(f"mapper_{kind}_to_{mid}")
+    dpg.bind_item_theme(f"mapper_{kind}_from_{mid}", theme_mapper_readout)
+    dpg.bind_item_theme(f"mapper_{kind}_to_{mid}", theme_mapper_readout)
 
 
-def _mapper_band_control(mapping: dict[str, Any], mid: int) -> None:
+def _mapper_band_control(mapping: dict[str, Any], mid: int, *, compact: bool = False) -> None:
     """Compact control band of a knob/button/cue-list card (e34s02, e34s04).
+
+    e86: `compact` hides the out/inp readout column (and the cue progress),
+    leaving the control (and, for a cue list, its opener).
 
     ONE row as tall as the 44 px control: the control on the LEFT, and on the
     right the readout — knob/button: the 'out' line (always) with the 'inp'
@@ -9687,10 +12106,12 @@ def _mapper_band_control(mapping: dict[str, Any], mid: int) -> None:
             _style_trigger_theme(f"mapper_{kind}_{mid}", _trigger_is_on(mapping))
         if str(mapping["property"]) == catalog.SET_CURRENT_PROPERTY:
             # e83: no value exists, so no readout: the row says what SET does.
-            themed_text("-> current", slot="text_dim", tag=f"mapper_setc_hint_{mid}")
+            if not compact:
+                themed_text("-> current", slot="text_dim", tag=f"mapper_setc_hint_{mid}")
         elif control == "cue list":
             # e34s04/e35 UAT: the right readout column hosts the window opener
             # and, UNDER it, the 'N of Total' progress readout of the cue.
+            # e86: compact keeps the opener, hides the progress.
             with dpg.group():
                 dpg.add_button(
                     label="Cue list...",
@@ -9699,16 +12120,28 @@ def _mapper_band_control(mapping: dict[str, Any], mid: int) -> None:
                     user_data=mid,
                     tag=f"mapper_cue_open_{mid}",
                 )
-                themed_text(
-                    _cue_progress_label(mapping),
-                    slot="text_dim",
-                    tag=f"mapper_cue_prog_{mid}",
-                )
+                if not compact:
+                    themed_text(
+                        _cue_progress_label(mapping),
+                        slot="text_dim",
+                        tag=f"mapper_cue_prog_{mid}",
+                    )
             _bind_mapper_font(f"mapper_cue_open_{mid}")
-            _bind_mapper_font(f"mapper_cue_prog_{mid}")
-        else:
+            if not compact:
+                _bind_mapper_font(f"mapper_cue_prog_{mid}")
+        elif not compact:
             with dpg.group():
-                _mapper_readout_line("out", mid, "out", out_from, out_to, MAPPER_BAND_DRAG_W)
+                # e92: the SO square sits at the RIGHT of the OUT row (the operator's
+                # layout), not in a separate row; the 9 px digits + 28 px boxes make it fit.
+                _mapper_readout_line(
+                    "out",
+                    mid,
+                    "out",
+                    out_from,
+                    out_to,
+                    MAPPER_BAND_DRAG_W,
+                    show_so=mapping if _mapper_so_capable(mapping) else None,
+                )
                 if _mapper_card_has_source(mapping):
                     in_from = mapping.get("input_from")
                     in_to = mapping.get("input_to")
@@ -9728,6 +12161,28 @@ def _mapper_band_control(mapping: dict[str, Any], mid: int) -> None:
                         ) as tip_tag:
                             dpg.add_text(MAPPER_INPUT_ALT_TOOLTIP)
                         dpg.bind_item_theme(tip_tag, HELP_THEME_TOOLTIP)
+        elif _mapper_so_capable(mapping):  # e92: compact keeps the status square
+            _mapper_band_so(mapping, mid)
+
+
+def _mapper_band_so(mapping: dict[str, Any], mid: int) -> None:
+    """The SO square in a compact band's bottom-right corner (e92).
+
+    In the full band the square rides the OUT row; compact hides the readout, so
+    it is bottom-aligned beside the control. No card row grows.
+    """
+    top = MAPPER_KNOB_H - MAPPER_SO_BAND - MAPPER_ROW_GAP
+    spacer_w = MAPPER_MINI_W - 8 - MAPPER_KNOB_H - 2 - MAPPER_SO_BAND
+    with dpg.group():
+        dpg.add_spacer(height=top)
+        with dpg.group(horizontal=True):
+            dpg.add_spacer(width=spacer_w)
+            _mapper_so_button(mapping, mid, size=MAPPER_SO_BAND)
+
+
+def _mapper_effective_compact(mapping: dict[str, Any]) -> bool:
+    """True when this card renders compact (e86)."""
+    return bool(mapping.get("compact")) and not state.mapper_configure_mode
 
 
 def _render_mapper_card(mapping: dict[str, Any], parent: Any, height: int) -> None:
@@ -9750,12 +12205,13 @@ def _render_mapper_card(mapping: dict[str, Any], parent: Any, height: int) -> No
     has_reset = mapping["control"] != "cue list" and (
         str(mapping["property"]) != catalog.SET_CURRENT_PROPERTY
     )
-    mode_tag = modes_for_mapping(mid)
-    badge = f"[{mode_tag}]" if mode_tag else ""
-    badge_px = MAPPER_SMALL_CHAR_PX * len(badge)
+    # e86: compact cards keep caption + enable + X + E + the control; the
+    # configuration controls (R, out/in readouts, cue progress) are hidden.
+    compact = _mapper_effective_compact(mapping)
+    reserve = has_reset or compact  # the R/E slot
     # BUG-2026-10-14T181712b: the caption is truncated to the room the buttons leave,
-    # so R/enable/X can never be pushed out of the card; the full text is on hover.
-    caption = _fit_mapper_caption(full_caption, has_reset, extra_px=badge_px)
+    # so R/E/enable/X can never be pushed out of the card; the full text is on hover.
+    caption = _fit_mapper_caption(full_caption, reserve)
     out_from = mapping["output_from"]
     out_to = mapping["output_to"]
     content_w = MAPPER_MINI_W - 8  # 4 px card padding each side
@@ -9773,18 +12229,29 @@ def _render_mapper_card(mapping: dict[str, Any], parent: Any, height: int) -> No
                 with dpg.tooltip(parent=f"mapper_prop_{mid}", delay=HELP_HOVER_DELAY_S) as tip_tag:
                     dpg.add_text(full_caption)
                 dpg.bind_item_theme(tip_tag, HELP_THEME_TOOLTIP)
-            # e52s02: the gate tag rides next to the caption, so a layered
-            # Mapping is recognisable without opening the menu.
-            if badge:
-                themed_text(badge, slot="text", tag=f"mapper_mode_badge_{mid}")
-            dpg.add_spacer(
-                width=_mapper_caption_spacer(caption, {}, has_reset=has_reset, extra_px=badge_px)
-            )
+            # e52s10: the gate tag is NOT painted on the card (it belongs to a
+            # Binding, not the Mapping); the right-click Mode menu shows it.
+            dpg.add_spacer(width=_mapper_caption_spacer(caption, {}, has_reset=reserve))
             # e27s01: the reset button sits LEFT of the enable checkbox — it
             # returns the control to its neutral default (mapper.reset_mapping_value).
             # UAT e35: a cue-list trigger has no value to reset (it RUNS the cue,
             # stopped by the window 'Stop') — no R on cue-list cards.
-            if mapping["control"] != "cue list":
+            # e86: a compact card shows an E (expand) in that slot instead; R
+            # moves to the right-click menu.
+            if compact:
+                dpg.add_button(
+                    label="E",
+                    width=MAPPER_RESET_W,
+                    height=MAPPER_RESET_H,
+                    callback=on_mapper_expand,
+                    user_data=mid,
+                    tag=f"mapper_expand_{mid}",
+                )
+                dpg.bind_item_theme(f"mapper_expand_{mid}", theme_mapper_micro)
+                with dpg.tooltip(f"mapper_expand_{mid}", delay=HELP_HOVER_DELAY_S) as tip_tag:
+                    dpg.add_text("Expand this mapping")
+                dpg.bind_item_theme(tip_tag, HELP_THEME_TOOLTIP)
+            elif mapping["control"] != "cue list":
                 dpg.add_button(
                     label="R",
                     width=MAPPER_RESET_W,
@@ -9826,22 +12293,212 @@ def _render_mapper_card(mapping: dict[str, Any], parent: Any, height: int) -> No
                 tag=f"mapper_slider_{mid}",
             )
             _bind_mapper_font(f"mapper_slider_{mid}")
-            _mapper_readout_line("output", mid, "out", out_from, out_to, MAPPER_DRAG_W)
-            if _mapper_card_has_source(mapping):
-                in_from = mapping.get("input_from")
-                in_to = mapping.get("input_to")
+            if not compact:
                 _mapper_readout_line(
-                    "input",
+                    "output",
                     mid,
-                    "in",
-                    in_from if in_from is not None else 0.0,
-                    in_to if in_to is not None else 1.0,
+                    "out",
+                    out_from,
+                    out_to,
                     MAPPER_DRAG_W,
+                    show_so=mapping if _mapper_so_capable(mapping) else None,
                 )
+                if _mapper_card_has_source(mapping):
+                    in_from = mapping.get("input_from")
+                    in_to = mapping.get("input_to")
+                    _mapper_readout_line(
+                        "input",
+                        mid,
+                        "in",
+                        in_from if in_from is not None else 0.0,
+                        in_to if in_to is not None else 1.0,
+                        MAPPER_DRAG_W,
+                    )
+            elif _mapper_so_capable(mapping):  # e92: compact slider keeps the square
+                with dpg.group(horizontal=True):
+                    dpg.add_spacer(width=max(0, content_w - MAPPER_SO_SIZE))
+                    _mapper_so_button(mapping, mid)
         else:
             # knob / button: the compact band (e34s02)
-            _mapper_band_control(mapping, mid)
+            _mapper_band_control(mapping, mid, compact=compact)
         _render_mapper_source_menu(mapping)
+
+
+# e92: the Secondary Output editor. One dialog serves a Mapping (value = the
+# Mapping's Destination value, with the SO scale) and a step (value = the fixed
+# value it sends). Only one is open at a time.
+SO_EDITOR_TAG = "so_editor"
+SO_ERROR_TAG = "so_error"
+
+
+def open_mapping_so_editor(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Card button / right-click entry: edit one Mapping's SO (e92)."""
+    _open_so_editor(("mapping", int(user_data)))
+
+
+def open_step_so_editor(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Cell menu / corner marker: edit one sequencer step's SO (e92)."""
+    index, row, col = user_data
+    _open_so_editor(("step", int(index), int(row), int(col)))
+
+
+def _open_so_editor(owner: tuple[Any, ...]) -> None:
+    """Build the SO dialog for a Mapping or a sequencer step (e92)."""
+    if dpg.does_item_exist(SO_EDITOR_TAG):
+        dpg.delete_item(SO_EDITOR_TAG)
+    is_step = owner[0] == "step"
+    mapping: dict[str, Any] | None = None
+    if is_step:
+        index, row, col = int(owner[1]), int(owner[2]), int(owner[3])
+        step = state.sequencer(index)["tracks"][row]["steps"][col]
+        spec = step.get("secondary_output") or {}
+        value = float(spec.get("fixed", 1.0))
+        title = "Secondary Output — step"
+    else:
+        mapping = mapper.find_mapping(int(owner[1]))
+        if mapping is None:
+            return
+        spec = mapping.get("secondary_output") or {}
+        value = float(mapping["value"])
+        title = f"Secondary Output — {mapping.get('property', '?')}"
+    enabled = bool(spec.get("enabled", True))
+    host = str(spec.get("host") or MAPPING_SO_DEFAULT_HOST)
+    port = int(spec.get("port") or MAPPING_SO_DEFAULT_PORT)
+    address = str(spec.get("address") or MAPPING_SO_DEFAULT_ADDRESS)
+    arg = str(spec.get("arg") or "float")
+    with dpg.window(
+        label=title, tag=SO_EDITOR_TAG, modal=True, width=430, height=400, no_resize=True
+    ):
+        dpg.add_checkbox(label="Enabled", default_value=enabled, tag="so_enabled")
+        dpg.add_input_text(label="Host", default_value=host, width=280, tag="so_host")
+        dpg.add_input_int(label="Port", default_value=port, width=160, tag="so_port")
+        dpg.add_input_text(label="Address", default_value=address, width=280, tag="so_address")
+        dpg.add_combo(
+            items=list(SECONDARY_OUTPUT_ARGS),
+            default_value=arg,
+            width=140,
+            tag="so_arg",
+        )
+        if is_step:
+            dpg.add_input_float(label="Value", default_value=value, width=160, tag="so_value")
+        else:
+            themed_text(f"sends the Mapping value (now {value:.2f})", slot="text_dim")
+            dpg.add_input_float(
+                label="Scale from",
+                default_value=float(spec.get("from", mapping["output_from"] if mapping else 0.0)),
+                width=140,
+                tag="so_from",
+            )
+            dpg.add_input_float(
+                label="Scale to",
+                default_value=float(spec.get("to", mapping["output_to"] if mapping else 1.0)),
+                width=140,
+                tag="so_to",
+            )
+        dpg.add_text("", tag=SO_ERROR_TAG)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Test", callback=on_so_test, user_data=owner)
+            dpg.add_button(label="Remove", callback=on_so_remove, user_data=owner)
+            dpg.add_button(label="Save", callback=on_so_save, user_data=owner)
+            dpg.add_button(label="Cancel", callback=on_so_cancel)
+        help_tooltip("so_enabled", "mapper.so.enabled")
+        help_tooltip("so_host", "mapper.host")
+        help_tooltip("so_port", "mapper.port")
+        help_tooltip("so_address", "mapper.address")
+        help_tooltip("so_arg", "mapper.so.message")
+        if not is_step:
+            help_tooltip("so_from", "mapper.so.scale")
+            help_tooltip("so_to", "mapper.so.scale")
+
+
+def _so_form_spec(owner: tuple[Any, ...]) -> dict[str, Any]:
+    """Read the dialog's fields into an SO spec (unvalidated, e92)."""
+    spec: dict[str, Any] = {
+        "enabled": bool(dpg.get_value("so_enabled")),
+        "host": str(dpg.get_value("so_host")),
+        "port": int(dpg.get_value("so_port")),
+        "address": str(dpg.get_value("so_address")),
+        "arg": str(dpg.get_value("so_arg")),
+        "fixed": 0.0,
+    }
+    if owner[0] == "step":
+        spec["fixed"] = float(dpg.get_value("so_value"))
+    else:
+        spec["from"] = float(dpg.get_value("so_from"))
+        spec["to"] = float(dpg.get_value("so_to"))
+    return spec
+
+
+def _so_set_error(message: str) -> None:
+    if dpg.does_item_exist(SO_ERROR_TAG):
+        dpg.set_value(SO_ERROR_TAG, message)
+
+
+def _close_so_editor() -> None:
+    if dpg.does_item_exist(SO_EDITOR_TAG):
+        dpg.delete_item(SO_EDITOR_TAG)
+
+
+def on_so_test(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Test-send the form's spec with the current value; never persists (e92)."""
+    owner = tuple(user_data)
+    spec = _so_form_spec(owner)
+    error = validate_secondary_output(spec)
+    if error is not None:
+        _so_set_error(error)
+        return
+    if owner[0] == "step":
+        ok = send_secondary_output(spec, float(spec["fixed"]))
+    else:
+        mapping = mapper.find_mapping(int(owner[1]))
+        ok = False
+        if mapping is not None:
+            ok = send_secondary_output(
+                spec,
+                float(mapping["value"]),
+                float(mapping["output_from"]),
+                float(mapping["output_to"]),
+            )
+    _so_set_error("Sent" if ok else "Not sent — see the Logs window")
+
+
+def on_so_save(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Store the validated spec on its owner and refresh that surface (e92)."""
+    owner = tuple(user_data)
+    spec = _so_form_spec(owner)
+    error = validate_secondary_output(spec)
+    if error is not None:
+        _so_set_error(error)
+        return
+    if owner[0] == "step":
+        index, row, col = int(owner[1]), int(owner[2]), int(owner[3])
+        step = state.sequencer(index)["tracks"][row]["steps"][col]
+        step["secondary_output"] = sanitize_secondary_output(spec)
+        _close_so_editor()
+        update_step_ui(row, col, sequencer_prefix(index), index)
+    else:
+        mapper.set_mapping_secondary_output(int(owner[1]), spec)
+        _close_so_editor()
+        refresh_mapper_ui()
+
+
+def on_so_remove(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Drop the SO from its owner (the Mapping/cell stays) (e92)."""
+    owner = tuple(user_data)
+    if owner[0] == "step":
+        index, row, col = int(owner[1]), int(owner[2]), int(owner[3])
+        step = state.sequencer(index)["tracks"][row]["steps"][col]
+        step["secondary_output"] = None
+        _close_so_editor()
+        update_step_ui(row, col, sequencer_prefix(index), index)
+    else:
+        mapper.set_mapping_secondary_output(int(owner[1]), None)
+        _close_so_editor()
+        refresh_mapper_ui()
+
+
+def on_so_cancel(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    _close_so_editor()
 
 
 def _mapper_card_caption(mapping: dict[str, Any]) -> str:
@@ -9856,6 +12513,13 @@ def _mapper_card_caption(mapping: dict[str, Any]) -> str:
     control = str(mapping.get("control") or "")
     if control == "cue list":
         return "cue list"
+    source_kind = str(mapping.get("source_kind") or "hand")
+    if source_kind == "zone":
+        badge = "Z"  # e88: zone source
+    elif source_kind == "body":
+        badge = "B"  # e89: body source
+    else:
+        badge = handtrack.provider_badge(mapping)  # e87: L / W next to the property
     prop = str(mapping["property"])
     slot = catalog.parse_uniform_slot(prop)
     if slot is not None:
@@ -9873,14 +12537,14 @@ def _mapper_card_caption(mapping: dict[str, Any]) -> str:
         # instead of crashing the window.
         return prop
     if entry["family"] == catalog.FAMILY_TRIGGER:
-        return prop.upper()
+        return f"{prop.upper()} {badge}".strip()
     label = str(entry["label"])
     component = mapping.get("component")
     if component is not None:
         for comp in entry["components"]:
             if comp["key"] == component:
-                return f"{label} {comp['label']}"
-    return label
+                return f"{label} {comp['label']} {badge}".strip()
+    return f"{label} {badge}".strip()
 
 
 def _render_mapper_source_menu(mapping: dict[str, Any]) -> None:
@@ -9933,8 +12597,20 @@ def _render_mapper_source_menu(mapping: dict[str, Any]) -> None:
                     )
             with dpg.group(horizontal=True):
                 dpg.add_button(
-                    label="Leap Motion...",
-                    callback=open_mapper_leap_picker,
+                    label="Hands...",
+                    callback=open_mapper_hands_picker,
+                    user_data=mid,
+                )
+            with dpg.group(horizontal=True):
+                dpg.add_button(
+                    label="Zones...",
+                    callback=open_mapper_zone_picker,
+                    user_data=mid,
+                )
+            with dpg.group(horizontal=True):
+                dpg.add_button(
+                    label="Bodies...",
+                    callback=open_mapper_body_picker,
                     user_data=mid,
                 )
             with dpg.group(horizontal=True):
@@ -9957,10 +12633,24 @@ def _render_mapper_source_menu(mapping: dict[str, Any]) -> None:
             # e47: no MODE-arm item here any more — the toolbar icon arms the
             # mode; capture still happens on the markers once the mode is on.
             dpg.add_menu_item(
-                label="Leap Motion...",
+                label="Hands...",
                 check=True,
                 default_value=(mapping.get("leap") is not None),
-                callback=open_mapper_leap_picker,
+                callback=open_mapper_hands_picker,
+                user_data=mid,
+            )
+            dpg.add_menu_item(
+                label="Zones...",
+                check=True,
+                default_value=(mapping.get("source_kind") == "zone"),
+                callback=open_mapper_zone_picker,
+                user_data=mid,
+            )
+            dpg.add_menu_item(
+                label="Bodies...",
+                check=True,
+                default_value=(mapping.get("source_kind") == "body"),
+                callback=open_mapper_body_picker,
                 user_data=mid,
             )
             dpg.add_separator()
@@ -9985,6 +12675,26 @@ def _render_mapper_source_menu(mapping: dict[str, Any]) -> None:
                     callback=on_mapper_mode_menu,
                     user_data=(mid, mode_name),
                 )
+        # e86: the compact/configure view is UI configuration, not a MIDI action
+        # (operator decision). Reset moves here because a compact card hides R.
+        dpg.add_separator()
+        dpg.add_menu_item(
+            label="Compact",
+            check=True,
+            default_value=bool(mapping.get("compact")),
+            callback=on_mapper_compact_menu,
+            user_data=mid,
+        )
+        if mapping["control"] != "cue list" and (
+            str(mapping["property"]) != catalog.SET_CURRENT_PROPERTY
+        ):
+            dpg.add_menu_item(label="Reset", callback=reset_mapping, user_data=mid)
+        if _mapper_so_capable(mapping):
+            dpg.add_menu_item(
+                label="Secondary output...",
+                callback=open_mapping_so_editor,
+                user_data=mid,
+            )
         # e51s02: copy/cut/move the Mapping itself (mouse surface of the clipboard
         # actions; the MIDI-mappable markers live on the card strip).
         dpg.add_separator()
@@ -10038,9 +12748,17 @@ def set_mapping_band(sender: Any = None, app_data: Any = None, user_data: Any = 
 
 
 def clear_mapping_source(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
-    """Mapper control menu: drop the band/MIDI source, manual control resumes (e18)."""
-    mapper.clear_mapping_source(int(user_data))
+    """Mapper control menu: drop the band/MIDI source, manual control resumes (e18).
+
+    e84s01: clearing a MIDI source also removes the Binding rows that drove the
+    Mapping, so a manual control can never keep dispatching to a Mapping that no
+    longer claims a source.
+    """
+    mapping_id = int(user_data)
+    remove_mapping_bindings(mapping_id)
+    mapper.clear_mapping_source(mapping_id)
     refresh_mapper_ui()
+    refresh_midi_mappings_ui()
 
 
 def on_mapper_mode_menu(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
@@ -10090,15 +12808,22 @@ def drive_mapper_band(band_id: int, level: float) -> None:
             _set_mapper_control_value(m["id"], value)
 
 
-def drive_leap_mappings(snapshot: dict[str, float], now: float | None = None) -> None:
-    """Push a fresh leap snapshot into every leap-bound mapping (e26s03).
+def drive_hand_mappings(
+    snapshot: dict[str, float],
+    provider: str = handtrack.PROVIDER_LEAP,
+    now: float | None = None,
+) -> None:
+    """Push a fresh hand snapshot into the mappings BOUND to ``provider`` (e26s03/e87).
 
-    Called by the leap worker listener on tracking frames. Per-mapping rate
+    Called by the active engine's worker on tracking frames. Per-mapping rate
     cap (~30 Hz) and the change epsilon (input span / 1000) come from the
-    pure drive_ready gate; an absent hand/key HOLDS the mapping's last value.
+    pure drive_ready gate; an absent hand/key HOLDS the mapping's last value,
+    and a mapping of the INACTIVE engine is skipped for the same reason.
     OSC sends happen inside mapper.apply_input_value (worker-safe, HIGH-1) and
     the card widget moves on the main thread via ui_task.
     """
+    if state.tracking_frozen:
+        return
     if now is None:
         now = time.monotonic()
     snapshot = snapshot or {}
@@ -10106,14 +12831,16 @@ def drive_leap_mappings(snapshot: dict[str, float], now: float | None = None) ->
         key = m.get("leap")
         if not key:
             continue
+        if str(m.get("hand_provider") or handtrack.PROVIDER_LEAP) != provider:
+            continue  # e87: the other engine's mapping holds its last value
         raw = snapshot.get(key)
         if raw is None:
             continue  # absent hand: hold the mapping's last value
         in_from, in_to = m.get("input_from"), m.get("input_to")
         if in_from is None or in_to is None:
-            parts = leap.binding_parts(key)
+            parts = handtrack.binding_parts(key)
             if parts is not None:
-                in_from, in_to = leap.signal_default_range(parts[1]) or (0.0, 1.0)
+                in_from, in_to = handtrack.signal_default_range(parts[1], provider) or (0.0, 1.0)
             else:
                 in_from, in_to = 0.0, 1.0
         book = state.leap_drive_state.setdefault(m["id"], {"last_raw": None, "last_push": 0.0})
@@ -10133,6 +12860,108 @@ def drive_leap_mappings(snapshot: dict[str, float], now: float | None = None) ->
             value = mapper.apply_input_value(m["id"], float(raw))
         except Exception as exc:  # BUG-2026-10-14T180544: isolate each Mapping
             log_error("Mapper leap", f"mapping {m.get('id')}: {exc!r}")
+            continue
+
+        def _move_widget(mid: int = m["id"], v: float = value) -> None:
+            _set_mapper_control_value(mid, v)
+
+        ui_task(_move_widget)
+
+
+def drive_leap_mappings(snapshot: dict[str, float], now: float | None = None) -> None:
+    """Leap-only entry point kept for the existing callers/tests (e26s03)."""
+    drive_hand_mappings(snapshot, handtrack.PROVIDER_LEAP, now=now)
+
+
+def drive_zone_mappings(snapshot: dict[str, dict[str, float]], now: float | None = None) -> None:
+    """Push a fresh zone snapshot into the mappings BOUND to the zone source (e88s03).
+
+    Same per-mapping rate cap (~30 Hz) and change epsilon (input span / 1000) as
+    the hand drive; an absent zone or signal HOLDS the last value, and a mapping
+    of another source family is skipped. OSC sends happen inside
+    ``mapper.apply_input_value`` (worker-safe); the card widget moves on the main
+    thread via ui_task.
+    """
+    if state.tracking_frozen:
+        return
+    if now is None:
+        now = time.monotonic()
+    snapshot = snapshot or {}
+    for m in list(state.mapper_mappings):
+        if str(m.get("source_kind") or "hand") != "zone":
+            continue
+        zone = snapshot.get(f"zone{int(m.get('zone_id') or 1)}")
+        if not zone:
+            continue
+        signal = str(m.get("zone_signal") or "energy")
+        raw = zone.get(signal)
+        if raw is None:
+            continue
+        in_from, in_to = m.get("input_from"), m.get("input_to")
+        if in_from is None or in_to is None:
+            in_from, in_to = zonetrack.zone_signal_range(signal)
+        book = state.zone_drive_state.setdefault(m["id"], {"last_raw": None, "last_push": 0.0})
+        if not leap.drive_ready(
+            now,
+            float(book["last_push"]),
+            leap.LEAP_DRIVE_INTERVAL,
+            book["last_raw"],
+            float(raw),
+            float(in_from),
+            float(in_to),
+        ):
+            continue
+        book["last_raw"] = float(raw)
+        book["last_push"] = now
+        try:
+            value = mapper.apply_input_value(m["id"], float(raw))
+        except Exception as exc:
+            log_error("Mapper zone", f"mapping {m.get('id')}: {exc!r}")
+            continue
+
+        def _move_widget(mid: int = m["id"], v: float = value) -> None:
+            _set_mapper_control_value(mid, v)
+
+        ui_task(_move_widget)
+
+
+def drive_body_mappings(snapshot: dict[str, dict[str, float]], now: float | None = None) -> None:
+    """Push a fresh body snapshot into the mappings BOUND to the body source."""
+    if state.tracking_frozen:
+        return
+    if now is None:
+        now = time.monotonic()
+    snapshot = snapshot or {}
+    for m in list(state.mapper_mappings):
+        if str(m.get("source_kind") or "hand") != "body":
+            continue
+        body = snapshot.get(f"body{int(m.get('body_id') or 1)}")
+        if not body:
+            continue
+        signal = str(m.get("body_signal") or "x")
+        raw = body.get(signal)
+        if raw is None:
+            continue
+        in_from, in_to = m.get("input_from"), m.get("input_to")
+        if in_from is None or in_to is None:
+            in_from, in_to = bodytrack.body_signal_range(signal)
+        book = state.body_drive_state.setdefault(m["id"], {"last_raw": None, "last_push": 0.0})
+        if not leap.drive_ready(
+            now,
+            float(book["last_push"]),
+            leap.LEAP_DRIVE_INTERVAL,
+            book["last_raw"],
+            float(raw),
+            float(in_from),
+            float(in_to),
+        ):
+            continue
+        book["last_raw"] = float(raw)
+        book["last_push"] = now
+        try:
+            value = mapper.apply_input_value(m["id"], float(raw))
+        except Exception as exc:
+            log_error("Mapper body", f"mapping {m.get('id')}: {exc!r}")
             continue
 
         def _move_widget(mid: int = m["id"], v: float = value) -> None:
@@ -10221,13 +13050,353 @@ def mapper_leap_cancel(sender: Any = None, app_data: Any = None, user_data: Any 
         dpg.delete_item("mapper_leap_window")
 
 
-def midi_mapping_value(mapping_id: int, midi_value: int) -> None:
+HANDS_PICKER_WINDOW = "mapper_hands_window"
+
+
+def _hands_provider(label: str) -> str:
+    """Map the `Hands…` provider label back to the provider id (leap on unknown)."""
+    return next(
+        (p for p, text in handtrack.PROVIDER_LABELS.items() if text == label),
+        handtrack.PROVIDER_LEAP,
+    )
+
+
+def _hands_signal_labels(provider: str) -> list[str]:
+    """The signal combo items of one provider (labels, catalog order)."""
+    return [handtrack.field_label(field) for field in handtrack.bindable_signals(provider)]
+
+
+def _hands_field(provider: str, label: str) -> str | None:
+    """The field whose label is `label` for `provider` (None when unknown)."""
+    return next(
+        (
+            field
+            for field in handtrack.bindable_signals(provider)
+            if handtrack.field_label(field) == label
+        ),
+        None,
+    )
+
+
+def on_hands_provider_change(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    """`Hands…` provider combo: repopulate the signal list from the new engine."""
+    provider = _hands_provider(str(app_data))
+    labels = _hands_signal_labels(provider)
+    if dpg.does_item_exist("mapper_hands_signal_cb"):
+        dpg.configure_item("mapper_hands_signal_cb", items=labels)
+        if labels:
+            dpg.set_value("mapper_hands_signal_cb", labels[0])
+
+
+def open_mapper_hands_picker(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    """Mapper card menu > Hands…: provider -> hand -> signal modal (e87s04).
+
+    The provider comes FIRST because the two engines expose different signal
+    sets, and the mapping stores its provider (s03) so the inactive engine holds
+    it. Choosing Leap produces exactly the old keys and ranges.
+    """
+    mapping_id = int(user_data)
+    if dpg.does_item_exist(HANDS_PICKER_WINDOW):
+        dpg.delete_item(HANDS_PICKER_WINDOW)
+    mapping = mapper.find_mapping(mapping_id)
+    provider = handtrack.PROVIDER_LEAP
+    hand_default = "Left"
+    field_default: str | None = None
+    if mapping is not None:
+        stored = str(mapping.get("hand_provider") or handtrack.PROVIDER_LEAP)
+        if stored in handtrack.HAND_PROVIDERS:
+            provider = stored
+        parts = handtrack.binding_parts(mapping.get("leap") or "")
+        if parts is not None:
+            hand_default = "Left" if parts[0] == "left" else "Right"
+            if parts[1] in handtrack.bindable_signals(provider):
+                field_default = parts[1]
+    signals = handtrack.bindable_signals(provider)
+    field_default = field_default or signals[0]
+    label_default = handtrack.field_label(field_default)
+    with dpg.window(
+        label="Hands",
+        tag=HANDS_PICKER_WINDOW,
+        modal=True,
+        width=360,
+        height=250,
+        no_resize=True,
+    ):
+        themed_text("Bind this control to a hand signal:", slot="text")
+        dpg.add_spacer(height=6)
+        with dpg.group(horizontal=True):
+            themed_text("Engine", slot="text_dim")
+            dpg.add_combo(
+                items=[handtrack.PROVIDER_LABELS[p] for p in handtrack.HAND_PROVIDERS],
+                default_value=handtrack.PROVIDER_LABELS[provider],
+                width=170,
+                tag="mapper_hands_provider_cb",
+                callback=on_hands_provider_change,
+            )
+        dpg.add_spacer(height=4)
+        with dpg.group(horizontal=True):
+            themed_text("Hand", slot="text_dim")
+            dpg.add_combo(
+                items=["Left", "Right"],
+                default_value=hand_default,
+                width=110,
+                tag="mapper_hands_hand_cb",
+            )
+        dpg.add_spacer(height=4)
+        with dpg.group(horizontal=True):
+            themed_text("Signal", slot="text_dim")
+            dpg.add_combo(
+                items=_hands_signal_labels(provider),
+                default_value=label_default,
+                width=210,
+                tag="mapper_hands_signal_cb",
+            )
+        dpg.add_spacer(height=10)
+        with dpg.group(horizontal=True):
+            dpg.add_button(
+                label="Bind", callback=mapper_hands_confirm, user_data=mapping_id, width=90
+            )
+            dpg.add_button(label="Cancel", callback=mapper_hands_cancel, width=90)
+    show_centered_window(HANDS_PICKER_WINDOW)  # e55: dialogs open centered
+
+
+def mapper_hands_confirm(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Bind the picked provider/hand/signal and close the modal (e87s04)."""
+    mapping_id = int(user_data)
+    provider = _hands_provider(str(dpg.get_value("mapper_hands_provider_cb")))
+    hand = str(dpg.get_value("mapper_hands_hand_cb")).lower()
+    field = _hands_field(provider, str(dpg.get_value("mapper_hands_signal_cb")))
+    if field is None or hand not in leap.LEAP_HANDS:
+        return
+    mapper.set_mapping_leap(mapping_id, handtrack.binding_key(hand, field), provider)
+    if dpg.does_item_exist(HANDS_PICKER_WINDOW):
+        dpg.delete_item(HANDS_PICKER_WINDOW)
+    refresh_mapper_ui()
+
+
+def mapper_hands_cancel(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Close the `Hands…` picker modal without binding (e87s04)."""
+    if dpg.does_item_exist(HANDS_PICKER_WINDOW):
+        dpg.delete_item(HANDS_PICKER_WINDOW)
+
+
+ZONE_PICKER_WINDOW = "mapper_zone_window"
+
+
+def _zone_label(zone: dict[str, Any]) -> str:
+    """The zone combo label (`id: name`); the id prefix is the stable key."""
+    return f"{zone['id']}: {zone['name']}"
+
+
+def _zone_id_from_label(label: str) -> int:
+    """Parse the id prefix of a zone combo label (0 when garbage)."""
+    try:
+        return int(str(label).split(":", 1)[0])
+    except (TypeError, ValueError):
+        return 0
+
+
+def _zone_signal_from_label(label: str) -> str:
+    """The zone signal whose catalog label is `label` (`energy` on unknown)."""
+    return next(
+        (
+            signal
+            for signal in zonetrack.ZONE_SIGNALS
+            if zonetrack.zone_signal_label(signal) == label
+        ),
+        "energy",
+    )
+
+
+def open_mapper_zone_picker(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    """Mapper card menu > Zones…: zone -> signal modal (e88s03).
+
+    The zone list is the live operator configuration; a project with no zones
+    opens an explanatory modal instead of an empty combo. Binding is not a MIDI
+    learn target: the signal IS the address (the Hands… precedent).
+    """
+    mapping_id = int(user_data)
+    if dpg.does_item_exist(ZONE_PICKER_WINDOW):
+        dpg.delete_item(ZONE_PICKER_WINDOW)
+    mapping = mapper.find_mapping(mapping_id)
+    zones = list(state.zones_config)
+    with dpg.window(
+        label="Zones",
+        tag=ZONE_PICKER_WINDOW,
+        modal=True,
+        width=360,
+        height=240,
+        no_resize=True,
+    ):
+        themed_text("Bind this control to a stage zone:", slot="text")
+        dpg.add_spacer(height=6)
+        if zones:
+            labels = [_zone_label(zone) for zone in zones]
+            zone_id = int((mapping or {}).get("zone_id") or zones[0]["id"])
+            zone_default = next(
+                (label for label, zone in zip(labels, zones, strict=True) if zone["id"] == zone_id),
+                labels[0],
+            )
+            signal = str((mapping or {}).get("zone_signal") or "energy")
+            if signal not in zonetrack.ZONE_FIELDS:
+                signal = "energy"
+            with dpg.group(horizontal=True):
+                themed_text("Zone", slot="text_dim")
+                dpg.add_combo(
+                    items=labels,
+                    default_value=zone_default,
+                    width=230,
+                    tag="mapper_zone_zone_cb",
+                )
+            dpg.add_spacer(height=4)
+            with dpg.group(horizontal=True):
+                themed_text("Signal", slot="text_dim")
+                dpg.add_combo(
+                    items=[zonetrack.zone_signal_label(s) for s in zonetrack.ZONE_SIGNALS],
+                    default_value=zonetrack.zone_signal_label(signal),
+                    width=230,
+                    tag="mapper_zone_signal_cb",
+                )
+            dpg.add_spacer(height=10)
+            with dpg.group(horizontal=True):
+                dpg.add_button(
+                    label="Bind", callback=mapper_zone_confirm, user_data=mapping_id, width=90
+                )
+                dpg.add_button(label="Cancel", callback=mapper_zone_cancel, width=90)
+        else:
+            themed_text(
+                "No zones configured. Draw zones in the Stage zones window.",
+                slot="text",
+            )
+            dpg.add_spacer(height=10)
+            dpg.add_button(label="Cancel", callback=mapper_zone_cancel, width=90)
+    show_centered_window(ZONE_PICKER_WINDOW)
+
+
+def mapper_zone_confirm(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Bind the picked zone/signal, close the modal and refresh (e88s03)."""
+    mapping_id = int(user_data)
+    zone_id = _zone_id_from_label(str(dpg.get_value("mapper_zone_zone_cb")))
+    signal = _zone_signal_from_label(str(dpg.get_value("mapper_zone_signal_cb")))
+    if zone_id <= 0:
+        return
+    mapper.set_mapping_zone(mapping_id, zone_id, signal)
+    if dpg.does_item_exist(ZONE_PICKER_WINDOW):
+        dpg.delete_item(ZONE_PICKER_WINDOW)
+    refresh_mapper_ui()
+
+
+def mapper_zone_cancel(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Close the `Zones…` picker modal without binding (e88s03)."""
+    if dpg.does_item_exist(ZONE_PICKER_WINDOW):
+        dpg.delete_item(ZONE_PICKER_WINDOW)
+
+
+BODY_PICKER_WINDOW = "mapper_body_window"
+
+
+def _body_slot_label(slot: int) -> str:
+    return f"Body {slot}"
+
+
+def _body_slot_from_label(label: str) -> int:
+    try:
+        return int(str(label).split()[-1])
+    except (TypeError, ValueError):
+        return 0
+
+
+def _body_signal_from_label(label: str) -> str:
+    return next(
+        (
+            signal
+            for signal in bodytrack.BODY_SIGNALS
+            if bodytrack.body_signal_label(signal) == label
+        ),
+        "x",
+    )
+
+
+def open_mapper_body_picker(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    """Mapper card menu > Bodies…: slot -> signal modal (e89s05)."""
+    mapping_id = int(user_data)
+    if dpg.does_item_exist(BODY_PICKER_WINDOW):
+        dpg.delete_item(BODY_PICKER_WINDOW)
+    mapping = mapper.find_mapping(mapping_id)
+    slots = list(range(1, max(1, min(bodytrack.BODY_MAX, state.body_max_bodies)) + 1))
+    labels = [_body_slot_label(slot) for slot in slots]
+    slot_default = int((mapping or {}).get("body_id") or 1)
+    slot_label = _body_slot_label(slot_default) if slot_default in slots else labels[0]
+    signal = str((mapping or {}).get("body_signal") or "x")
+    if signal not in bodytrack.BODY_FIELDS:
+        signal = "x"
+    with dpg.window(
+        label="Bodies",
+        tag=BODY_PICKER_WINDOW,
+        modal=True,
+        width=360,
+        height=250,
+        no_resize=True,
+    ):
+        themed_text("Bind this control to a body track:", slot="text")
+        dpg.add_spacer(height=6)
+        with dpg.group(horizontal=True):
+            themed_text("Body", slot="text_dim")
+            dpg.add_combo(
+                items=labels, default_value=slot_label, width=140, tag="mapper_body_slot_cb"
+            )
+        dpg.add_spacer(height=4)
+        with dpg.group(horizontal=True):
+            themed_text("Signal", slot="text_dim")
+            dpg.add_combo(
+                items=[bodytrack.body_signal_label(s) for s in bodytrack.BODY_SIGNALS],
+                default_value=bodytrack.body_signal_label(signal),
+                width=220,
+                tag="mapper_body_signal_cb",
+            )
+        dpg.add_spacer(height=10)
+        with dpg.group(horizontal=True):
+            dpg.add_button(
+                label="Bind", callback=mapper_body_confirm, user_data=mapping_id, width=90
+            )
+            dpg.add_button(label="Cancel", callback=mapper_body_cancel, width=90)
+    show_centered_window(BODY_PICKER_WINDOW)
+
+
+def mapper_body_confirm(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    mapping_id = int(user_data)
+    slot = _body_slot_from_label(str(dpg.get_value("mapper_body_slot_cb")))
+    signal = _body_signal_from_label(str(dpg.get_value("mapper_body_signal_cb")))
+    if slot <= 0:
+        return
+    mapper.set_mapping_body(mapping_id, slot, signal)
+    if dpg.does_item_exist(BODY_PICKER_WINDOW):
+        dpg.delete_item(BODY_PICKER_WINDOW)
+    refresh_mapper_ui()
+
+
+def mapper_body_cancel(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    if dpg.does_item_exist(BODY_PICKER_WINDOW):
+        dpg.delete_item(BODY_PICKER_WINDOW)
+
+
+def midi_mapping_value(mapping_id: int, midi_value: int, source_type: str = "") -> None:
     """Drive a mapper control from a learned MIDI value (e23s02).
 
     The raw 0..127 value is rescaleped through the mapping's input range
     (default 0..127), then through its output range, and the control widget
     follows. Cue list (e35s03): the value marker IS the trigger — a value >= 64
-    runs/restarts the cue, anything below is ignored.
+    runs/restarts the cue, anything below is ignored. e84s01: `source_type` is
+    the kind of message that produced the value, so a note + a CC on one Mapping
+    are interpreted independently.
     """
     mapping = mapper.find_mapping(mapping_id)
     if mapping is not None and mapping.get("control") == "cue list":
@@ -10242,7 +13411,7 @@ def midi_mapping_value(mapping_id: int, midi_value: int) -> None:
             mapper.send_button_mapping(mapping_id)
             _after_button_press(mapper.find_mapping(mapping_id) or mapping)
         return
-    value = mapper.apply_input_value(mapping_id, midi_value)
+    value = mapper.apply_input_value(mapping_id, midi_value, source_type)
     _set_mapper_control_value(mapping_id, value)
     if mapping is not None and mapping.get("control") == "button":
         # BUG-2026-09-07: the square trigger must follow the driven value too
@@ -10473,6 +13642,30 @@ def _render_state_box(
     _render_mapping_box(f"mapper_state_box_{target_id}", head_tag, "State", mappings, parent, head)
 
 
+def on_mapper_compact_menu(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Card menu > Compact: set one mapping's persistent compact flag (e86)."""
+    mapper.set_mapping_compact(int(user_data), bool(app_data))
+    refresh_mapper_ui()
+
+
+def on_mapper_expand(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """The compact card's E: expand THIS mapping (compact = False) (e86)."""
+    mapper.set_mapping_compact(int(user_data), False)
+    refresh_mapper_ui()
+
+
+def on_mapper_compact_all(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Mapper toolbar: compact/expand EVERY mapping (e86)."""
+    mapper.set_all_mappings_compact(bool(user_data))
+    refresh_mapper_ui()
+
+
+def on_mapper_configure(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Mapper toolbar Configure: force every card full while ON (e86, session)."""
+    state.mapper_configure_mode = bool(app_data)
+    refresh_mapper_ui()
+
+
 def on_mapping_enable(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
     """Arm checkbox of a Mapping (mini-card OR row): flip the Enabled gate.
 
@@ -10531,6 +13724,7 @@ def delete_mapping(sender: Any = None, app_data: Any = None, user_data: Any = No
     """
     mid = int(user_data)
     mapper.remove_mapping(mid)
+    state.tracking_event_bindings = trackevents.drop_mapping(state.tracking_event_bindings, mid)
     _drop_mapping_editor_and_runs(mid)
     live_ids = {int(m["id"]) for m in state.mapper_mappings}
     emission.prune_book(state.mapping_book, state.mapping_values, live_ids)
@@ -12459,7 +15653,7 @@ def midi_control_loop() -> None:
         except Exception as e:  # a worker thread must never die (BLE001, per-file ignore)
             log_error("MIDI", f"control loop: {e}")
             time.sleep(MIDI_OPEN_RETRY_COOLDOWN_SECONDS)
-        time.sleep(0.002)
+        time.sleep(MIDI_CONTROL_POLL_SECONDS)
 
 
 def _midi_control_tick(
@@ -12532,17 +15726,35 @@ def _midi_control_tick(
 # Semantic grid-LED names (mirror/flash call sites) mapped per profile palette.
 
 
+def midi_clock_listen_needed() -> bool:
+    """True only while a MIDI clock/beat is actually in use (e85s04).
+
+    Before: the clock opened the FIRST input at boot and polled it at 1 kHz even
+    with MIDI disabled or a non-MIDI beat source. Now the listener exists only
+    when MIDI is enabled AND (a clock source is configured OR the beat source is
+    MIDI); the loop closes the port when this turns false.
+    """
+    return bool(state.midi_enabled) and (
+        bool(state.midi_clock_source) or state.beat_source == BEAT_SOURCE_MIDI
+    )
+
+
 def midi_clock_loop() -> None:
     """Listen for MIDI clock (0xF8, 24 pulses/beat) and fire the sequencer beat in MIDI mode.
 
     The clock listens on cfg clock_source when set, else the first available input;
-    without any port it logs once and idles so the app keeps running.
+    without any port it logs once and idles so the app keeps running. e85s04: the
+    loop only opens a port while `midi_clock_listen_needed()` and polls at
+    MIDI_CLOCK_POLL_SECONDS (5 ms), not 1 ms.
     """
     try:
         import mido
     except ImportError:
         return
     while True:
+        if not midi_clock_listen_needed():
+            time.sleep(MIDI_CLOCK_IDLE_SLEEP_SECONDS)
+            continue
         port_name = _clock_port_name()
         if not port_name:
             # BUG-2026-09-07: a no-input idle loop must not re-enumerate every few
@@ -12552,7 +15764,7 @@ def midi_clock_loop() -> None:
         try:
             with mido.open_input(port_name) as port:
                 append_log("MIDI", f"Clock listening on {port_name}")
-                while True:
+                while midi_clock_listen_needed():
                     for msg in port.iter_pending():
                         if msg.type == "clock":
                             state.midi_pulses += 1
@@ -12562,10 +15774,750 @@ def midi_clock_loop() -> None:
                                 if state.beat_source == BEAT_SOURCE_MIDI and state.is_playing:
                                     sync_event_beat.set()
                                     deliver_event_beat()
-                    time.sleep(0.001)
+                    time.sleep(MIDI_CLOCK_POLL_SECONDS)
         except Exception as e:
             log_error("MIDI", str(e))
             time.sleep(MIDI_OPEN_RETRY_COOLDOWN_SECONDS)
+
+
+# ---------- e87: webcam hand engine worker ----------
+# THIN GLUE ONLY (REFACTOR_LATEST.md): the geometry lives in vjmixapp/handtrack.py,
+# capture/inference in vjmixapp/handio.py (both dpg-free). This loop reads a frame,
+# asks the adapter for hands, derives the canonical fields, writes the SHARED
+# snapshot under state.leap_lock (only the active engine writes it) and drives the
+# mappings bound to the webcam. UI mutations on the main thread only (HIGH-1).
+HANDTRACK_IDLE_SLEEP_S: float = 0.2
+HANDTRACK_RETRY_SLEEP_S: float = 2.0
+HANDTRACK_CAMERA_WIDTH: int = 640
+HANDTRACK_CAMERA_HEIGHT: int = 480
+HANDTRACK_PREVIEW_W: int = 320
+HANDTRACK_PREVIEW_H: int = 240
+HANDTRACK_FPS_TAU_S: float = 0.5
+# e87s06: while nothing is tracked, only the palm detector runs (the landmarks
+# step needs a box), so the searching cadence can be slower than the performing
+# one without touching a session that has a hand in view.
+HANDTRACK_SEARCH_HZ: float = 6.0
+
+
+def handtrack_inference_hz(tracked: bool, max_hz: float) -> float:
+    """The cadence of the webcam engine (pure; the CPU fix of e87s06).
+
+    A tracked hand runs at the user's ``max Hz`` (the performing cadence). While
+    searching, the palm detector is the only cost and re-acquisition tolerates a
+    slower pass, so the idle engine stays inside the CPU budget.
+    """
+    return max_hz if tracked else min(max_hz, HANDTRACK_SEARCH_HZ)
+
+
+_handtrack_gate = handtrack.EngagementGate()
+# e87s05: one tracker for the active engine (reset whenever the engine restarts).
+_handtrack_poses = handtrack.PoseTracker()
+# e87 bug: the model's handedness follows the visual chirality, so the name is
+# locked while the hand stays in view (see handtrack.SideStabilizer).
+_handtrack_side = handtrack.SideStabilizer()
+_handtrack_source: Any = None
+_handtrack_model: Any = None
+_handtrack_last_tick: float = 0.0
+# e90s02: the supervised tracker child (camera + models OUT of this process).
+# The inline path stays the reference implementation and the fallback.
+_track_child = trackchild.TrackerChild()
+_handtrack_child_seq: int = -1
+
+# The child reports its own engine status; the window wants the hand vocab.
+_ENGINE_STATUS_MAP: dict[str, str] = {"live": "tracking", "off": "off"}
+_HOST_STATUS_MAP: dict[str, str] = {
+    trackchild.STATUS_STARTING: "searching",
+    trackchild.STATUS_STALLED: "stalled",
+    trackchild.STATUS_OFFLINE: "lost",
+    trackchild.STATUS_MISMATCH: "mismatch",
+    trackchild.STATUS_INLINE: "searching",
+    trackchild.STATUS_OFF: "off",
+}
+
+
+def _track_child_exhausted() -> None:
+    """Three failed restarts: the show keeps running inline until asked (e90s05)."""
+    state.tracking_host = trackchild.HOST_INLINE
+    _track_child.stop()
+    append_log("Tracking", "tracker child failed 3 times - running inline")
+
+
+_track_child.on_exhausted(_track_child_exhausted)
+
+
+def _track_child_config() -> dict[str, Any]:
+    """The parent's Control message: all three engines, one camera owner."""
+    hand_on = state.handtrack_enabled and state.hand_provider == handtrack.PROVIDER_WEBCAM
+    return {
+        "hand": {
+            "enabled": hand_on,
+            "device": state.handtrack_device,
+            "width": HANDTRACK_CAMERA_WIDTH,
+            "height": HANDTRACK_CAMERA_HEIGHT,
+            "max_hz": state.handtrack_max_hz,
+            "preview": state.handtrack_preview,
+            "preview_w": HANDTRACK_PREVIEW_W,
+            "preview_h": HANDTRACK_PREVIEW_H,
+        },
+        "body": {
+            "enabled": state.body_enabled,
+            "device": state.body_device,
+            "width": state.body_width,
+            "height": state.body_height,
+            "max_hz": state.body_max_hz,
+            "max_bodies": state.body_max_bodies,
+            "detect_every": state.body_detect_every,
+            "score": state.body_score,
+            "roi": list(state.body_roi),
+            "preview": state.body_preview,
+            "preview_w": BODY_PREVIEW_W,
+            "preview_h": BODY_PREVIEW_H,
+            "reset": state.body_reset_seq,
+        },
+        "zones": {
+            "enabled": state.zones_enabled,
+            "device": state.zones_device,
+            "width": state.zones_width,
+            "height": state.zones_height,
+            "processing_width": state.zones_processing_width,
+            "threshold": state.zones_threshold,
+            "min_area": state.zones_min_area,
+            "bg_tau_s": state.zones_bg_tau_s,
+            "max_hz": state.zones_max_hz,
+            "mirror": state.zones_mirror,
+            "preview": state.zones_preview,
+            "preview_w": ZONES_PREVIEW_W,
+            "preview_h": ZONES_PREVIEW_H,
+            "reset": state.zones_reset_seq,
+            "zones": state.zones_config,
+        },
+    }
+
+
+def _child_host_status(default: str) -> str:
+    """Map the host state onto the engine's own vocabulary (shared by all three)."""
+    if _track_child.status() != trackchild.STATUS_LIVE:
+        return _HOST_STATUS_MAP.get(_track_child.status(), default)
+    return state.tracking_engine_status or default
+
+
+def _handtrack_child_status() -> str:
+    engine = _child_host_status("searching")
+    return _ENGINE_STATUS_MAP.get(engine, engine)
+
+
+def _decode_child_preview(raw: bytes | None) -> Any:
+    """Decode the child's JPEG preview; a broken frame is skipped, not fatal."""
+    if not raw:
+        return None
+    try:
+        from PIL import Image
+
+        return np.asarray(Image.open(io.BytesIO(raw)).convert("RGB"), dtype=np.uint8)
+    except (OSError, ValueError):
+        return None
+
+
+def _handtrack_stop() -> None:
+    """Release the camera + forget the tracking state (disable / provider switch)."""
+    global _handtrack_source, _handtrack_model, _handtrack_last_tick, _handtrack_child_seq
+    if state.tracking_host == trackchild.HOST_CHILD:
+        _track_child.configure(_track_child_config())
+    if _handtrack_source is not None:
+        _handtrack_source.close()
+    _handtrack_source = None
+    _handtrack_model = None
+    _handtrack_last_tick = 0.0
+    _handtrack_child_seq = -1
+    _handtrack_gate.reset()
+    _handtrack_poses.reset()
+    _handtrack_side.reset()
+    state.handtrack_status = "off"
+    state.handtrack_fps = 0.0
+    with state.tracking_preview_lock:
+        state.tracking_preview_frame = None
+
+
+# e90s03: one preview block feeds three window textures; this set is the real
+# creation record (dpg.does_item_exist is not enough: the tag can outlive a
+# rebuild) and it is what the tests reset.
+_preview_textures: set[str] = set()
+
+
+def _publish_tracking_preview(engine: str, frame: Any) -> None:
+    """Store the ACTIVE engine's preview frame; the main thread uploads it."""
+    if frame is None:
+        return
+    with state.tracking_preview_lock:
+        state.tracking_preview_frame = frame
+        state.tracking_preview_engine = engine
+        state.tracking_preview_seq += 1
+
+
+def _handtrack_publish_preview(rgb: Any, fields: dict[str, float] | None, engaged: bool) -> None:
+    """Publish the downscaled preview with the box (+ cursor when a hand is seen).
+
+    BUG-2026-10-23T214000: this used to run only when a hand was detected, so the
+    panel showed "Waiting for the camera..." whenever the hand was not in view —
+    indistinguishable from a camera that never opened.
+    """
+    if not state.handtrack_preview or rgb is None:
+        return
+    small = handio.resize_rgb(rgb, (HANDTRACK_PREVIEW_W, HANDTRACK_PREVIEW_H))
+    frame = handtrack.draw_preview(
+        small,
+        None if fields is None else fields["palm_x"],
+        None if fields is None else fields["palm_y"],
+        box_fraction=state.handtrack_box,
+        mirror=state.handtrack_mirror,
+        engaged=engaged,
+    )
+    _publish_tracking_preview("hand", frame)
+
+
+def _handtrack_pose_signals(
+    fields: dict[str, float], landmarks: Any, engaged: bool, now: float
+) -> dict[str, float]:
+    """One frame of the pose machine (e87s05): the five 0/1 gesture signals.
+
+    ``gesture_open`` is zeroed while the gate is disarmed: the open palm is the
+    ARM gesture, so it must not also fire a mapped trigger on the same motion.
+    """
+    pose_features = dict(fields)
+    pose_features["thumb_high"] = handtrack.thumb_above_wrist(landmarks)
+    signals = _handtrack_poses.step(now, handtrack.classify_pose(pose_features))
+    if not engaged:
+        signals["gesture_open"] = 0.0
+    return signals
+
+
+def handtrack_restart() -> None:
+    """Force the webcam worker to rebuild the capture + model state (e87 action)."""
+    if state.hand_provider == handtrack.PROVIDER_WEBCAM:
+        _handtrack_stop()
+        if state.tracking_host == trackchild.HOST_CHILD:
+            _track_child.restart()
+        append_log("Hand tracking", "restart requested")
+
+
+def _handtrack_apply(landmarks: Any, side: str, preview: Any, now: float) -> dict[str, float]:
+    """One detected frame -> canonical fields, gate, poses, snapshot, preview.
+
+    Shared by the inline producer and the child producer: the SOURCE of the
+    landmarks changed (e90s02), the semantics did not (HIGH-1: pure cores).
+    """
+    snapshot: dict[str, float] = {}
+    if landmarks is not None:
+        fields = handtrack.normalize_landmarks(
+            landmarks,
+            box=handtrack.box_half_extent(state.handtrack_box),
+            mirror=state.handtrack_mirror,
+        )
+        engaged, _reason = _handtrack_gate.step(
+            now,
+            present=True,
+            inside=handtrack.in_box(fields["palm_x"], fields["palm_y"]),
+            palm_facing=fields["palm_facing"],
+            fist=fields["grab"] >= handtrack.CURL_FIST,
+        )
+        fields["engaged"] = 1.0 if engaged else 0.0
+        # e87s05: the pose signals ride the same snapshot (webcam provider only).
+        fields.update(_handtrack_pose_signals(fields, landmarks, engaged, now))
+        hand_side = _handtrack_side.update(side, now)
+        snapshot = {f"{hand_side}.{name}": value for name, value in fields.items()}
+        state.handtrack_status = "tracking"
+        _handtrack_publish_preview(preview, fields, engaged)
+    else:
+        _handtrack_gate.step(now, present=False, inside=False, palm_facing=0.0, fist=False)
+        _handtrack_poses.step(now, None)  # tracking loss never latches a pose
+        state.handtrack_status = "searching"
+        _handtrack_publish_preview(preview, None, False)
+    with state.leap_lock:
+        state.leap_values.clear()
+        state.leap_values.update(snapshot)
+    return snapshot
+
+
+def _handtrack_after_frame(snapshot: dict[str, float], now: float) -> None:
+    """FPS EMA + the Mapper drive, shared by both producers."""
+    global _handtrack_last_tick
+    if _handtrack_last_tick:
+        delta = now - _handtrack_last_tick
+        if delta > 0.0:
+            state.handtrack_fps = handtrack.ema(
+                state.handtrack_fps or None, 1.0 / delta, delta, HANDTRACK_FPS_TAU_S
+            )
+    _handtrack_last_tick = now
+    drive_hand_mappings(snapshot, handtrack.PROVIDER_WEBCAM, now=now)
+
+
+def _handtrack_child_iteration() -> None:
+    """Consume the child's newest frame; the child owns capture and inference."""
+    global _handtrack_child_seq
+    config = _track_child_config()
+    _track_child.configure(config)
+    _track_child.start(config)
+    state.handtrack_status = _handtrack_child_status()
+    frame = _track_child.latest(trackpipe.ENGINE_HAND)
+    if not isinstance(frame, trackpipe.TrackingFrame):
+        time.sleep(HANDTRACK_IDLE_SLEEP_S)
+        return
+    if frame.seq == _handtrack_child_seq:
+        time.sleep(HANDTRACK_IDLE_SLEEP_S)
+        return
+    _handtrack_child_seq = frame.seq
+    now = time.monotonic()
+    state.handtrack_latency_ms = float(sum(frame.timings))
+    state.handtrack_frame_age_ms = max(0.0, (now - frame.t_mono) * 1000.0)
+    landmarks = None if frame.payload_shape[0] == 0 else frame.payload
+    snapshot = _handtrack_apply(landmarks, frame.label, _decode_child_preview(frame.preview), now)
+    _handtrack_after_frame(snapshot, now)
+    time.sleep(1.0 / max(state.handtrack_max_hz, 1.0))
+
+
+def _handtrack_worker_iteration() -> None:
+    """One webcam-engine pass; the loop guard keeps the thread alive on any error."""
+    global _handtrack_source, _handtrack_model, _handtrack_last_tick
+    state.handtrack_worker_tick = time.time()
+    if not handtrack.engine_active():
+        if state.tracking_host == trackchild.HOST_CHILD:
+            _track_child.configure(_track_child_config())
+        if _handtrack_source is not None:
+            _handtrack_stop()
+        time.sleep(HANDTRACK_IDLE_SLEEP_S)
+        return
+    if state.tracking_host == trackchild.HOST_CHILD:
+        _handtrack_child_iteration()
+        return
+    if not handio.available():
+        if state.handtrack_status != "missing-deps":
+            append_log("Hand tracking", "onnxruntime or the hand models are missing")
+        state.handtrack_status = "missing-deps"
+        time.sleep(HANDTRACK_RETRY_SLEEP_S)
+        return
+    if _handtrack_source is None:
+        device = state.handtrack_device or next(iter(handio.list_devices()), "")
+        if not device:
+            state.handtrack_status = "no-camera"
+            time.sleep(HANDTRACK_RETRY_SLEEP_S)
+            return
+        source = handio.CameraSource(device, HANDTRACK_CAMERA_WIDTH, HANDTRACK_CAMERA_HEIGHT)
+        if not source.open():
+            source.close()
+            # BUG-2026-10-23T220000: a wedged driver blocks inside av.open(); say
+            # so instead of reporting a plain "no camera" with zeros everywhere.
+            state.handtrack_status = "stalled" if source.stalled else "no-camera"
+            time.sleep(HANDTRACK_RETRY_SLEEP_S)
+            return
+        _handtrack_source = source
+        _handtrack_model = handio.HandModel()
+        _handtrack_gate.reset()
+        _handtrack_last_tick = 0.0
+        append_log("Hand tracking", f"camera {device}")
+    started = time.monotonic()
+    rgb = _handtrack_source.read()
+    if rgb is None:
+        state.handtrack_status = "lost" if _handtrack_source.lost else "no-camera"
+        time.sleep(_handtrack_source.retry_delay())
+        return
+    hands = _handtrack_model.detect(rgb, now=started)
+    now = time.monotonic()
+    state.handtrack_latency_ms = (now - started) * 1000.0
+    if hands:
+        hand = hands[0]
+        snapshot = _handtrack_apply(hand.landmarks, hand.side, rgb, now)
+    else:
+        snapshot = _handtrack_apply(None, "", rgb, now)
+    state.handtrack_frame_age_ms = getattr(_handtrack_source, "frame_age_ms", 0.0)
+    _handtrack_after_frame(snapshot, now)
+    interval = 1.0 / max(handtrack_inference_hz(bool(hands), state.handtrack_max_hz), 1.0)
+    time.sleep(max(0.0, interval - (time.monotonic() - started)))
+
+
+def handtrack_control_loop() -> None:
+    """The webcam engine's thread: guarded, daemon, idles while the engine is off."""
+    while True:
+        try:
+            if state.handtrack_ready:
+                _handtrack_worker_iteration()
+            else:
+                # Before the boot applied the config there is nothing to honour
+                # (the suite never boots, so the loop stays out of its way).
+                time.sleep(HANDTRACK_IDLE_SLEEP_S)
+        except Exception as e:
+            log_error("Hand tracking", f"worker: {e!r}")
+            time.sleep(HANDTRACK_RETRY_SLEEP_S)
+
+
+# ---------- e88: stage-zones camera engine worker (T0, no ML) ----------
+# THIN GLUE ONLY (REFACTOR_LATEST.md): the motion math lives in
+# vjmixapp/zonetrack.py (dpg-free) and the camera is handio.CameraSource, the
+# same V4L2 path as the hand engine. This loop reads a frame, steps the pure
+# engine, publishes the snapshot under zones_lock and (optionally) an overlay
+# frame for the main-thread texture upload. UI mutations never happen here.
+ZONES_IDLE_SLEEP_S: float = 0.2
+ZONES_RETRY_SLEEP_S: float = 2.0
+ZONES_FPS_TAU_S: float = 0.5
+ZONES_PREVIEW_W: int = 320
+ZONES_PREVIEW_H: int = 240
+
+_zones_source: Any = None
+_zones_engine: Any = None
+_zones_engine_key: tuple[Any, ...] | None = None
+_zones_last_tick: float = 0.0
+_zones_reset_seen: int = 0
+_zones_child_seq: int = -1
+
+
+def _zones_engine_for_config() -> Any:
+    """Rebuild the pure engine when the zones or the motion options change."""
+    global _zones_engine, _zones_engine_key
+    key = (
+        state.zones_processing_width,
+        state.zones_threshold,
+        state.zones_min_area,
+        state.zones_bg_tau_s,
+        state.zones_mirror,
+        tuple(
+            (zone["id"], tuple(tuple(point) for point in zone["points"]))
+            for zone in state.zones_config
+        ),
+    )
+    if _zones_engine is None or _zones_engine_key != key:
+        _zones_engine = zonetrack.ZoneEngine(
+            state.zones_config,
+            processing_width=state.zones_processing_width,
+            threshold=state.zones_threshold,
+            min_area=state.zones_min_area,
+            bg_tau_s=state.zones_bg_tau_s,
+            mirror=state.zones_mirror,
+        )
+        _zones_engine_key = key
+    return _zones_engine
+
+
+def _zones_stop() -> None:
+    """Release the camera and forget the zone state (disable / owner switch)."""
+    global _zones_source, _zones_engine, _zones_engine_key, _zones_last_tick
+    if _zones_source is not None:
+        _zones_source.close()
+    _zones_source = None
+    _zones_engine = None
+    _zones_engine_key = None
+    _zones_last_tick = 0.0
+    state.zones_status = "off"
+    state.zones_fps = 0.0
+    with state.zones_lock:
+        state.zones_snapshot.clear()
+        state.tracking_preview_frame = None
+
+
+def _zones_publish_preview(rgb: Any, snapshot: dict[str, dict[str, float]]) -> None:
+    """Store the overlay frame; the main thread uploads it at its own cadence."""
+    if not state.zones_preview:
+        return
+    small = handio.resize_rgb(rgb, (ZONES_PREVIEW_W, ZONES_PREVIEW_H))
+    frame = zonetrack.draw_overlay(small, state.zones_config, snapshot, mirror=state.zones_mirror)
+    _publish_tracking_preview("zones", frame)
+
+
+def _zones_child_iteration() -> None:
+    """Consume the child's zone signals (the child owns the camera and the engine)."""
+    global _zones_child_seq, _zones_last_tick
+    config = _track_child_config()
+    _track_child.configure(config)
+    _track_child.start(config)
+    state.zones_status = _child_host_status("live")
+    message = _track_child.latest(trackpipe.ENGINE_ZONES)
+    if not isinstance(message, trackpipe.Signals) or message.seq == _zones_child_seq:
+        time.sleep(ZONES_IDLE_SLEEP_S)
+        return
+    _zones_child_seq = message.seq
+    now = time.monotonic()
+    state.zones_latency_ms = float(sum(message.timings))
+    state.zones_frame_age_ms = max(0.0, (now - message.t_mono) * 1000.0)
+    with state.zones_lock:
+        state.zones_snapshot.clear()
+        state.zones_snapshot.update(message.values)
+    if _zones_last_tick:
+        delta = now - _zones_last_tick
+        if delta > 0.0:
+            state.zones_fps = handtrack.ema(
+                state.zones_fps or None, 1.0 / delta, delta, ZONES_FPS_TAU_S
+            )
+    _zones_last_tick = now
+    state.zones_status = "live"
+    drive_zone_mappings(message.values, now=now)
+    _publish_tracking_preview("zones", _decode_child_preview(message.preview))
+    time.sleep(1.0 / max(state.zones_max_hz, 1.0))
+
+
+def _zones_worker_iteration() -> None:
+    """One zones-engine pass; the loop guard keeps the thread alive on any error."""
+    global _zones_source, _zones_last_tick, _zones_reset_seen
+    state.zones_worker_tick = time.time()
+    if state.zones_restart_requested:
+        state.zones_restart_requested = False
+        if _zones_source is not None:
+            _zones_stop()
+    if not camera.zones_engine_active():
+        if state.tracking_host == trackchild.HOST_CHILD:
+            _track_child.configure(_track_child_config())
+        if _zones_source is not None:
+            _zones_stop()
+        time.sleep(ZONES_IDLE_SLEEP_S)
+        return
+    if state.tracking_host == trackchild.HOST_CHILD:
+        _zones_child_iteration()
+        return
+    if _zones_source is None:
+        device = state.zones_device or next(iter(handio.list_devices()), "")
+        if not device:
+            if state.zones_status != "no-camera":
+                append_log("Stage zones", "no camera device")
+            state.zones_status = "no-camera"
+            time.sleep(ZONES_RETRY_SLEEP_S)
+            return
+        source = handio.CameraSource(device, state.zones_width, state.zones_height)
+        if not source.available():
+            if state.zones_status != "missing-deps":
+                append_log("Stage zones", "PyAV is missing")
+            state.zones_status = "missing-deps"
+            time.sleep(ZONES_RETRY_SLEEP_S)
+            return
+        if not source.open():
+            source.close()
+            failed = "stalled" if source.stalled else "no-camera"
+            if state.zones_status != failed:
+                append_log("Stage zones", f"camera {device} failed to open ({failed})")
+            state.zones_status = failed
+            time.sleep(ZONES_RETRY_SLEEP_S)
+            return
+        _zones_source = source
+        _zones_last_tick = 0.0
+        append_log("Stage zones", f"camera {device}")
+    started = time.monotonic()
+    rgb = _zones_source.read()
+    if rgb is None:
+        state.zones_status = "lost" if _zones_source.lost else "no-camera"
+        time.sleep(_zones_source.retry_delay())
+        return
+    engine = _zones_engine_for_config()
+    if state.zones_reset_seq != _zones_reset_seen:
+        _zones_reset_seen = state.zones_reset_seq
+        engine.reset_activity()
+    snapshot = engine.step(rgb, started)
+    now = time.monotonic()
+    state.zones_latency_ms = (now - started) * 1000.0
+    state.zones_frame_age_ms = getattr(_zones_source, "frame_age_ms", 0.0)
+    with state.zones_lock:
+        state.zones_snapshot.clear()
+        state.zones_snapshot.update(snapshot)
+    if _zones_last_tick:
+        delta = now - _zones_last_tick
+        if delta > 0.0:
+            state.zones_fps = handtrack.ema(
+                state.zones_fps or None, 1.0 / delta, delta, ZONES_FPS_TAU_S
+            )
+    _zones_last_tick = now
+    state.zones_status = "live"
+    drive_zone_mappings(snapshot, now=now)
+    _zones_publish_preview(rgb, snapshot)
+    interval = 1.0 / max(state.zones_max_hz, 1.0)
+    time.sleep(max(0.0, interval - (time.monotonic() - started)))
+
+
+def zones_control_loop() -> None:
+    """The zones engine's thread: guarded, daemon, idles while disabled."""
+    while True:
+        try:
+            if state.zones_ready:
+                _zones_worker_iteration()
+            else:
+                time.sleep(ZONES_IDLE_SLEEP_S)
+        except Exception as e:
+            log_error("Stage zones", f"worker: {e!r}")
+            time.sleep(ZONES_RETRY_SLEEP_S)
+
+
+# ---------- e89: body-tracking worker (T1) ----------
+# THIN GLUE ONLY: the pure core is vjmixapp/bodytrack.py, the ONNX adapter is
+# vjmixapp/bodyio.py; this loop reads, detects (every N passes), poses each
+# person, tracks and publishes {body1..bodyN} under body_lock.
+BODY_IDLE_SLEEP_S: float = 0.2
+BODY_RETRY_SLEEP_S: float = 2.0
+BODY_FPS_TAU_S: float = 0.5
+BODY_PREVIEW_W: int = 320
+BODY_PREVIEW_H: int = 240
+BODY_PREVIEW_HZ: float = 10.0
+
+_body_source: Any = None
+_body_detector: Any = None
+_body_pose: Any = None
+_body_tracker: Any = None
+_body_boxes: list[Any] = []
+_body_pass: int = 0
+_body_last_tick: float = 0.0
+_body_reset_seen: int = 0
+_body_child_seq: int = -1
+
+
+def _body_stop() -> None:
+    global _body_source, _body_detector, _body_pose, _body_tracker, _body_boxes, _body_pass
+    if _body_source is not None:
+        _body_source.close()
+    _body_source = None
+    _body_detector = None
+    _body_pose = None
+    _body_tracker = None
+    _body_boxes = []
+    _body_pass = 0
+    state.body_status = "off"
+    state.body_fps = 0.0
+    with state.body_lock:
+        state.body_snapshot.clear()
+        state.tracking_preview_frame = None
+
+
+def _body_publish_preview(rgb: Any, tracker: Any) -> None:
+    if not state.body_preview:
+        return
+    frame = bodytrack.draw_overlay(rgb, bodytrack.landmarks_by_slot(tracker))
+    small = handio.resize_rgb(frame, (BODY_PREVIEW_W, BODY_PREVIEW_H))
+    _publish_tracking_preview("body", small)
+
+
+def _body_child_iteration() -> None:
+    """Consume the child's body signals (the child owns the camera and the tracker)."""
+    global _body_child_seq, _body_last_tick
+    config = _track_child_config()
+    _track_child.configure(config)
+    _track_child.start(config)
+    state.body_status = _child_host_status("live")
+    message = _track_child.latest(trackpipe.ENGINE_BODY)
+    if not isinstance(message, trackpipe.Signals) or message.seq == _body_child_seq:
+        time.sleep(BODY_IDLE_SLEEP_S)
+        return
+    _body_child_seq = message.seq
+    now = time.monotonic()
+    state.body_latency_ms = float(sum(message.timings))
+    state.body_frame_age_ms = max(0.0, (now - message.t_mono) * 1000.0)
+    with state.body_lock:
+        state.body_snapshot.clear()
+        state.body_snapshot.update(message.values)
+    drive_body_mappings(message.values, now=now)
+    if _body_last_tick:
+        delta = now - _body_last_tick
+        if delta > 0.0:
+            state.body_fps = bodytrack_ema(state.body_fps, 1.0 / delta, delta)
+    _body_last_tick = now
+    state.body_status = "live"
+    _publish_tracking_preview("body", _decode_child_preview(message.preview))
+    time.sleep(1.0 / max(state.body_max_hz, 1.0))
+
+
+def _body_worker_iteration() -> None:
+    """One body-engine pass; the loop guard keeps the thread alive on any error."""
+    global _body_source, _body_detector, _body_pose, _body_tracker
+    global _body_boxes, _body_pass, _body_last_tick, _body_reset_seen
+    state.body_worker_tick = time.time()
+    if state.body_restart_requested:
+        state.body_restart_requested = False
+        if _body_source is not None:
+            _body_stop()
+    if camera.camera_engine() != camera.CAMERA_BODY:
+        if state.tracking_host == trackchild.HOST_CHILD:
+            _track_child.configure(_track_child_config())
+        if _body_source is not None:
+            _body_stop()
+        time.sleep(BODY_IDLE_SLEEP_S)
+        return
+    if state.tracking_host == trackchild.HOST_CHILD:
+        _body_child_iteration()
+        return
+    if not bodyio.available():
+        if state.body_status != "missing-deps":
+            append_log("Body tracking", "onnxruntime or the body models are missing")
+        state.body_status = "missing-deps"
+        time.sleep(BODY_RETRY_SLEEP_S)
+        return
+    if _body_source is None:
+        device = state.body_device or next(iter(handio.list_devices()), "")
+        if not device:
+            state.body_status = "no-camera"
+            time.sleep(BODY_RETRY_SLEEP_S)
+            return
+        source = handio.CameraSource(device, state.body_width, state.body_height)
+        if not source.open():
+            source.close()
+            state.body_status = "stalled" if source.stalled else "no-camera"
+            time.sleep(BODY_RETRY_SLEEP_S)
+            return
+        _body_source = source
+        _body_detector = bodyio.PersonDetector()
+        _body_pose = bodyio.PoseEstimator()
+        _body_tracker = bodytrack.BodyTracker(state.body_max_bodies)
+        _body_boxes = []
+        _body_pass = 0
+        _body_last_tick = 0.0
+        append_log("Body tracking", f"camera {device}")
+    started = time.monotonic()
+    rgb = _body_source.read()
+    if rgb is None:
+        state.body_status = "lost" if _body_source.lost else "no-camera"
+        time.sleep(_body_source.retry_delay())
+        return
+    if state.body_reset_seq != _body_reset_seen:
+        _body_reset_seen = state.body_reset_seq
+        _body_tracker.reset()
+    _body_pass += 1
+    if _body_pass % max(1, state.body_detect_every) == 1 or not _body_boxes:
+        _body_boxes = _body_detector.detect(rgb, roi=tuple(state.body_roi))
+    height, width = rgb.shape[:2]
+    detections: list[Any] = []
+    for person in _body_boxes[: state.body_max_bodies]:
+        landmarks, confidence = _body_pose.estimate(rgb, person)
+        if landmarks is not None:
+            detections.append(bodytrack.BodyDetection(landmarks, confidence))
+    snapshot = _body_tracker.step(detections, width, height, started)
+    now = time.monotonic()
+    state.body_latency_ms = (now - started) * 1000.0
+    state.body_frame_age_ms = getattr(_body_source, "frame_age_ms", 0.0)
+    with state.body_lock:
+        state.body_snapshot.clear()
+        state.body_snapshot.update(snapshot)
+    drive_body_mappings(snapshot, now=now)
+    if _body_last_tick:
+        delta = now - _body_last_tick
+        if delta > 0.0:
+            state.body_fps = bodytrack_ema(state.body_fps, 1.0 / delta, delta)
+    _body_last_tick = now
+    state.body_status = "live"
+    _body_publish_preview(rgb, _body_tracker)
+    interval = 1.0 / max(state.body_max_hz, 1.0)
+    time.sleep(max(0.0, interval - (time.monotonic() - started)))
+
+
+def bodytrack_ema(previous: float, value: float, dt: float) -> float:
+    """EMA helper for the worker fps (the pure core owns the body smoothing)."""
+    import math
+
+    if previous <= 0.0 or dt <= 0.0:
+        return float(value)
+    return float(previous + (1.0 - math.exp(-dt / BODY_FPS_TAU_S)) * (value - previous))
+
+
+def body_control_loop() -> None:
+    """The body engine's thread: guarded, daemon, idles while disabled."""
+    while True:
+        try:
+            if state.body_ready:
+                _body_worker_iteration()
+            else:
+                time.sleep(BODY_IDLE_SLEEP_S)
+        except Exception as e:
+            log_error("Body tracking", f"worker: {e!r}")
+            time.sleep(BODY_RETRY_SLEEP_S)
 
 
 # ---------- e26: Leap Motion worker ----------
@@ -12722,7 +16674,7 @@ def _leap_listener(lib: Any) -> Any:
             if state.leap_stall_count:
                 # e26s05: a frame after an escalation = the stream is back.
                 state.leap_stall_count = 0
-            drive_leap_mappings(snapshot)  # e26s03: push leap-bound mappings
+            drive_hand_mappings(snapshot, handtrack.PROVIDER_LEAP)  # e26s03/e87
             # e26s04: while the visualizer is on, capture the hand geometry and
             # publish one rate-capped composite (the poll thread is the only
             # writer of the visualizer snapshot; the main tick only uploads the
@@ -12934,7 +16886,7 @@ FIRST_OPEN_CENTERED_WINDOWS: tuple[str, ...] = (
 ALWAYS_CENTERED_WINDOWS: tuple[str, ...] = (
     "settings_window",
     "midi_window",
-    "leap_window",
+    "tracking_window",
     MAP_ACTIONS_WINDOW_TAG,
 )
 
@@ -13067,7 +17019,7 @@ _FOCUS_TRACKED_WINDOWS: tuple[str, ...] = (
     "file_manager_window",
     "settings_window",
     "midi_window",
-    "leap_window",
+    "tracking_window",
     "help_window",
 )
 
@@ -13105,6 +17057,11 @@ def _active_window_tag(tag: Any) -> str | None:
 
 
 _window_menu_sig: tuple[Any, ...] | None = None  # last (active, monitor tags) seen
+# e85s03: the shown-window signature + geometry scan is sampled at 10 Hz; an active
+# window change forces an immediate pass (the highlight must follow the focus).
+TOOLBAR_STATE_SAMPLE_SECONDS = 0.1
+_toolbar_shown_at: float = 0.0
+_toolbar_active_window: str | None = None
 
 # BUG-2026-09-19T005453: Dear ImGui's built-in Ctrl+Tab panel lists every
 # visible root window and renders an unlabeled one as "(Untitled)". The bar is
@@ -13154,7 +17111,7 @@ def _keep_toolbar_out_of_window_switch(now: float | None = None) -> None:
         dpg.hide_item(MODE_BADGES_WINDOW_TAG)
 
 
-def tick_toolbar() -> None:
+def tick_toolbar(now: float | None = None) -> None:
     """Per-frame gate: repaint the toolbar highlight only when the state changed.
 
     The signature is (tracked current window, shown window tags of the BAR's
@@ -13164,19 +17121,29 @@ def tick_toolbar() -> None:
     reports arbitrary widgets (step pads, combos) and the open menu itself, so
     the track resolves the active item up to its app window and never clears on
     a menu/popup/None result (BUG-2026-09-01T194500).
+
+    e85s03: the shown-window signature (an `is_item_shown` scan of every toolbar
+    window) and the geometry check are sampled at TOOLBAR_STATE_SAMPLE_SECONDS;
+    a change of the tracked active window forces an immediate pass. The Ctrl+Tab
+    guard still runs every frame.
     """
-    global _window_menu_sig
+    global _window_menu_sig, _toolbar_geom_sig, _toolbar_shown_at, _toolbar_active_window
     _keep_toolbar_out_of_window_switch()
     active = dpg.get_active_window()
     window = _active_window_tag(active)
     if window is not None:
         state.current_window = window
+    active_changed = state.current_window != _toolbar_active_window
+    _toolbar_active_window = state.current_window
+    clock = time.monotonic() if now is None else now
+    if not active_changed and clock - _toolbar_shown_at < TOOLBAR_STATE_SAMPLE_SECONDS:
+        return
+    _toolbar_shown_at = clock
     sig = (state.current_window, _toolbar_shown_signature(), tuple(_toolbar_color("text", 255)))
     if sig != _window_menu_sig:
         _window_menu_sig = sig
         refresh_toolbar_icons()
     # e46s01: keep the toolbar anchored to the top-right on resize / width changes.
-    global _toolbar_geom_sig
     geometry = (
         int(dpg.get_item_width(TOOLBAR_BAR_TAG) or 0),
         int(dpg.get_viewport_client_width() or 0),
@@ -13295,8 +17262,12 @@ def _show_band_overlay(
     )
 
 
-def refresh_band_value(bars: np.ndarray, band_id: int) -> None:
-    """Recompute one band's level from its sliders; update text and overlay (main thread)."""
+def refresh_band_value(bars: np.ndarray, band_id: int, *, ui: bool = True) -> None:
+    """Recompute one band's level; drive mappings/beat always, widgets only when `ui`.
+
+    e85s02: with the Audio window hidden the VALUE still feeds the Mapper bands and
+    the band-1 beat edge, but the text/overlay/LED writes are skipped.
+    """
     if not bands_enabled[band_id]:
         return
     f_start = float(dpg.get_value(f"band{band_id}_start"))
@@ -13309,41 +17280,130 @@ def refresh_band_value(bars: np.ndarray, band_id: int) -> None:
     # Beat trigger: any band rising to the threshold flashes its LED; only band 1 can
     # drive the sequencer beat (edge only) — bands 2/3 stay spectrum-only (e10s07)
     if value >= BAND_BEAT_THRESHOLD and band_prev_values[band_id] < BAND_BEAT_THRESHOLD:
-        flash_led(f"led_band{band_id}")
+        if ui:
+            flash_led(f"led_band{band_id}")
         if band_id == 1 and state.beat_source == BEAT_SOURCE_BAND1:
             sync_event_beat.set()
             deliver_event_beat()
     band_prev_values[band_id] = value
+    if not ui:
+        return
     dpg.set_value(f"band{band_id}_value_text", f"{value:.2f}")
     _show_band_overlay(band_id, f_start, f_end, l_min, l_max)
 
 
-def refresh_bands(bars: np.ndarray) -> None:
-    """Refresh every enabled band (disabled bands stay 0 and hidden)."""
+def refresh_bands(bars: np.ndarray, *, ui: bool = True, only: set[int] | None = None) -> None:
+    """Refresh the enabled bands; `only` restricts the set (e85s07).
+
+    With the Audio window hidden, only the bands a Mapping/beat consumes are
+    evaluated; with it visible, every enabled band is (for its overlay/text).
+    """
     for band_id in bands_enabled:
-        if bands_enabled[band_id]:
-            refresh_band_value(bars, band_id)
+        if not bands_enabled[band_id]:
+            continue
+        if only is not None and band_id not in only:
+            continue
+        refresh_band_value(bars, band_id, ui=ui)
+
+
+def audio_window_visible() -> bool:
+    """True while the Audio window exists and is shown (e85s02)."""
+    return dpg.does_item_exist("audio_window") and dpg.is_item_shown("audio_window")
+
+
+# e85s07: the spectrum only exists to feed the visible bars OR the bands a
+# Mapping/beat consumes. With the window hidden and no consumer the 20 Hz worker
+# is pure waste (the FFT is cheap; the wake/GIL and band pass are not).
+SPECTRUM_CONSUMPTION_POLL_S = 0.5
+_spectrum_consumed_at: float = 0.0
+
+
+def refresh_spectrum_consumed() -> None:
+    """Recompute the spectrum's consumers and whether it should run (e85s07).
+
+    Main thread only: reads the Mapper list and the enabled bands. `band_consumers`
+    is the set of enabled bands a Mapping (or the band-1 beat) actually uses;
+    `spectrum_consumed` is the visible window OR a non-empty consumer set.
+    """
+    consumers: set[int] = set()
+    for mapping in state.mapper_mappings:
+        band = mapping.get("band")
+        if isinstance(band, int) and bands_enabled.get(band):
+            consumers.add(band)
+    if state.beat_source == BEAT_SOURCE_BAND1 and bands_enabled.get(1):
+        consumers.add(1)
+    state.band_consumers = consumers
+    state.spectrum_consumed = bool(audio_window_visible() or consumers)
+
+
+def spectrum_should_run() -> bool:
+    """The worker's gate: analysis enabled AND something consumes the spectrum."""
+    return bool(state.is_audio_analyzing and state.spectrum_consumed)
+
+
+def tick_spectrum_consumption(now: float | None = None) -> None:
+    """Main-loop cadence (0.5 s): refresh the spectrum consumption flags (e85s07)."""
+    global _spectrum_consumed_at
+    clock = time.monotonic() if now is None else now
+    if clock - _spectrum_consumed_at < SPECTRUM_CONSUMPTION_POLL_S:
+        return
+    _spectrum_consumed_at = clock
+    refresh_spectrum_consumed()
 
 
 def update_spectrum_ui(bars: np.ndarray) -> None:
-    """Redraw the spectrum bars and refresh the enabled bands (main thread)."""
-    n = len(bars)
-    bw = SPEC_DRAWLIST_W / n
-    for i, level in enumerate(bars):
-        h = level * (SPEC_DRAWLIST_H - 4)
-        dpg.configure_item(
-            f"spec_bar_{i}",
-            pmin=(i * bw + 1, SPEC_DRAWLIST_H - h),
-            pmax=((i + 1) * bw - 1, SPEC_DRAWLIST_H - 2),
-        )
+    """Redraw the spectrum bars and refresh the enabled bands (main thread).
+
+    e85s02: the cache and the band VALUES always update (they feed Mapper bands and
+    the beat with the window closed); the 16 bars and the band overlays/text are
+    written only while the Audio window is visible.
+    """
+    visible = audio_window_visible()
+    if visible:
+        n = len(bars)
+        bw = SPEC_DRAWLIST_W / n
+        for i, level in enumerate(bars):
+            h = level * (SPEC_DRAWLIST_H - 4)
+            dpg.configure_item(
+                f"spec_bar_{i}",
+                pmin=(i * bw + 1, SPEC_DRAWLIST_H - h),
+                pmax=((i + 1) * bw - 1, SPEC_DRAWLIST_H - 2),
+            )
     state.spectrum_bars_cache = bars
-    refresh_bands(bars)
+    refresh_bands(bars, ui=visible, only=None if visible else state.band_consumers)
+
+
+def _drain_spectrum_update() -> None:
+    """Main-thread task: apply the newest pending bars and clear the handoff (e85s02)."""
+    try:
+        bars = state.spectrum_pending_bars
+        if bars is not None:
+            update_spectrum_ui(bars)
+    finally:
+        state.spectrum_pending_bars = None
+        state.spectrum_update_pending = False
+
+
+def _queue_spectrum_update(bars: np.ndarray) -> bool:
+    """Queue the newest bars unless an update is already pending (e85s02).
+
+    Returns True when a task was enqueued. While a task is in flight, newer bars
+    replace `state.spectrum_pending_bars` and are applied by that same task: the
+    queue never grows beyond one spectrum update.
+    """
+    state.spectrum_pending_bars = bars
+    if state.spectrum_update_pending:
+        return False
+    state.spectrum_update_pending = True
+    ui_task(_drain_spectrum_update)
+    return True
 
 
 def on_band_enable(sender: Any, app_data: Any, user_data: Any) -> None:
     """Show/hide a band's overlay and (re)compute it when the checkbox toggles."""
     band_id = int(user_data)
     bands_enabled[band_id] = bool(app_data)
+    refresh_spectrum_consumed()  # e85s07: a newly enabled/disabled band changes the gate
     if bands_enabled[band_id]:
         refresh_band_value(state.spectrum_bars_cache, band_id)
     else:
@@ -13614,13 +17674,15 @@ def _band_rect_mouse_move(sender: Any = None, app_data: Any = None, user_data: A
 def spectrum_analyzer_loop() -> None:
     """Compute the spectrum ~30x/s, AGC-normalize it, enqueue the redraw (HIGH-1)."""
     while True:
-        if state.is_audio_analyzing:
-            try:
-                bars = compute_spectrum_bars(get_audio_snapshot())
-                bars, state.spec_peak_hold = apply_spectrum_agc(bars, state.spec_peak_hold)
-                ui_task(partial(update_spectrum_ui, bars))
-            except Exception as e:
-                log_error("Spectrum", str(e))
+        if not spectrum_should_run():  # e85s07: no consumer -> stop the 20 Hz work
+            time.sleep(0.2)
+            continue
+        try:
+            bars = compute_spectrum_bars(get_audio_snapshot())
+            bars, state.spec_peak_hold = apply_spectrum_agc(bars, state.spec_peak_hold)
+            _queue_spectrum_update(bars)  # e85s02: latest-wins, one task
+        except Exception as e:
+            log_error("Spectrum", str(e))
         time.sleep(1.0 / SPECTRUM_FPS)
 
 
@@ -14191,12 +18253,27 @@ def _sync_analysis_widgets() -> None:
             dpg.set_value(tag, bool(flag))
 
 
+def _input_stream_samplerate(device_id: int) -> float:
+    """The rate an input stream should open at: the device default, else the live one.
+
+    e85s05: the audit machine's first device is 48 kHz and REJECTS 44100; opening
+    at the device default removes a failed open or an audio-server resampler.
+    """
+    try:
+        info = sd.query_devices(device_id)
+        rate = float(info.get("default_samplerate") or 0.0)
+    except Exception:
+        rate = 0.0
+    return rate if rate > 0.0 else float(state.samplerate)
+
+
 def _sync_audio_stream() -> bool:
     """Open/close the shared input stream to match the analysis flags (e28s03).
 
     Returns False when the requested stream could not be opened (no input
     device or a device failure); the callers flip the flags back off and sync
-    the widgets — the same bounce a failed manual click produces.
+    the widgets — the same bounce a failed manual click produces. e85s05: the
+    stream opens at the DEVICE's default rate and `state.samplerate` follows it.
     """
     global audio_stream
     needs_stream = state.is_audio_analyzing or state.is_beat_tracking
@@ -14208,14 +18285,16 @@ def _sync_audio_stream() -> bool:
         # 2026-10-14: name the capture client in PulseAudio/PipeWire (the ALSA plugin would
         # show `ALSA plug-in [python3.13]`); libpulse reads PULSE_PROP at connect.
         os.environ["PULSE_PROP"] = pulse_client_properties(os.environ.get("PULSE_PROP"))
+        rate = _input_stream_samplerate(device_id)
         try:
             audio_stream = sd.InputStream(
                 device=device_id,
                 channels=1,
-                samplerate=samplerate,
+                samplerate=rate,
                 dtype=np.float32,
                 callback=audio_callback,
             )
+            state.samplerate = rate
             audio_stream.start()
         except Exception:
             audio_stream = None
@@ -14244,6 +18323,7 @@ def set_audio_analysis_flags(spectrum: bool, bpm: bool) -> None:
         state.is_beat_tracking = False
         _sync_analysis_widgets()
         log_error("Audio", "analysis disabled: no usable input device")
+    refresh_spectrum_consumed()  # e85s07
 
 
 def toggle_audio_stream(sender: Any, app_data: Any, user_data: Any) -> None:
@@ -14265,6 +18345,7 @@ def toggle_audio_stream(sender: Any, app_data: Any, user_data: Any) -> None:
         else:
             state.is_beat_tracking = False
         _sync_analysis_widgets()
+    refresh_spectrum_consumed()  # e85s07: the gate follows the toggle at once
 
 
 def toggle_play(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
@@ -14334,6 +18415,15 @@ for _tile_title_font_path in _TILE_TITLE_FONT_PATHS:
     if os.path.exists(_tile_title_font_path):
         with dpg.font_registry():
             _tile_title_font = dpg.add_font(_tile_title_font_path, size=MEDIA_TITLE_FONT_SIZE)
+        break
+
+# e52s09: the mode badge's compact font, so five characters fit the badge (the default
+# 13 px font only fit three). Same guarded pattern: a missing asset keeps the badges
+# on the default font, wider label clipped as before.
+for _mode_badge_font_path in _TILE_TITLE_FONT_PATHS:
+    if os.path.exists(_mode_badge_font_path):
+        with dpg.font_registry():
+            _mode_badge_font = dpg.add_font(_mode_badge_font_path, size=MODE_BADGE_FONT_SIZE)
         break
 
 # e66s03: ONE font per zoom level, built here and never again. A level is a PAIR (pixels + a
@@ -14417,6 +18507,8 @@ with dpg.handler_registry():
     # e55s02: Enter submits the pairing prompt while it is up (the digit filter
     # owns the input callback, so Enter is routed through the global handler).
     dpg.add_key_press_handler(dpg.mvKey_Return, callback=_on_pairing_code_enter)
+    # e88: Escape drops the zone draft (then leaves the editor).
+    dpg.add_key_press_handler(dpg.mvKey_Escape, callback=on_zones_escape)
 
 
 # e10s06: one click-handler registry per Mediagrid tile. DPG 2.x item handlers
@@ -14545,6 +18637,22 @@ with dpg.theme() as theme_mapper_micro, dpg.theme_component(dpg.mvButton):
     # the label and it reads as "not centred". The SIZE is right (operator), so the
     # fix is the padding: with 0 the glyph is centred in the whole button. Bound to
     # the micro buttons only; every other colour comes from the card theme.
+    dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 0)
+    dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 3)
+
+with dpg.theme() as theme_mapper_readout, dpg.theme_component(dpg.mvThemeCat_Core):
+    # e92: 2 px horizontal frame padding (the card theme uses 6) gives the 9 px
+    # digits room inside the 28 px band boxes. Style only: every colour stays
+    # the card theme's.
+    dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 2, 2)
+
+with dpg.theme() as theme_so_muted, dpg.theme_component(dpg.mvButton):
+    # e92: a configured-but-muted Secondary Output reads AMBER. The accent state
+    # reuses the shared trigger ON theme, so only this warn state needs its own.
+    dpg.add_theme_color(dpg.mvThemeCol_Button, (150, 110, 20, 255))
+    dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (180, 135, 30, 255))
+    dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (210, 160, 40, 255))
+    dpg.add_theme_color(dpg.mvThemeCol_Text, (255, 240, 200, 255))
     dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 0)
     dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 3)
 
@@ -15278,7 +19386,12 @@ _MAP_ACTION_WINDOW_LABELS: dict[str, str] = {
     "logs_window": "Logs",
     "settings_window": "Settings",
     "midi_window": "MIDI",
-    "leap_window": "Leap Motion",
+    # e90s04: the three engine windows became tabs of ONE window; the old
+    # action targets stay as aliases so a saved MIDI binding keeps working.
+    "tracking_window": "Tracking",
+    "leap_window": "Hand tracking",
+    "zones_window": "Stage zones",
+    "body_window": "Body tracking",
     "help_window": "Info",
     SOURCES_DATA_WINDOW_TAG: "Sources data",
 }
@@ -15319,6 +19432,115 @@ def _sync_map_actions_panel() -> None:
                 tag=f"{row_tag}_marker",
                 tooltip=f"Map: {label}",
             )
+
+
+def _exec_tracking_force_inline(value: int) -> None:
+    """e90s05: drop the child for this session and keep tracking in-process."""
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    tracking_force_inline()
+
+
+def _exec_tracking_retry(value: int) -> None:
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    tracking_retry()
+
+
+def _exec_tracking_freeze(value: int) -> None:
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    tracking_set_frozen(not state.tracking_frozen)
+
+
+def _exec_tracking_add_row(value: int) -> None:
+    """e90s06: add a Mapper line for the last signal clicked in the monitor."""
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    if _tracking_last_signal is None:
+        log_warn("Tracking", "no signal row clicked yet")
+        return
+    add_mapping_for_signal(*_tracking_last_signal)
+
+
+def _exec_tracking_events_clear(value: int) -> None:
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    on_tracking_events_clear()
+
+
+def _exec_tracking_event_test(value: int) -> None:
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    on_tracking_event_test()
+
+
+def _exec_tracking_panic(value: int) -> None:
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    tracking_panic()
+
+
+def _exec_handtrack_toggle(value: int) -> None:
+    """e87: enable/disable the ACTIVE hand engine from MIDI (same path as the window)."""
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    if state.hand_provider == handtrack.PROVIDER_LEAP:
+        on_leap_enable(None, not state.leap_enabled)
+    else:
+        handtrack.set_handtrack_enabled(not state.handtrack_enabled)
+    _sync_handtrack_widgets()
+
+
+def _exec_handtrack_restart(value: int) -> None:
+    """e87: rebuild the ACTIVE hand engine (Leap generation / webcam re-open)."""
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    if state.hand_provider == handtrack.PROVIDER_LEAP:
+        on_leap_restart()
+    else:
+        handtrack_restart()
+
+
+def _exec_zones_toggle(value: int) -> None:
+    """e88: enable/disable the zones engine from MIDI (same path as the window)."""
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    engine = camera.CAMERA_NONE if state.zones_enabled else camera.CAMERA_ZONES
+    camera.set_camera_engine(engine)
+    _sync_camera_owner_widgets()
+
+
+def _exec_zones_restart(value: int) -> None:
+    """e88: ask the worker to reopen the camera."""
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    on_zones_restart()
+
+
+def _exec_zones_overlay(value: int) -> None:
+    """e88: show/hide the preview overlay."""
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    zonetrack.set_option("preview", not state.zones_preview)
+    _sync_zones_widgets()
+    if dpg.does_item_exist("zones_preview_panel"):
+        dpg.configure_item("zones_preview_panel", show=state.zones_preview)
+    _sync_zones_camera_combo()
+
+
+def _exec_zones_edit(value: int) -> None:
+    """e88: arm/disarm the polygon editor."""
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    set_zones_edit(not state.zones_edit)
+
+
+def _exec_zones_reset_activity(value: int) -> None:
+    """e88: relearn the background and reset occupancy."""
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    on_zones_reset_activity()
 
 
 def _exec_show_window(params: dict[str, Any], value: int) -> None:
@@ -16787,6 +21009,7 @@ with dpg.window(
     height=316,  # e71s01: two more band rows
     pos=(10, 806),
     tag="audio_window",
+    show=False,  # e85s07: the bands/mappings run hidden; open from the toolbar
 ):
     dpg.add_combo(
         items=input_devices_list, default_value=input_devices_list[0], tag="combo_devices", width=-1
@@ -16988,7 +21211,7 @@ with (
         # e83 fix: 4 tiles (4 x 137 = 548 px) + MEDIA_GRID_MARGIN 26 = 574, rounded
         # up. At 550 the 4th tile never fit and the window showed a ~110 px strip on
         # the right; a resize still leaves a remainder of at most one tile.
-        width=580,
+        width=VIMIX_MEDIA_WINDOW_W,
         height=690,
         pos=(1100, TOOLBAR_BAR_H),
         tag="vimix_media_window",
@@ -17021,6 +21244,12 @@ with (
         ),
         "sources.data",
     )
+
+# BUG-2026-10-21T202949: reflow the (wrapped) media learn bar while the operator
+# resizes the window, so the markers follow the width instead of being clipped.
+with dpg.item_handler_registry(tag="media_window_resize_reg"):
+    dpg.add_item_resize_handler(callback=lambda s, a: _sync_media_learn_bar())
+dpg.bind_item_handler_registry("vimix_media_window", "media_window_resize_reg")
 
 # WINDOW 4b: SOURCES DATA (e74s03; hidden until opened from the Vimix-sources toolbar).
 # The raw viOSC state table lived at the bottom of Settings until e74s03.
@@ -17311,50 +21540,394 @@ _sync_map_actions_panel()
 # monitor ~25 px; the 150-tall panel costs a further ~165 px, absorbed by the
 # window scrollbar (e48s02).
 LEAP_VIZ_PANEL_H: int = 158
-with dpg.window(
-    label="Leap Motion", width=560, height=680, pos=(560, 300), tag="leap_window", show=False
-):
-    dpg.add_checkbox(
-        label="Enable Leap Motion",
-        tag="leap_enable_cb",
-        default_value=state.leap_enabled,
-        callback=on_leap_enable,
-    )
-    # BUG-2026-09-18T212400: recovery control. The worker rebuilds its connection on
-    # the generation bump, so a stuck engine never needs an app restart.
-    dpg.add_button(
-        label="Restart engine",
-        tag="leap_restart_btn",
-        callback=on_leap_restart,
-        enabled=state.leap_enabled,
-    )
-    dpg.add_separator()
-    dpg.add_spacer(height=4)
-    dpg.add_text("", tag="leap_status_text")
-    # e48: tracking frame rate (diagnostics; per frame, not per hand).
-    dpg.add_text("", tag="leap_fps_text")
-    dpg.add_spacer(height=4)
-    dpg.add_separator()
-    dpg.add_checkbox(
-        label="Show device view + hands",
-        tag="leap_viz_cb",
-        default_value=state.leap_visualizer,
-        callback=on_leap_visualizer,
-    )
-    with dpg.child_window(height=LEAP_VIZ_PANEL_H, show=False, tag="leap_viz_panel"):
-        dpg.add_text("Waiting for the Leap device...", tag="leap_viz_wait_text")
-    with dpg.group(horizontal=True, tag="leap_monitor_group"):
-        for hand in leap.LEAP_HANDS:
-            for column_index, column in enumerate(leap.monitor_columns()):
-                with dpg.group(tag=f"leap_mon_{hand}_col{column_index + 1}"):
-                    themed_text(leap.monitor_column_title(hand, column_index), slot="text_bright")
-                    for field in column:
-                        with dpg.group(horizontal=True):
-                            themed_text(leap.monitor_label(field), slot="text_dim")
+# e87 (operator decision 2026-10-22): ONE window for BOTH hand engines. The tag
+# stays `leap_window` so the layout, the help targets and the Ctrl+Tab cycle keep
+# working; the label and the provider combo are the operator-facing part. Only
+# the ACTIVE provider's group is shown (show/hide, never a rebuild).
+HANDTRACK_PREVIEW_PANEL_H: int = 250
+
+# e87s04 (e33 rule): the two engine actions are MIDI-mappable, so their controls
+# have a marker slot that _sync_hand_engine_learn_markers fills while learning.
+LEAP_TOGGLE_LEARN_SLOT = "leap_toggle_learn_slot"
+LEAP_RESTART_LEARN_SLOT = "leap_restart_learn_slot"
+HANDTRACK_TOGGLE_LEARN_SLOT = "handtrack_toggle_learn_slot"
+
+
+def _build_leap_tab() -> None:
+    """The Leap Motion engine: its own tab (decision A, 2026-10-28)."""
+    with dpg.tab(label="Leap", tag="tracking_tab_leap"), dpg.group(tag="leap_provider_group"):
+        with dpg.group(horizontal=True):
+            help_tooltip(
+                dpg.add_checkbox(
+                    label="Enable Leap Motion",
+                    tag="leap_enable_cb",
+                    default_value=state.leap_enabled,
+                    callback=on_leap_enable,
+                ),
+                "leap.enable",
+            )
+            dpg.add_group(horizontal=True, tag=LEAP_TOGGLE_LEARN_SLOT)
+        # BUG-2026-09-18T212400: recovery control. The worker rebuilds its connection on
+        # the generation bump, so a stuck engine never needs an app restart.
+        with dpg.group(horizontal=True):
+            help_tooltip(
+                dpg.add_button(
+                    label="Restart engine",
+                    tag="leap_restart_btn",
+                    callback=on_leap_restart,
+                    enabled=state.leap_enabled,
+                ),
+                "leap.restart",
+            )
+            dpg.add_group(horizontal=True, tag=LEAP_RESTART_LEARN_SLOT)
+        dpg.add_separator()
+        dpg.add_spacer(height=4)
+        dpg.add_text("", tag="leap_status_text")
+        # e48: tracking frame rate (diagnostics; per frame, not per hand).
+        dpg.add_text("", tag="leap_fps_text")
+        dpg.add_spacer(height=4)
+        dpg.add_separator()
+        help_tooltip(
+            dpg.add_checkbox(
+                label="Show device view + hands",
+                tag="leap_viz_cb",
+                default_value=state.leap_visualizer,
+                callback=on_leap_visualizer,
+            ),
+            "leap.viz",
+        )
+        with dpg.child_window(height=LEAP_VIZ_PANEL_H, show=False, tag="leap_viz_panel"):
+            dpg.add_text("Waiting for the Leap device...", tag="leap_viz_wait_text")
+        with dpg.group(horizontal=True, tag="leap_monitor_group"):
+            for hand in leap.LEAP_HANDS:
+                for column_index, column in enumerate(leap.monitor_columns()):
+                    with dpg.group(tag=f"leap_mon_{hand}_col{column_index + 1}"):
+                        themed_text(
+                            leap.monitor_column_title(hand, column_index), slot="text_bright"
+                        )
+                        for field in column:
+                            with dpg.group(horizontal=True):
+                                themed_text(leap.monitor_label(field), slot="text_dim")
+                                dpg.add_text(
+                                    leap.LEAP_MONITOR_PLACEHOLDER,
+                                    tag=f"leap_mon_{hand}_{field}",
+                                )
+
+
+def _build_hands_tab() -> None:
+    """The webcam engine + the provider selector that picks the hand source."""
+    with dpg.tab(label="Hands", tag="tracking_tab_hands"):
+        with dpg.group(horizontal=True):
+            themed_text("Engine", slot="text_dim")
+            help_tooltip(
+                dpg.add_combo(
+                    items=[handtrack.PROVIDER_LABELS[p] for p in handtrack.HAND_PROVIDERS],
+                    default_value=handtrack.PROVIDER_LABELS[state.hand_provider],
+                    width=200,
+                    tag="handtrack_provider_cb",
+                    callback=on_hand_provider_change,
+                ),
+                "hands.provider",
+            )
+        dpg.add_separator()
+        with dpg.group(tag="webcam_provider_group"):
+            with dpg.group(horizontal=True):
+                help_tooltip(
+                    dpg.add_checkbox(
+                        label="Enable webcam",
+                        tag="handtrack_enable_cb",
+                        default_value=state.handtrack_enabled,
+                        callback=on_handtrack_enable,
+                    ),
+                    "handtrack.enable",
+                )
+                dpg.add_group(horizontal=True, tag=HANDTRACK_TOGGLE_LEARN_SLOT)
+            with dpg.group(horizontal=True):
+                themed_text("Camera", slot="text_dim")
+                help_tooltip(
+                    dpg.add_combo(
+                        items=[],
+                        width=190,
+                        tag="handtrack_camera_cb",
+                        callback=on_handtrack_camera,
+                    ),
+                    "handtrack.camera",
+                )
+                themed_text("Mirror", slot="text_dim")
+                help_tooltip(
+                    dpg.add_checkbox(
+                        tag="handtrack_mirror_cb",
+                        default_value=state.handtrack_mirror,
+                        callback=on_handtrack_mirror,
+                    ),
+                    "handtrack.mirror",
+                )
+            with dpg.group(horizontal=True):
+                help_tooltip(
+                    dpg.add_slider_float(
+                        label="Box",
+                        tag="handtrack_box_slider",
+                        width=120,
+                        min_value=handtrack.BOX_FRACTION_MIN,
+                        max_value=handtrack.BOX_FRACTION_MAX,
+                        default_value=state.handtrack_box,
+                        callback=on_handtrack_box,
+                    ),
+                    "handtrack.box",
+                )
+                help_tooltip(
+                    dpg.add_slider_float(
+                        label="Max Hz",
+                        tag="handtrack_maxhz_slider",
+                        width=110,
+                        min_value=handtrack.MAX_HZ_MIN,
+                        max_value=handtrack.MAX_HZ_MAX,
+                        default_value=state.handtrack_max_hz,
+                        callback=on_handtrack_maxhz,
+                    ),
+                    "handtrack.maxhz",
+                )
+                help_tooltip(
+                    dpg.add_checkbox(
+                        label="Preview",
+                        tag="handtrack_preview_cb",
+                        default_value=state.handtrack_preview,
+                        callback=on_handtrack_preview,
+                    ),
+                    "handtrack.preview",
+                )
+            dpg.add_separator()
+            dpg.add_text("", tag="handtrack_status_text")
+            dpg.add_text("", tag="handtrack_fps_text")
+            # Operator request 2026-10-28: the PREVIEW comes first, right under the
+            # status. It used to sit after the 34-row signal monitor, so it was
+            # always below the fold and the window had to be scrolled to see it.
+            with (
+                dpg.child_window(
+                    height=HANDTRACK_PREVIEW_PANEL_H,
+                    show=state.handtrack_preview,  # BUG-2026-10-24: a stored ON opens it
+                    tag="handtrack_preview_panel",
+                ),
+                dpg.group(horizontal=True),
+            ):
+                dpg.add_spacer(width=HANDTRACK_PREVIEW_PAD)
+                with dpg.group(tag="handtrack_preview_panel_slot"):
+                    dpg.add_text("Waiting for the camera...", tag="handtrack_preview_wait_text")
+            # Operator rig 2026-10-28: one COMPACT row per hand (label + value
+            # inline) instead of a 17-line column inside its own scroll box.
+            with dpg.group(tag="handtrack_monitor_group"):
+                for hand in handtrack.MONITOR_HANDS:
+                    with dpg.group(horizontal=True, tag=f"handtrack_mon_{hand}"):
+                        themed_text(hand[0].upper(), slot="text_bright")
+                        for field in handtrack.MONITOR_FIELDS:
+                            themed_text(handtrack.field_label(field), slot="text_dim")
                             dpg.add_text(
-                                leap.LEAP_MONITOR_PLACEHOLDER,
-                                tag=f"leap_mon_{hand}_{field}",
+                                handtrack.MONITOR_PLACEHOLDER,
+                                tag=f"handtrack_mon_{hand}_{field}",
                             )
+
+
+TRACKING_WINDOW_TAG = "tracking_window"
+TRACKING_MATRIX_TAGS: tuple[tuple[str, str], ...] = (
+    ("Leap", "tracking_matrix_leap"),
+    ("Hands", "tracking_matrix_hands"),
+    ("Bodies", "tracking_matrix_body"),
+    ("Zones", "tracking_matrix_zones"),
+)
+MATRIX_COLUMNS: tuple[tuple[str, float], ...] = (
+    ("Engine", 0.9),
+    ("On", 0.45),
+    ("State", 2.3),
+    ("Owner", 0.9),
+    ("", 0.7),
+)
+MATRIX_ROWS: tuple[tuple[str, str], ...] = (
+    ("tracking_matrix_leap", "Leap"),
+    ("tracking_matrix_hands", "Hands"),
+    ("tracking_matrix_body", "Bodies"),
+    ("tracking_matrix_zones", "Zones"),
+)
+TRACKING_HOST_LABELS: dict[str, str] = {
+    trackchild.HOST_INLINE: "Inline (in-process)",
+    trackchild.HOST_CHILD: "Child process",
+}
+TRACKING_HOST_HINTS: dict[str, str] = {
+    trackchild.HOST_INLINE: "reference path; a native crash can take the app down",
+    trackchild.HOST_CHILD: "crash-isolated: camera + models run outside this process",
+}
+
+# The four engine actions stay the SAME actions (e87/e88/e89); this window only
+# presents them uniformly (e90s04).
+TRACKING_FREEZE_LEARN_SLOT = "tracking_freeze_learn_slot"
+TRACKING_PANIC_LEARN_SLOT = "tracking_panic_learn_slot"
+TRACKING_INLINE_LEARN_SLOT = "tracking_inline_learn_slot"
+TRACKING_RETRY_LEARN_SLOT = "tracking_retry_learn_slot"
+TRACKING_ACTION_ROWS: tuple[tuple[str, str, str], ...] = (
+    ("Hands", "handtrack_enable", "handtrack_restart_action"),
+    ("Bodies", "body_enable", "body_restart_action"),
+    ("Zones", "zones_enable", "zones_restart_action"),
+)
+
+
+def _build_tracking_window() -> None:
+    """The ONE Tracking window: engine tabs, a status matrix, one preview (A)."""
+    with dpg.window(
+        label="Tracking",
+        tag=TRACKING_WINDOW_TAG,
+        width=TRACKING_WINDOW_W,
+        height=TRACKING_WINDOW_H,
+        pos=(560, 300),
+        show=False,
+        no_scrollbar=True,
+    ):
+        with dpg.group(horizontal=True):
+            themed_text("Host", slot="text_dim")
+            help_tooltip(
+                dpg.add_combo(
+                    items=[TRACKING_HOST_LABELS[host] for host in trackchild.HOSTS],
+                    default_value=TRACKING_HOST_LABELS[state.tracking_host],
+                    tag="tracking_host_cb",
+                    width=160,
+                    callback=on_tracking_host_change,
+                ),
+                "tracking.host",
+            )
+            dpg.add_text("", tag="tracking_host_hint")
+        # e90 rig 2026-10-28: a real TABLE, not padded monospace text, so every
+        # status cell can carry its own colour and the columns never drift.
+        with dpg.table(
+            tag="tracking_matrix_table",
+            header_row=True,
+            borders_innerH=True,
+            borders_innerV=False,
+            borders_outerH=False,
+            borders_outerV=False,
+            row_background=False,
+            policy=dpg.mvTable_SizingStretchProp,
+        ):
+            for column, weight in MATRIX_COLUMNS:
+                dpg.add_table_column(label=column, init_width_or_weight=weight)
+            for key, name in MATRIX_ROWS:
+                with dpg.table_row():
+                    dpg.add_text(name, tag=f"{key}_engine")
+                    dpg.add_text("off", tag=f"{key}_on")
+                    dpg.add_text("off", tag=key)
+                    dpg.add_text("-", tag=f"{key}_owner")
+                    dpg.add_text("", tag=f"{key}_note")
+        dpg.add_text(
+            "Owner = the engine holding the camera (one at a time; Leap is USB).",
+            tag="tracking_help_text",
+            wrap=TRACKING_WINDOW_W - 40,
+        )
+        dpg.add_separator()
+        # The engine tabs scroll INSIDE this panel, so the safety row below stays
+        # put: the operator must reach Freeze/Panic without scrolling (e90 rig).
+        with (
+            dpg.child_window(height=TRACKING_TABS_H, tag="tracking_tabs_panel", border=False),
+            dpg.tab_bar(tag="tracking_tab_bar"),
+        ):
+            _build_leap_tab()
+            _build_hands_tab()
+            _build_body_tab()
+            _build_zones_tab()
+        dpg.add_separator()
+        with dpg.group(horizontal=True):
+            help_tooltip(
+                dpg.add_button(
+                    label="Signals...",
+                    tag="tracking_signals_btn",
+                    callback=show_tracking_source_picker,
+                    width=100,
+                ),
+                "tracking.signals",
+            )
+            help_tooltip(
+                dpg.add_button(
+                    label="Events...",
+                    tag="tracking_events_btn",
+                    callback=show_tracking_events_window,
+                    width=100,
+                ),
+                "tracking.events",
+            )
+            help_tooltip(
+                dpg.add_button(
+                    label="Freeze", tag="tracking_freeze_btn", callback=on_tracking_freeze, width=90
+                ),
+                "tracking.freeze",
+            )
+            dpg.add_group(horizontal=True, tag=TRACKING_FREEZE_LEARN_SLOT)
+            help_tooltip(
+                dpg.add_button(
+                    label="Panic", tag="tracking_panic_btn", callback=on_tracking_panic, width=90
+                ),
+                "tracking.panic",
+            )
+            dpg.add_group(horizontal=True, tag=TRACKING_PANIC_LEARN_SLOT)
+            dpg.add_button(
+                label="Run inline",
+                tag="tracking_inline_btn",
+                callback=on_tracking_inline,
+                width=110,
+            )
+            dpg.add_group(horizontal=True, tag=TRACKING_INLINE_LEARN_SLOT)
+            help_tooltip(
+                dpg.add_button(
+                    label="Retry child",
+                    tag="tracking_retry_btn",
+                    callback=on_tracking_retry,
+                    width=110,
+                ),
+                "tracking.retry",
+            )
+            dpg.add_group(horizontal=True, tag=TRACKING_RETRY_LEARN_SLOT)
+
+
+_build_tracking_window()
+
+
+def _sync_tracking_learn_markers() -> None:
+    """(Re)render the safety actions' learn markers (e33 rule, e90s05)."""
+    for slot, action_id, tag in (
+        (TRACKING_FREEZE_LEARN_SLOT, MIDI_ACTION_TRACKING_FREEZE, "tracking_mk_freeze"),
+        (TRACKING_PANIC_LEARN_SLOT, MIDI_ACTION_TRACKING_PANIC, "tracking_mk_panic"),
+        (TRACKING_INLINE_LEARN_SLOT, MIDI_ACTION_TRACKING_FORCE_INLINE, "tracking_mk_inline"),
+        (TRACKING_RETRY_LEARN_SLOT, MIDI_ACTION_TRACKING_RETRY, "tracking_mk_retry"),
+    ):
+        if not dpg.does_item_exist(slot):
+            continue
+        dpg.delete_item(slot, children_only=True)
+        if not state.midi_learn_mode:
+            continue
+        learn_marker(
+            action_id,
+            {},
+            parent=slot,
+            tag=tag,
+            tooltip=f"Map: {actions.action_label(action_id)}",
+        )
+
+
+def _sync_hand_engine_learn_markers() -> None:
+    """(Re)render the hand-engine learn markers (e33 rule, e87s04)."""
+    for slot, action_id, tag in (
+        (LEAP_TOGGLE_LEARN_SLOT, MIDI_ACTION_HANDTRACK_TOGGLE, "leap_mk_toggle"),
+        (LEAP_RESTART_LEARN_SLOT, MIDI_ACTION_HANDTRACK_RESTART, "leap_mk_restart"),
+        (HANDTRACK_TOGGLE_LEARN_SLOT, MIDI_ACTION_HANDTRACK_TOGGLE, "handtrack_mk_toggle"),
+    ):
+        if not dpg.does_item_exist(slot):
+            continue
+        dpg.delete_item(slot, children_only=True)
+        if not state.midi_learn_mode:
+            continue
+        learn_marker(
+            action_id,
+            {},
+            parent=slot,
+            tag=tag,
+            tooltip=f"Map: {actions.action_label(action_id)}",
+        )
+
 
 # e16/e22/e23/e24: Mapper window — the body is rebuilt by refresh_mapper_ui()
 # (menu open, create, delete, prune, resize) as a stack of wrapping source
@@ -17413,6 +21986,17 @@ with (
         )
         themed_text("New mapping", slot="text_dim")
         dpg.add_group(tag="mapper_filter_learn_slot", horizontal=True)
+        # e86: view controls — Configure forces full for editing; the bulk
+        # buttons set every mapping's persistent compact flag.
+        dpg.add_spacer(width=MAPPER_FILTER_ADD_GAP)
+        dpg.add_checkbox(
+            label="Configure",
+            tag="mapper_configure_cb",
+            default_value=state.mapper_configure_mode,
+            callback=on_mapper_configure,
+        )
+        dpg.add_button(label="Compact all", callback=on_mapper_compact_all, user_data=True)
+        dpg.add_button(label="Expand all", callback=on_mapper_compact_all, user_data=False)
     # NOTE: a bare dpg.group(...) call does NOT create the item — the context
     # manager must be entered (dearpygui 2.x), same as the original tuple-with.
     with dpg.group(tag="mapper_mappings_group"):
@@ -17475,6 +22059,9 @@ threading.Thread(target=spectrum_analyzer_loop, daemon=True).start()
 threading.Thread(target=midi_clock_loop, daemon=True).start()
 threading.Thread(target=midi_control_loop, daemon=True).start()  # e09: control worker
 threading.Thread(target=leap_control_loop, daemon=True).start()  # e26: leap worker
+threading.Thread(target=handtrack_control_loop, daemon=True).start()  # e87: webcam worker
+threading.Thread(target=zones_control_loop, daemon=True).start()  # e88: stage-zones worker
+threading.Thread(target=body_control_loop, daemon=True).start()  # e89: body worker
 
 threading.Thread(target=sequencer_tick, daemon=True).start()
 threading.Thread(target=visual_metronome_loop, daemon=True).start()
@@ -17532,7 +22119,8 @@ TOOLBAR_ITEM_GROUPS: tuple[tuple[ToolbarItem, ...], ...] = (
         ("toggle", "settings_window", "\uf013", "Settings", ""),
         ("toggle", "midi_window", "\uf11c", "MIDI", ""),
         ("mode", "midi_learn", "\uf140", "MIDI Learn", ""),
-        ("toggle", "leap_window", "\uf256", "Leap Motion", ""),
+        # e90s04: one instrument, one icon (the three engines are tabs inside).
+        ("toggle", "tracking_window", "\uf256", "Tracking", ""),
         # e55: the I/O Monitor is not a workspace window; its icon joins the
         # configuration block on the right.
         ("toggle", "io_monitor_window", "\uf0ec", "I/O Monitor", ""),
@@ -17632,7 +22220,10 @@ def _toolbar_show_func(target: str) -> Any:
         "shader_window": show_shader_window,
         "settings_window": show_settings_window,
         "midi_window": show_midi_window,
+        "tracking_window": show_tracking_window,
         "leap_window": show_leap_window,
+        "zones_window": show_zones_window,
+        "body_window": show_body_window,
         "help_window": show_help_window,
     }.get(target)
 
@@ -18054,6 +22645,7 @@ try:
         tick_transport_layout()  # e74s07c: re-wrap a narrowed sequencer transport row
 
         tick_toolbar()  # e46s01: keep the toolbar highlight + active mark fresh
+        tick_spectrum_consumption()  # e85s07: stop the spectrum when nothing consumes it
         tick_viosc_led()  # e58s03: the settings connection LED
         tick_midi_learn_shortcut()  # e52s07: Ctrl+M arms/cancels MIDI Learn
 
@@ -18080,6 +22672,17 @@ try:
 
         tick_leap_visualizer()  # e26s04: embed the IR + skeleton frame (when shown)
 
+        tick_tracking_window()  # e90s04: the status matrix (one truth)
+        tick_tracking_source_picker()  # e90s06: live values in the signals picker
+        tick_tracking_events()  # e90s07: edges -> cue (only when bindings exist)
+        tick_handtrack_window()  # e87: webcam status + signal monitor (changed-only)
+
+        tick_handtrack_preview()  # e87: the 10 Hz preview upload (shown + enabled only)
+        tick_zones_window()  # e88: status + live per-zone readouts
+        tick_zones_preview()  # e88: the 10 Hz overlay upload + draft
+        tick_body_window()  # e89: status + live track readouts
+        tick_body_preview()  # e89: the 10 Hz skeleton upload
+
         tick_source_preview(time.time())  # e38s03: preview frames + transport sync
 
         request_missing_thumbnails(time.time())
@@ -18088,6 +22691,11 @@ try:
         time.sleep(frame_sleep())  # perf e07 P1: throttle the idle render cadence
 finally:
     # L-4 clean exit: stop audio, shut down the OSC server, destroy the context
+    # e90 rig 2026-10-29: the tracker child OWNS the camera — stop it before the
+    # process dies, or the next start finds the device still busy.
+    if _track_child is not None:
+        with contextlib.suppress(Exception):
+            _track_child.stop()
     if audio_stream is not None:
         with contextlib.suppress(Exception):
             audio_stream.stop()

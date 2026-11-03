@@ -11,6 +11,7 @@ composition root until the ui commit.
 import contextlib
 import contextvars
 import io
+import math
 import socket
 import time
 from collections.abc import Iterator
@@ -27,6 +28,7 @@ from vjmixapp.constants import (
     IO_MONITOR_KIND_DESTINATION,
     IO_MONITOR_KIND_MONITOR,
     IO_MONITOR_KIND_OSC,
+    IO_MONITOR_KIND_OSC_SO,
     IO_MONITOR_KIND_STATE,
     IO_MONITOR_KIND_STATE_PULL,
     IO_MONITOR_KIND_SYNC,
@@ -40,6 +42,7 @@ from vjmixapp.constants import (
     MAX_THUMBNAIL_BLOB_BYTES,
     MAX_THUMBNAIL_PIXELS,
     RECV_BUFFER_BYTES,
+    SECONDARY_OUTPUT_ARGS,
     STATE_PATH,
     STATE_PULL_INTERVAL,
     STATE_PULL_MAX_FAILURES,
@@ -604,4 +607,155 @@ def send_mapping_osc(spec: Any, value: float) -> bool:
         return True
     except Exception as e:
         log_error("OSC", f"mapping destination {address}: {e}")
+        return False
+
+
+# e92: the SO (Secondary Output) — a second, MIRRORED OSC egress. One spec shape
+# serves Mappings (value = the primary's emitted value, optional scale) and
+# sequencer steps (value = the fixed configured value). The sanitizer is the
+# persistence gate; the sender is best-effort and never raises into a caller.
+def _finite_number(value: Any) -> float | None:
+    """A finite float, or None for a bool/str/garbage/NaN (e92)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _secondary_output_scale(raw: dict[str, Any]) -> tuple[float, float] | None:
+    """The SO scale pair, None when absent; ValueError when half/invalid (e92)."""
+    has_from = "from" in raw
+    has_to = "to" in raw
+    if not has_from and not has_to:
+        return None
+    if has_from != has_to:
+        raise ValueError("half scale")
+    start = _finite_number(raw["from"])
+    end = _finite_number(raw["to"])
+    if start is None or end is None:
+        raise ValueError("non-finite scale")
+    return (start, end)
+
+
+def sanitize_secondary_output(raw: Any) -> dict[str, Any] | None:
+    """Heal one stored SO spec, or None when it cannot be a valid egress (e92).
+
+    The normalized form is ``{enabled, host, port, address, arg, fixed}`` plus
+    ``from``/``to`` when the scale is present. Unknown keys are dropped; an
+    invalid host/port/address/argument/scale/number yields None, so a project
+    load drops the SO rather than the Mapping or the cell that carries it.
+    """
+    if not isinstance(raw, dict):
+        return None
+    if validate_destination(raw) is not None:
+        return None
+    arg = str(raw.get("arg") or "float")
+    if arg not in SECONDARY_OUTPUT_ARGS:
+        return None
+    fixed = _finite_number(raw.get("fixed", 0.0))
+    if fixed is None:
+        return None
+    try:
+        scale = _secondary_output_scale(raw)
+    except ValueError:
+        return None
+    spec: dict[str, Any] = {
+        "enabled": bool(raw.get("enabled", True)),
+        "host": str(raw["host"]).strip(),
+        "port": int(raw["port"]),
+        "address": str(raw["address"]).strip(),
+        "arg": arg,
+        "fixed": fixed,
+    }
+    if scale is not None:
+        spec["from"], spec["to"] = scale
+    return spec
+
+
+def validate_secondary_output(spec: Any) -> str | None:
+    """The problem with an SO spec, or None when it is usable (e92, UI-facing)."""
+    error = validate_destination(spec)
+    if error is not None:
+        return error
+    arg = str(spec.get("arg") or "float")
+    if arg not in SECONDARY_OUTPUT_ARGS:
+        return f"OSC argument {arg!r} must be one of {SECONDARY_OUTPUT_ARGS}"
+    fixed = spec.get("fixed")
+    if fixed is not None and _finite_number(fixed) is None:
+        return "OSC value must be a finite number"
+    try:
+        _secondary_output_scale(spec)
+    except ValueError:
+        return "OSC scale must give both 'from' and 'to' as finite numbers"
+    return None
+
+
+def secondary_output_value(
+    spec: Any,
+    value: float,
+    output_from: float | None = None,
+    output_to: float | None = None,
+) -> float:
+    """The value the SO sends: the primary value scaled to the SO interval (e92).
+
+    No scale (or no output interval) is the identity. A degenerate primary
+    interval yields the SO scale's ``from``; a reversed interval maps naturally.
+    """
+    try:
+        scale = _secondary_output_scale(spec) if isinstance(spec, dict) else None
+    except ValueError:
+        scale = None
+    if scale is None or output_from is None or output_to is None:
+        return float(value)
+    start, end = scale
+    low, high = float(output_from), float(output_to)
+    if high == low:
+        return float(start)
+    unit = (float(value) - low) / (high - low)
+    return float(start + unit * (end - start))
+
+
+def compose_secondary_output_args(
+    spec: Any,
+    value: float,
+    output_from: float | None = None,
+    output_to: float | None = None,
+) -> list[Any]:
+    """The OSC argument list of one SO send (e92): float, int or no-arg trigger."""
+    arg = str(spec.get("arg") or "float") if isinstance(spec, dict) else "float"
+    if arg == "trigger":
+        return []
+    scaled = secondary_output_value(spec, value, output_from, output_to)
+    if arg == "int":
+        return [round(scaled)]
+    return [float(scaled)]
+
+
+def send_secondary_output(
+    spec: Any,
+    value: float,
+    output_from: float | None = None,
+    output_to: float | None = None,
+) -> bool:
+    """Send one value to an SO destination; False on an invalid spec (e92).
+
+    Best-effort, like ``send_mapping_osc``: a bad spec or a failing send is
+    logged and returns False. The message is the SO's own kind in the Monitor.
+    """
+    error = validate_secondary_output(spec)
+    if error is not None:
+        log_error("OSC", f"secondary output: {error}")
+        return False
+    address = str(spec["address"])
+    args = compose_secondary_output_args(spec, float(value), output_from, output_to)
+    try:
+        client = _client_for(str(spec["host"]), int(spec["port"]))
+        if not isinstance(client, ObservedClient):
+            client = observe_client(client, f"{spec['host']}:{spec['port']}")
+            _mapping_clients[(str(spec["host"]), int(spec["port"]))] = client
+        with sent_by(IO_MONITOR_KIND_OSC_SO):
+            client.send_message(address, args)
+        return True
+    except Exception as e:
+        log_error("OSC", f"secondary output {address}: {e}")
         return False
