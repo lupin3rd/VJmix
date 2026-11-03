@@ -7,6 +7,7 @@ the composition root via ui_task.
 """
 
 import math
+import time
 from typing import Any
 
 import essentia.standard as es
@@ -14,6 +15,8 @@ import numpy as np
 
 from vjmixapp import state
 from vjmixapp.constants import (
+    AUDIO_BUFFER_SECONDS,
+    AUDIO_STATUS_LOG_INTERVAL_S,
     BAND_AGG_WEIGHT,
     BAND_EDGE_BODY,
     BAND_EDGE_BOTTOM,
@@ -31,6 +34,7 @@ from vjmixapp.constants import (
     SPECTRUM_PEAK_FLOOR,
     SPECTRUM_PEAK_TARGET,
 )
+from vjmixapp.queues import log_warn
 
 rhythm_extractor = es.RhythmExtractor2013(method="multifeature")
 lowpass_filter = es.LowPass(cutoffFrequency=250.0)
@@ -43,7 +47,14 @@ lowpass_filter = es.LowPass(cutoffFrequency=250.0)
 
 def audio_callback(indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
     if status:
-        print(status)
+        # e85s05: NEVER print per block on the audio thread; count and warn at
+        # most once per AUDIO_STATUS_LOG_INTERVAL_S (terminal I/O blocks the
+        # callback, which causes more xruns and more prints).
+        state.audio_status_events += 1
+        now = time.monotonic()
+        if now - state.audio_status_logged_at >= AUDIO_STATUS_LOG_INTERVAL_S:
+            state.audio_status_logged_at = now
+            log_warn("Audio", f"stream status: {status}")
     samples = indata[:, 0].astype(np.float32)
     # L-2 ring-buffer write: in-place, modulo indexing, no full-buffer reallocation
     # (np.roll allocated a fresh ~1 MB array ~43x/s on every callback).
@@ -63,15 +74,21 @@ def audio_callback(indata: np.ndarray, frames: int, time_info: Any, status: Any)
 
 
 def get_audio_snapshot() -> np.ndarray:
-    """Chronological copy of the last len(audio_buffer) samples (newest at tail).
+    """Chronological copy of the last AUDIO_BUFFER_SECONDS at the live rate (newest at tail).
 
-    Linearizes the ring buffer for the BPM thread. Called once per second (not per
-    audio callback), so this allocation is acceptable.
+    e85s05: the ring is sized for MAX_AUDIO_SAMPLERATE; the window returned follows
+    `state.samplerate`, so a 48 kHz device yields 6 s of 48 kHz audio and a 44.1 kHz
+    device 6 s of its own. Only the tail is copied (the old code always copied the
+    whole max-sized buffer).
     """
+    total = min(len(state.audio_buffer), max(1, int(state.samplerate * AUDIO_BUFFER_SECONDS)))
     head = state.audio_buffer_head
     if head == 0:
-        return state.audio_buffer.copy()
-    return np.concatenate((state.audio_buffer[head:], state.audio_buffer[:head]))
+        return state.audio_buffer[-total:].copy()
+    if head >= total:
+        return state.audio_buffer[head - total : head].copy()
+    tail = state.audio_buffer[len(state.audio_buffer) - (total - head) :]
+    return np.concatenate((tail, state.audio_buffer[:head]))
 
 
 def _bar_freq_edges(n_bars: int, sr: float) -> np.ndarray:
@@ -87,14 +104,18 @@ def _bar_freq_edges(n_bars: int, sr: float) -> np.ndarray:
 
 
 def compute_spectrum_bars(
-    samples: np.ndarray, n_bars: int = SPECTRUM_BARS, sr: float = state.samplerate
+    samples: np.ndarray, n_bars: int = SPECTRUM_BARS, sr: float | None = None
 ) -> np.ndarray:
     """Magnitude spectrum of the latest samples, binned into n_bars levels (0..1).
 
     Hann-windowed rfft, dB scale with a -SPECTRUM_DB_FLOOR floor; the bars are
     log-spaced over SPECTRUM_F_MIN..SPECTRUM_F_MAX (e10s09) so music energy is
     spread perceptually; a full-scale sine reaches ~1.0, silence ~0.0.
+    e85s05: `sr` defaults to the LIVE `state.samplerate` (the old default froze
+    44100 at import, so a 48 kHz device mapped bins to the wrong Hz).
     """
+    if sr is None:
+        sr = state.samplerate
     if samples.size < SPECTRUM_FFT_SIZE:
         samples = np.pad(samples, (0, SPECTRUM_FFT_SIZE - samples.size))
     frame = samples[-SPECTRUM_FFT_SIZE:] * np.hanning(SPECTRUM_FFT_SIZE)

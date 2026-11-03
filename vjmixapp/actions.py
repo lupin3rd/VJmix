@@ -14,6 +14,10 @@ from dataclasses import dataclass
 
 from vjmixapp.constants import (
     MIDI_ACTION_BEAT_SOURCE,
+    MIDI_ACTION_BODY_OVERLAY,
+    MIDI_ACTION_BODY_RESET_TRACKS,
+    MIDI_ACTION_BODY_RESTART,
+    MIDI_ACTION_BODY_TOGGLE,
     MIDI_ACTION_DRAFT_LOAD,
     MIDI_ACTION_DRAFT_NEXT,
     MIDI_ACTION_DRAFT_PREV,
@@ -24,6 +28,8 @@ from vjmixapp.constants import (
     MIDI_ACTION_FILE_NEXT,
     MIDI_ACTION_FILE_PREV,
     MIDI_ACTION_FILE_STEP,
+    MIDI_ACTION_HANDTRACK_RESTART,
+    MIDI_ACTION_HANDTRACK_TOGGLE,
     MIDI_ACTION_IO_MONITOR_TOGGLE,
     MIDI_ACTION_MAPPER_BAND,
     MIDI_ACTION_MAPPER_CUE_OPEN,
@@ -36,6 +42,7 @@ from vjmixapp.constants import (
     MIDI_ACTION_MAPPING_CUT,
     MIDI_ACTION_MAPPING_MOVE,
     MIDI_ACTION_MAPPING_PASTE,
+    MIDI_ACTION_MAPPING_SO,
     MIDI_ACTION_MAPPING_TOGGLE,
     MIDI_ACTION_MODE_TOGGLE,
     MIDI_ACTION_MODES_CLEAR,
@@ -70,9 +77,21 @@ from vjmixapp.constants import (
     MIDI_ACTION_TEXT_WORD,
     MIDI_ACTION_TEXT_WORD_PLUS,
     MIDI_ACTION_TRACK_ASSIGN,
+    MIDI_ACTION_TRACKING_ADD_ROW,
+    MIDI_ACTION_TRACKING_EVENT_TEST,
+    MIDI_ACTION_TRACKING_EVENTS_CLEAR,
+    MIDI_ACTION_TRACKING_FORCE_INLINE,
+    MIDI_ACTION_TRACKING_FREEZE,
+    MIDI_ACTION_TRACKING_PANIC,
+    MIDI_ACTION_TRACKING_RETRY,
     MIDI_ACTION_TRANSPORT_PLAY,
     MIDI_ACTION_TRANSPORT_RESYNC,
     MIDI_ACTION_TRANSPORT_TAP,
+    MIDI_ACTION_ZONES_EDIT,
+    MIDI_ACTION_ZONES_OVERLAY,
+    MIDI_ACTION_ZONES_RESET_ACTIVITY,
+    MIDI_ACTION_ZONES_RESTART,
+    MIDI_ACTION_ZONES_TOGGLE,
 )
 
 # Categories group the actions in future UI (MIDI window catalog etc.).
@@ -102,6 +121,12 @@ CATEGORY_FILES = "files"
 CATEGORY_TEXT = "text"
 # e61s03: the Shader window — authors a GLSL asset and deploys its FILE PATH.
 CATEGORY_SHADER = "shader"
+# e88: the stage-zones engine (toggle/restart/overlay/edit/reset activity).
+CATEGORY_ZONES = "zones"
+# e89: the body-tracking engine (toggle/restart/overlay/reset tracks).
+CATEGORY_BODY = "body"
+# e90s05: the host-level safety actions (inline, retry, freeze, panic).
+CATEGORY_TRACKING = "tracking"
 
 # e33s05: global actions (window show + project new/open/save).
 CATEGORY_GLOBAL = "global"
@@ -249,11 +274,83 @@ ACTION_SPECS: dict[str, ActionSpec] = {
         CATEGORY_MEDIAGRID,
         KIND_MOMENTARY,
     ),
+    MIDI_ACTION_HANDTRACK_TOGGLE: ActionSpec(
+        MIDI_ACTION_HANDTRACK_TOGGLE, "Toggle hand engine", CATEGORY_SETTINGS, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_HANDTRACK_RESTART: ActionSpec(
+        MIDI_ACTION_HANDTRACK_RESTART, "Restart hand engine", CATEGORY_SETTINGS, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_ZONES_TOGGLE: ActionSpec(
+        MIDI_ACTION_ZONES_TOGGLE, "Toggle zones engine", CATEGORY_ZONES, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_ZONES_RESTART: ActionSpec(
+        MIDI_ACTION_ZONES_RESTART, "Restart zones engine", CATEGORY_ZONES, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_ZONES_OVERLAY: ActionSpec(
+        MIDI_ACTION_ZONES_OVERLAY, "Toggle zones overlay", CATEGORY_ZONES, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_ZONES_EDIT: ActionSpec(
+        MIDI_ACTION_ZONES_EDIT, "Toggle zone editor", CATEGORY_ZONES, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_ZONES_RESET_ACTIVITY: ActionSpec(
+        MIDI_ACTION_ZONES_RESET_ACTIVITY, "Reset zone activity", CATEGORY_ZONES, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_TRACKING_FORCE_INLINE: ActionSpec(
+        MIDI_ACTION_TRACKING_FORCE_INLINE,
+        "Tracking: run inline",
+        CATEGORY_TRACKING,
+        KIND_MOMENTARY,
+    ),
+    MIDI_ACTION_TRACKING_RETRY: ActionSpec(
+        MIDI_ACTION_TRACKING_RETRY, "Tracking: retry child", CATEGORY_TRACKING, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_TRACKING_FREEZE: ActionSpec(
+        MIDI_ACTION_TRACKING_FREEZE, "Tracking: freeze values", CATEGORY_TRACKING, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_TRACKING_PANIC: ActionSpec(
+        MIDI_ACTION_TRACKING_PANIC, "Tracking: panic release", CATEGORY_TRACKING, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_TRACKING_ADD_ROW: ActionSpec(
+        MIDI_ACTION_TRACKING_ADD_ROW,
+        "Tracking: add last signal row",
+        CATEGORY_TRACKING,
+        KIND_MOMENTARY,
+    ),
+    MIDI_ACTION_TRACKING_EVENTS_CLEAR: ActionSpec(
+        MIDI_ACTION_TRACKING_EVENTS_CLEAR,
+        "Tracking: clear event state",
+        CATEGORY_TRACKING,
+        KIND_MOMENTARY,
+    ),
+    MIDI_ACTION_TRACKING_EVENT_TEST: ActionSpec(
+        MIDI_ACTION_TRACKING_EVENT_TEST,
+        "Tracking: fire the test event",
+        CATEGORY_TRACKING,
+        KIND_MOMENTARY,
+    ),
+    MIDI_ACTION_BODY_TOGGLE: ActionSpec(
+        MIDI_ACTION_BODY_TOGGLE, "Toggle body engine", CATEGORY_BODY, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_BODY_RESTART: ActionSpec(
+        MIDI_ACTION_BODY_RESTART, "Restart body engine", CATEGORY_BODY, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_BODY_OVERLAY: ActionSpec(
+        MIDI_ACTION_BODY_OVERLAY, "Toggle body overlay", CATEGORY_BODY, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_BODY_RESET_TRACKS: ActionSpec(
+        MIDI_ACTION_BODY_RESET_TRACKS, "Reset body tracks", CATEGORY_BODY, KIND_MOMENTARY
+    ),
     MIDI_ACTION_IO_MONITOR_TOGGLE: ActionSpec(
-        MIDI_ACTION_IO_MONITOR_TOGGLE, "I/O Monitor window", CATEGORY_MONITOR, KIND_MOMENTARY
+        MIDI_ACTION_IO_MONITOR_TOGGLE,
+        "I/O Monitor window",
+        CATEGORY_MONITOR,
+        KIND_MOMENTARY,
     ),
     MIDI_ACTION_MAPPING_TOGGLE: ActionSpec(
         MIDI_ACTION_MAPPING_TOGGLE, "Arm/disarm Mapping", CATEGORY_MAPPING, KIND_MOMENTARY
+    ),
+    MIDI_ACTION_MAPPING_SO: ActionSpec(
+        MIDI_ACTION_MAPPING_SO, "Secondary OSC output", CATEGORY_MAPPING, KIND_MOMENTARY
     ),
     MIDI_ACTION_MAPPING_ADD: ActionSpec(
         MIDI_ACTION_MAPPING_ADD, "Add Mapping to line", CATEGORY_MAPPING, KIND_MOMENTARY

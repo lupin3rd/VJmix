@@ -129,6 +129,29 @@ HELP: dict[str, HelpEntry] = {
         "Steps (1 = continuous)",
         "1 = continuous. 2 = on/off. N = N discrete levels.",
     ),
+    "mapper.so": HelpEntry(
+        "Secondary Output",
+        "An optional second OSC output that mirrors the value this Mapping sends. "
+        "It never replaces the Destination.",
+    ),
+    "mapper.so.enabled": HelpEntry(
+        "Enabled",
+        "Mute or resume this Secondary Output. The Mapping keeps sending either way.",
+    ),
+    "mapper.so.message": HelpEntry(
+        "Message",
+        "The OSC argument shape sent to the Secondary Output.",
+        (
+            ("float", "one floating-point value"),
+            ("int", "one integer, rounded after the scale"),
+            ("trigger", "no arguments, a bare address"),
+        ),
+    ),
+    "mapper.so.scale": HelpEntry(
+        "Scale from/to",
+        "Rescales the Mapping's output value into the Secondary Output range "
+        "(for example 0..1 to 0..127).",
+    ),
     "tile.blending": HelpEntry(
         "Blending",
         "How the source is composited onto the layer below.",
@@ -423,12 +446,76 @@ HELP: dict[str, HelpEntry] = {
         "Save", "Write the fields below into viOSC's remote configuration."
     ),
     "settings.viosc_restart": HelpEntry("Restart viOSC", "Restart the viOSC daemon."),
-    "leap.enable": HelpEntry("Enable Leap Motion", "Feed hand tracking into the Mapper controls."),
+    "leap.enable": HelpEntry(
+        "Enable Leap Motion",
+        "Feed hand tracking into the Mapper controls. Only one hand engine runs at a time.",
+    ),
     "leap.restart": HelpEntry(
         "Restart engine", "Rebuild the device connection; the app need not restart."
     ),
     "leap.viz": HelpEntry(
         "Device view", "Show the device view and both hands; it is a diagnostic."
+    ),
+    "hands.provider": HelpEntry(
+        "Engine",
+        "Which hand engine feeds the Mapper. Only one engine runs at a time.",
+        (("Leap Motion", "the infrared device"), ("Webcam", "the front camera")),
+    ),
+    "handtrack.enable": HelpEntry(
+        "Enable webcam",
+        "Track one hand from the front camera; it turns the Leap engine off.",
+    ),
+    "handtrack.camera": HelpEntry(
+        "Camera", "The capture device; the list refreshes when the webcam block opens."
+    ),
+    "handtrack.mirror": HelpEntry(
+        "Mirror", "Follow you like a mirror: your right hand moves the value right."
+    ),
+    "handtrack.box": HelpEntry(
+        "Box",
+        "The area of the frame that keeps the gesture engaged (up to the whole frame);"
+        " outside it the mapping holds.",
+    ),
+    "handtrack.maxhz": HelpEntry("Max Hz", "Inference cadence above the camera rate."),
+    "tracking.host": HelpEntry(
+        "Host",
+        "Where the camera and the models run. Child process isolates a native crash:"
+        " the tracking can die, the show cannot.",
+        (
+            ("Child process", "the crash-isolated path"),
+            ("Inline", "in-process, the reference path"),
+        ),
+    ),
+    "tracking.signals": HelpEntry(
+        "Signals...",
+        "Every tracked signal with its live value. Click a row to append a Mapper line"
+        " for the current Vimix source.",
+    ),
+    "tracking.events": HelpEntry(
+        "Events...",
+        "Bind a stage event (zone entered/left, pose held/released, track lost) to a"
+        " cue. The cue fires once, on the edge.",
+    ),
+    "tracking.freeze": HelpEntry(
+        "Freeze",
+        "Hold every tracking-driven value where it is. The engines keep running, so"
+        " unfreezing resumes instantly.",
+    ),
+    "tracking.panic": HelpEntry(
+        "Panic",
+        "Turn EVERY tracking engine off (camera and Leap): the emergency stop. No"
+        " value is sent; re-enable one engine to resume.",
+    ),
+    "tracking.inline": HelpEntry(
+        "Run inline",
+        "Drop the child for this session and keep tracking in-process.",
+    ),
+    "tracking.retry": HelpEntry(
+        "Retry child",
+        "Start the tracker child again after a failure or a decision.",
+    ),
+    "handtrack.preview": HelpEntry(
+        "Preview", "Show the camera frame with the box and the palm cursor; off by default."
     ),
     "cue.kind": HelpEntry(
         "Kind",

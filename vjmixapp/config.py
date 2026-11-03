@@ -5,6 +5,7 @@ config dir (CONFIG_PATH is owned here so the test suite can point it at a temp
 file); missing/corrupt files fall back to defaults. No dpg, no app state.
 """
 
+import contextlib
 import copy
 import json
 import os
@@ -115,18 +116,36 @@ def load_config() -> dict[str, Any]:
         if key in loaded:
             merged[key] = _merge(merged[key], loaded[key])
     merged["theme"]["colors"] = _sanitize_palette(merged["theme"].get("colors"))
+    # e90 (TRACKING_PERSISTENCE_LATEST): the engine switches are project content.
+    # A legacy `enabled` key is stripped here, so the file self-cleans on the next
+    # save instead of carrying a switch that no longer drives anything.
+    for block in ("handtrack", "body", "zones", "leap"):
+        section = merged.get(block)
+        if isinstance(section, dict):
+            section.pop("enabled", None)
     # e11s02: drop unknown top-level keys (the legacy "layout" block) so a stale
     # config file self-cleans on the next save instead of carrying dead state.
     return {key: merged[key] for key in DEFAULT_CONFIG}
 
 
-def save_config(cfg: dict[str, Any]) -> None:
-    """Atomically write the user config; failures are logged, never fatal."""
+def save_config(cfg: dict[str, Any]) -> bool:
+    """Atomically write the user config; failures are logged, never fatal.
+
+    Returns True only when the new file was put in place. EVERY failure class is
+    reported through the Logs window: a control whose UI state already changed
+    while the flag never reached the disk is the one failure the operator cannot
+    see (BUG-2026-10-21T223421), so the tmp file is removed and the reason logged
+    instead of an exception escaping into the GUI callback.
+    """
+    tmp = f"{CONFIG_PATH}.tmp"
     try:
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-        tmp = f"{CONFIG_PATH}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
         os.replace(tmp, CONFIG_PATH)
-    except OSError as e:
-        log_error("Config", f"cannot write {CONFIG_PATH}: {e}")
+    except (OSError, TypeError, ValueError) as e:
+        log_error("Config", f"cannot write {CONFIG_PATH}: {e!r}")
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        return False
+    return True

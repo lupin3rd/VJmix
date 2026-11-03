@@ -43,13 +43,13 @@ DPG_COLOR_SCALE = 255.0  # DPG ToColor divides color inputs by 255 -> its color 
 
 
 # --- BEHAVIORAL CONSTANTS (audit L-6) ---
-# Main-loop render cadence (perf e07 P1): full rate while something animates, throttled
-# while idle (input stays responsive at ~30 fps; SPIKE-perf measured the idle render as
-# the biggest fixed cost).
-FRAME_SLEEP_ANIMATED = 0.016  # ~60 fps while sequencer/spectrum/monitor video animate
+# Main-loop render cadence (perf e07 P1; e85s01): 16 ms ONLY while a video preview
+# plays, 33 ms for everything else (spectrum, sequencer, idle). Input stays responsive
+# at the throttled cadence; the spectrum itself produces 20 frames/s.
+FRAME_SLEEP_ANIMATED = 0.016  # ~60 fps only for a PLAYING video preview
 
 
-FRAME_SLEEP_IDLE = 0.033  # ~30 fps at rest
+FRAME_SLEEP_IDLE = 0.033  # ~30 fps for the spectrum, a playing sequencer and idle
 
 
 # Step-cell layout: a centered square leaves the checkbox/type row on top (audit L-6)
@@ -176,6 +176,9 @@ MEDIA_TILE_W_ESTIMATE = 137  # px per tile + the table's 1 px cell padding each 
 # scrollbar may be there, ALWAYS. Measuring the live content width instead would
 # feed back (a column fits -> no scrollbar -> the width grows -> a column fits...).
 MEDIA_GRID_MARGIN = 26  # px of window chrome excluded from the grid
+# Default width of the "Vimix sources" window (4 tiles x 137 + the margin above).
+# The media learn bar uses it as the pre-first-frame width fallback (BUG-2026-10-21).
+VIMIX_MEDIA_WINDOW_W = 580
 # e83: the compact tile status. The P/C/L badges are drawn ON the thumbnail (the
 # index badge already lives there), the seek is a 4 px bar under it and one 10 px
 # line carries blending/depth/speed/seek. Everything fits the ~25 px the tile has
@@ -352,7 +355,9 @@ MAPPER_DRAG_W = 40  # px width of the from/to drag boxes on the slider 'output:'
 
 # e34s02: px width of the from/to drag boxes in the compact knob/button band —
 # smaller than MAPPER_DRAG_W so 'Out'/'Inp' + two boxes fit beside the 44 px control.
-MAPPER_BAND_DRAG_W = 34
+# e92: 28 (was 34) leaves room for the SO square at the right of the OUT row; the
+# readout digits use the 9 px ProggyTiny (with 2 px frame padding) so they still fit.
+MAPPER_BAND_DRAG_W = 28
 
 # e33s04: fixed slot count of the Mapper in the learn bar (user rule: 4 lines,
 # pre-bindable even when fewer rows exist — a missing line is a logged no-op).
@@ -934,7 +939,33 @@ MIDI_ACTION_SOURCES_DATA_REFRESH = (
 )
 MIDI_ACTION_SET_BLENDING = "set_blending"  # set the SELECTED source's blending (enum index)
 MIDI_ACTION_IO_MONITOR_TOGGLE = "monitor_toggle"  # e39s01: show/hide the I/O Monitor window
+MIDI_ACTION_HANDTRACK_TOGGLE = "handtrack_toggle"  # e87: enable/disable the ACTIVE hand engine
+MIDI_ACTION_HANDTRACK_RESTART = "handtrack_restart"  # e87: rebuild the ACTIVE hand engine
+
+# e88: stage-zones engine (T0). The five performance controls are MIDI-mappable
+# (e33); zone add/delete/rename stay configuration (the e86 precedent).
+MIDI_ACTION_ZONES_TOGGLE = "zones_toggle"  # enable/disable the zones camera engine
+# e90s05: the safety net of the tracking instrument. Panic and freeze are the
+# two controls an operator reaches for when a tracker misbehaves mid-show.
+MIDI_ACTION_TRACKING_FORCE_INLINE = "tracking_force_inline"
+MIDI_ACTION_TRACKING_RETRY = "tracking_retry"
+MIDI_ACTION_TRACKING_FREEZE = "tracking_freeze"
+MIDI_ACTION_TRACKING_PANIC = "tracking_panic"
+MIDI_ACTION_TRACKING_ADD_ROW = "tracking_add_row"
+MIDI_ACTION_TRACKING_EVENTS_CLEAR = "tracking_events_clear"
+MIDI_ACTION_TRACKING_EVENT_TEST = "tracking_event_test"
+MIDI_ACTION_ZONES_RESTART = "zones_restart"  # reopen the camera (counterpart of handtrack_restart)
+MIDI_ACTION_ZONES_OVERLAY = "zones_overlay"  # show/hide the preview overlay
+MIDI_ACTION_ZONES_EDIT = "zones_edit"  # arm/disarm the polygon editor
+MIDI_ACTION_ZONES_RESET_ACTIVITY = "zones_reset_activity"  # relearn background/occupancy
+
+# e89: body-tracking engine (T1). Four performance controls (e33).
+MIDI_ACTION_BODY_TOGGLE = "body_toggle"  # enable/disable the body camera engine
+MIDI_ACTION_BODY_RESTART = "body_restart"  # reopen the camera / rebuild the sessions
+MIDI_ACTION_BODY_OVERLAY = "body_overlay"  # show/hide the skeleton preview
+MIDI_ACTION_BODY_RESET_TRACKS = "body_reset_tracks"  # clear the continuity tracker
 MIDI_ACTION_MAPPING_TOGGLE = "mapping_toggle"  # e40s01: arm/disarm a Mapping (Enabled gate)
+MIDI_ACTION_MAPPING_SO = "mapping_so"  # e92: mute/resume a Mapping's Secondary Output
 MIDI_ACTION_MAPPING_ADD = "mapping_add"  # e40s08: add a State Mapping on a source line
 
 # e51s02: Mapper clipboard + in-line moves (mirror of the sequencer step
@@ -1003,6 +1034,7 @@ IO_MONITOR_KIND_WATCH_REPLY = "watch_reply"
 IO_MONITOR_KIND_STATE = "state_broadcast"
 IO_MONITOR_KIND_THUMBNAIL = "thumbnail"
 IO_MONITOR_KIND_DESTINATION = "destination"
+IO_MONITOR_KIND_OSC_SO = "osc_so"  # e92: the Secondary Output egress
 IO_MONITOR_KIND_FADE = "fade"
 IO_MONITOR_KIND_SEQUENCER = "sequencer"
 IO_MONITOR_KIND_CUE = "cue"
@@ -1109,7 +1141,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "midi": {"enabled": False, "controllers": [], "clock_source": None},
     # e26: Leap Motion engine — persisted settings: enabled flag + the e26s04
     # embedded visualizer toggle (both off by default).
-    "leap": {"enabled": False, "visualizer": False},
+    # e90: no `enabled` — which engines a show uses is PROJECT content
+    # (specs/TRACKING_PERSISTENCE_LATEST.md); the visualizer is a UI preference.
+    "leap": {"visualizer": False},
     "projects": {"recent": [], "restore_last_on_boot": True},
     # e28s04: OSC endpoints are rig settings (not project content) — the viOSC
     # client + listening-server IP:port persist app-level like theme/MIDI/Leap.
@@ -1126,6 +1160,56 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # e76: display preferences that are not project content. Hover help is ON by
     # default; a VJ switches it off while performing.
     "ui": {"hover_help": True},
+    # e87: the webcam hand engine (opt-in, OFF by default). `provider` says which
+    # engine is active (one at a time); the webcam block is the camera setup.
+    # The render/CPU budget only pays while `enabled` is true and the provider is
+    # the webcam (the worker leaves the camera closed otherwise).
+    # e90: where the camera + inference run. `child` is the crash-isolated
+    # path (a supervised `python -m vjmixapp.trackd`); `inline` is the
+    # reference implementation and the fallback.
+    "tracking": {"host": "inline"},
+    "handtrack": {
+        "provider": "leap",
+        "device": "",
+        "width": 640,
+        "height": 480,
+        "max_hz": 12.0,
+        "num_hands": 1,
+        "mirror": True,
+        "box": 0.60,
+        "preview": False,
+    },
+    # e89: the body-tracking camera engine (T1). `enabled` is the owner switch
+    # shared through vjmixapp/camera.py; `roi` is the normalized performance
+    # area the 224 px detector can actually see (a wide stage frame is not).
+    "body": {
+        "device": "",
+        "width": 640,
+        "height": 480,
+        "max_hz": 8.0,
+        "max_bodies": 2,
+        "detect_every": 3,
+        "score": 0.5,
+        "roi": [0.0, 0.0, 1.0, 1.0],
+        "mirror": False,
+        "preview": False,
+    },
+    # e88: the stage-zones camera engine (T0, no ML). `enabled` is the owner
+    # switch shared with handtrack through vjmixapp/camera.py; the rest is the
+    # capture and motion setup. `zones` is the operator-drawn polygon list.
+    "zones": {
+        "device": "",
+        "width": 320,  # the zone mask is 320 wide: no gain from a larger capture
+        "height": 240,
+        "processing_width": 320,
+        "threshold": 18.0,
+        "min_area": 0.004,
+        "bg_tau_s": 2.0,
+        "max_hz": 10.0,
+        "mirror": False,
+        "preview": False,
+        "zones": [],
+    },
 }
 
 
@@ -1148,6 +1232,13 @@ MIDI_LEARN_RED_RGBA: tuple[int, int, int, int] = (*MIDI_LEARN_RED, 255)
 # never be hammered — the 2 s retry loop saturated the 192-client kernel table
 # on the live rig and silently killed controller detection.
 MIDI_OPEN_RETRY_COOLDOWN_SECONDS = 15.0
+
+# e85s04: the MIDI worker cadences. 5 ms (200 Hz) is far below a pad/knob's
+# perceptible latency and far above a MIDI clock's 24 pulses/beat, and it cuts the
+# two loops' measured 3.95% of one core (1 ms/2 ms polls) by ~75%.
+MIDI_CONTROL_POLL_SECONDS = 0.005
+MIDI_CLOCK_POLL_SECONDS = 0.005
+MIDI_CLOCK_IDLE_SLEEP_SECONDS = 0.2
 
 # e53 (rig feedback 2026-09-21): a powered-off controller can leave a stale open
 # input port in the worker, so a power-cycle is never noticed and the LED
@@ -1176,7 +1267,16 @@ PROJECT_FILE_EXTENSION = ".vjmix"
 RECENT_PROJECTS_MAX = 5  # cap for the Last-project submenu / config list (e11s02)
 
 
-STEP_PERSISTED_KEYS: tuple[str, ...] = ("active", "type", "v1", "v2", "frames", "msgs", "color")
+STEP_PERSISTED_KEYS: tuple[str, ...] = (
+    "active",
+    "type",
+    "v1",
+    "v2",
+    "frames",
+    "msgs",
+    "color",
+    "secondary_output",  # e92: the optional mirrored OSC output (SO)
+)
 
 
 # e28s01: the mapping-model keys that survive in a project file (capture whitelist /
@@ -1191,13 +1291,21 @@ MAPPER_PERSISTED_KEYS: tuple[str, ...] = (
     "band",
     "midi",
     "leap",
+    "hand_provider",  # e87: which engine bound the hand signal (leap | webcam)
+    "source_kind",  # e88: external source family (hand | zone | body)
+    "zone_id",  # e88: the zone number for source_kind=zone
+    "zone_signal",  # e88: one of zonetrack.ZONE_FIELDS (energy, x, enter, ...)
+    "body_id",  # e89: the body slot for source_kind=body
+    "body_signal",  # e89: one of bodytrack.BODY_FIELDS (x, height, pose_clap, ...)
     "output_from",
     "output_to",
     "input_from",
     "input_to",
     "button_mode",  # e77: how the GUI button behaves on a press (toggle / momentary)
     "enabled",
+    "compact",  # e86: the card renders compact (performance) instead of full
     "cue",  # e35s01: the per-mapping cue macro (rows + gap_ms), inert for non-cue-list controls
+    "secondary_output",  # e92: the optional mirrored OSC output (SO)
     # e40s01: a Mapping is a Mapping (Origin -> Rescale -> Destination). Legacy rows
     # carry none of these keys and hydrate to Control -> Vimix, so old project
     # files load unchanged; the new keys are additive.
@@ -1261,6 +1369,13 @@ MAPPING_OSC_DEFAULT_PORT = 9000
 # `/viosc/*` surface, the state keys) stays frozen.
 MAPPING_OSC_DEFAULT_ADDRESS = "/vjmix/mapping"
 MAPPING_OSC_MAX_PORT = 65535
+# e92: the SO (Secondary Output) — a second, MIRRORED OSC egress. It never replaces
+# the Destination; the persisted key is explicit because it is project content.
+SECONDARY_OUTPUT_KEY = "secondary_output"
+SECONDARY_OUTPUT_ARGS: tuple[str, ...] = ("float", "int", "trigger")
+MAPPING_SO_DEFAULT_HOST = "127.0.0.1"
+MAPPING_SO_DEFAULT_PORT = 9000
+MAPPING_SO_DEFAULT_ADDRESS = "/vjmix/so"
 MAPPING_DIRECTIONS: dict[str, tuple[str, ...]] = {
     ORIGIN_CONTROL: (DEST_VIMIX,),  # v1: a Control Origin keeps writing Vimix
     ORIGIN_STATE: (DEST_MIDI, DEST_OSC),
@@ -1365,6 +1480,13 @@ MIDI_CLOCK_PULSES_PER_BEAT = 24  # MIDI standard: 24 clock pulses (0xF8) per qua
 BPM_DETECTION_STALE_SECONDS = 2.0  # 2x the 1 s analysis cadence
 
 
+# --- AUDIO CAPTURE (e85s05) ---
+# The ring is sized for the HIGHEST rate we open, so a 48 kHz device keeps a full
+# 6 s window; `state.samplerate` (the device's default) decides how much of it the
+# snapshot returns and how the FFT maps bins to Hz.
+AUDIO_BUFFER_SECONDS = 6
+MAX_AUDIO_SAMPLERATE = 48000
+AUDIO_STATUS_LOG_INTERVAL_S = 5.0  # xruns: at most one warning per 5 s, never a print per block
 SPECTRUM_FFT_SIZE = 2048  # samples per FFT frame
 
 
@@ -1378,7 +1500,8 @@ NUM_BANDS = 5  # independent selectable analyzer bands (band1..band5)
 BAND_SOURCES: tuple[int, ...] = tuple(range(2, NUM_BANDS + 1))
 
 
-SPECTRUM_FPS = 30.0  # spectrum redraw rate while analyzing
+SPECTRUM_FPS = 20.0  # UI/band pass rate while analyzing (e85s02: the FFT is cheap,
+# the 30 Hz UI/band passes and worker wake-ups were not)
 
 
 SPECTRUM_DB_FLOOR = 60.0  # dB below full scale mapped to bar level 0
