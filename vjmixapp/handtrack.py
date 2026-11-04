@@ -132,7 +132,7 @@ POSE_NAMES: tuple[str, ...] = ("open", "fist", "point", "victory", "thumbs")
 
 # Preview geometry (s04): the box border and the cursor are drawn in numpy so
 # the geometry is testable without dpg and the worker never touches the toolkit.
-PREVIEW_HZ = 10.0
+PREVIEW_HZ = 20.0
 PREVIEW_COLOR_ENGAGED: tuple[int, int, int] = (80, 255, 80)
 PREVIEW_COLOR_IDLE: tuple[int, int, int] = (200, 200, 200)
 PREVIEW_BORDER = 1

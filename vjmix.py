@@ -656,7 +656,7 @@ Image.MAX_IMAGE_PIXELS = 25_000_000  # PIL's hard ceiling (~25 MP)
 # 0.4.0 — Leap Motion mapper source, per-mapping reset, project save + OSC config persist,
 # Mapper tile/row workflows (thumb assign, Add-to-Mapper submenu, line numbers).
 # 0.3.0 — Mapper family (rows/rescale/enable/cycle), compact Vimix-sources grid, windows, XDG.
-APP_VERSION: str = "1.2.0"
+APP_VERSION: str = "1.2.1"
 
 # The VJmix project repository, shown as a link in the Info window (e08s01; retargeted from the
 # author's profile to the project by e08s03, user request).
@@ -1455,10 +1455,18 @@ def _apply_project_tracking(raw: Any) -> None:
     hand = bool(section.get("hand_enabled", False))
     body = bool(section.get("body_enabled", False))
     zones = bool(section.get("zones_enabled", False))
+    leap_on = bool(section.get("leap_enabled", False))
     if sum((hand, body, zones)) > 1:
         append_log("Tracking", "the project names more than one camera engine: keeping the first")
+    if hand and leap_on:
+        # e93s05: one hand engine feeds the Mapper. The camera engine wins, as it
+        # does for hand/body/zones; the Leap is healed off instead of running mute.
+        append_log("Tracking", "the project enables Leap and the webcam: keeping the webcam")
+        leap_on = False
     if hand and state.hand_provider != handtrack.PROVIDER_WEBCAM:
         handtrack.set_hand_provider(handtrack.PROVIDER_WEBCAM)
+    elif leap_on and not hand and state.hand_provider != handtrack.PROVIDER_LEAP:
+        handtrack.set_hand_provider(handtrack.PROVIDER_LEAP)  # e93s05
     engine = camera.CAMERA_NONE
     if hand:
         engine = camera.CAMERA_HAND
@@ -1467,8 +1475,8 @@ def _apply_project_tracking(raw: Any) -> None:
     elif zones:
         engine = camera.CAMERA_ZONES
     camera.set_camera_engine(engine)
-    if bool(section.get("leap_enabled", False)) != state.leap_enabled:
-        set_leap_enabled(bool(section.get("leap_enabled", False)))
+    if leap_on != state.leap_enabled:
+        set_leap_enabled(leap_on)
     _sync_camera_owner_widgets()
 
 
@@ -1851,6 +1859,8 @@ def apply_boot_config() -> None:
     leap_init_from_config(cfg)  # e26: Leap Motion engine mirror (enabled flag)
     handtrack.handtrack_init_from_config(cfg)  # e87: provider + webcam settings
     trackchild.init_from_config(cfg)  # e90: inline | child (the crash-isolated host)
+    if dpg.does_item_exist("tracking_fps_first_cb"):
+        dpg.set_value("tracking_fps_first_cb", state.tracking_prefer_frame_rate)
     zonetrack.init_from_config(cfg)  # e88: zones camera engine (T0, no ML)
     bodytrack.init_from_config(cfg)  # e89: body camera engine (T1)
     if dpg.does_item_exist("handtrack_enable_cb"):
@@ -8124,6 +8134,40 @@ HELP_TARGETS: dict[str, str] = {
     "leap_enable_cb": "leap.enable",
     "leap_restart_btn": "leap.restart",
     "leap_viz_cb": "leap.viz",
+    # Tracking window (e93): one card for every control of the four engine tabs.
+    "tracking_host_cb": "tracking.host",
+    "tracking_fps_first_cb": "tracking.frame_rate",
+    "handtrack_enable_cb": "handtrack.enable",
+    "handtrack_camera_cb": "handtrack.camera",
+    "handtrack_mirror_cb": "handtrack.mirror",
+    "handtrack_box_slider": "handtrack.box",
+    "handtrack_maxhz_slider": "handtrack.maxhz",
+    "handtrack_preview_cb": "handtrack.preview",
+    "body_enable": "body.enable",
+    "body_camera": "body.camera",
+    "body_max_hz": "body.maxhz",
+    "body_max_bodies": "body.bodies",
+    "body_detect_every": "body.detect_every",
+    "body_preview_check": "body.preview",
+    "body_restart": "body.restart",
+    "body_reset": "body.reset",
+    "zones_enable": "zones.enable",
+    "zones_camera": "zones.camera",
+    "zones_processing": "zones.processing",
+    "zones_threshold": "zones.threshold",
+    "zones_min_area": "zones.min_area",
+    "zones_max_hz": "zones.maxhz",
+    "zones_preview_check": "zones.preview",
+    "zones_edit_check": "zones.edit",
+    "zones_new": "zones.new",
+    "zones_restart": "zones.restart",
+    "zones_reset": "zones.reset",
+    "tracking_signals_btn": "tracking.signals",
+    "tracking_events_btn": "tracking.events",
+    "tracking_freeze_btn": "tracking.freeze",
+    "tracking_panic_btn": "tracking.panic",
+    "tracking_inline_btn": "tracking.inline",
+    "tracking_retry_btn": "tracking.retry",
     # Text
     TEXT_SOURCE_COMBO_TAG: "text.source",
     "text_size_keyword": "text.size_keyword",
@@ -9598,6 +9642,11 @@ def on_leap_enable(sender: Any = None, app_data: Any = None, user_data: Any = No
     """
     enabled = bool(app_data)
     set_leap_enabled(enabled)
+    if enabled:
+        # e93s05: the tab IS the choice. The Leap takes the Mapper hand source and
+        # releases the webcam (one hand engine at a time); the tabs show the truth.
+        handtrack.set_hand_provider(handtrack.PROVIDER_LEAP)
+        _sync_camera_owner_widgets()
     if dpg.does_item_exist("leap_viz_cb"):
         dpg.configure_item("leap_viz_cb", enabled=enabled)
     if dpg.does_item_exist("leap_restart_btn"):
@@ -9646,20 +9695,17 @@ def _apply_leap_viz_layout(shown: bool) -> None:
 
 
 def _apply_hand_provider_layout(provider: str) -> None:
-    """Select the provider and refresh its camera list (e90s04: tabs, no hiding).
+    """Refresh the webcam device list (e90s04: tabs, no hiding; e93s05: no combo).
 
-    The Leap and webcam blocks used to show/hide inside ONE window; they now live
-    in their own tabs, so this only keeps the combo and the device list honest.
+    The Leap and webcam blocks live in their own tabs and the engine choice is the
+    Enable of the tab, so this only keeps the camera list honest.
     """
-    if dpg.does_item_exist("handtrack_provider_cb"):
-        dpg.set_value("handtrack_provider_cb", handtrack.PROVIDER_LABELS.get(provider, provider))
     if provider != handtrack.PROVIDER_LEAP and dpg.does_item_exist("handtrack_camera_cb"):
         devices = handio.list_devices()
-        dpg.configure_item("handtrack_camera_cb", items=devices)
-        dpg.set_value(
-            "handtrack_camera_cb",
-            state.handtrack_device or (devices[0] if devices else ""),
-        )
+        labels = handio.device_labels(devices)
+        dpg.configure_item("handtrack_camera_cb", items=labels)
+        chosen = state.handtrack_device or handio.capture_device(devices)
+        dpg.set_value("handtrack_camera_cb", handio.device_label(chosen) if chosen else "")
 
 
 def _apply_handtrack_preview_layout(shown: bool) -> None:
@@ -9669,21 +9715,31 @@ def _apply_handtrack_preview_layout(shown: bool) -> None:
 
 
 def _sync_camera_owner_widgets() -> None:
-    """After ANY camera-owner change, all three engine panels show the truth.
+    """After ANY camera-owner change, all engine panels show the truth.
 
     Operator rig 2026-10-29: enabling Bodies left "Enable webcam" ticked, because
     each Enable callback only synced its own panel while the owner policy turns
     the other two off. The camera is one device; the UI must say so everywhere.
+    e93s05: the Leap panel is the other hand engine, so it follows too.
     """
     _sync_handtrack_widgets()
     _sync_zones_widgets()
     _sync_body_widgets()
+    _sync_leap_widgets()
+
+
+def _sync_leap_widgets() -> None:
+    """Mirror the Leap engine state into its tab (project load included)."""
+    if dpg.does_item_exist("leap_enable_cb"):
+        dpg.set_value("leap_enable_cb", state.leap_enabled)
+    if dpg.does_item_exist("leap_viz_cb"):
+        dpg.configure_item("leap_viz_cb", enabled=state.leap_enabled)
+    if dpg.does_item_exist("leap_restart_btn"):
+        dpg.configure_item("leap_restart_btn", enabled=state.leap_enabled)
 
 
 def _sync_handtrack_widgets() -> None:
     """Push the live hand-engine state onto the window widgets (if built)."""
-    if dpg.does_item_exist("handtrack_provider_cb"):
-        dpg.set_value("handtrack_provider_cb", handtrack.PROVIDER_LABELS[state.hand_provider])
     if dpg.does_item_exist("handtrack_enable_cb"):
         dpg.set_value("handtrack_enable_cb", state.handtrack_enabled)
     if dpg.does_item_exist("handtrack_mirror_cb"):
@@ -9728,27 +9784,6 @@ def _hand_window_active() -> bool:
     return dpg.does_item_exist(TRACKING_WINDOW_TAG) and dpg.is_item_shown(TRACKING_WINDOW_TAG)
 
 
-def on_hand_provider_change(
-    sender: Any = None, app_data: Any = None, user_data: Any = None
-) -> None:
-    """Engine combo: switch the active provider (the other one is disabled)."""
-    if not _hand_window_active():
-        return  # a hidden window cannot have been edited
-    label = str(_hand_widget_value("handtrack_provider_cb", app_data))
-    provider = next(
-        (p for p, text in handtrack.PROVIDER_LABELS.items() if text == label),
-        handtrack.PROVIDER_LEAP,
-    )
-    if provider == state.hand_provider:
-        # The dispatch may carry the provider we already have; the window still
-        # has to show THAT provider's block (otherwise the operator has to
-        # switch twice to see the webcam options).
-        _apply_hand_provider_layout(provider)
-        return
-    handtrack.set_hand_provider(provider)
-    _sync_handtrack_widgets()
-
-
 def on_handtrack_enable(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
     """Webcam Enable: select the provider, then persist + apply the toggle."""
     if not _hand_window_active():
@@ -9764,10 +9799,17 @@ def on_handtrack_enable(sender: Any = None, app_data: Any = None, user_data: Any
 
 
 def on_handtrack_camera(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
-    """Camera combo: persist the device and rebuild the capture."""
+    """Camera combo: persist the device and rebuild the capture.
+
+    e93s02: the combo lists ``/dev/videoN - <name>``; the state, the project and
+    the child keep the raw node, so the label is translated here.
+    """
     if not _hand_window_active():
         return  # a hidden window cannot have been edited
-    device = str(_hand_widget_value("handtrack_camera_cb", app_data))
+    label = str(_hand_widget_value("handtrack_camera_cb", app_data))
+    device = handio.device_from_label(label, handio.list_devices())
+    if not device:
+        return  # the node vanished between the build and the click
     if device == state.handtrack_device:
         return
     handtrack.set_handtrack_option("device", device)
@@ -9936,11 +9978,14 @@ def _refresh_tracking_bindings() -> None:
             f"{label} {binding['detail'] or '(any)'} -> cue {binding['mapping_id']}",
             parent="tracking_bindings_group",
         )
+        remove_tag = f"tracking_binding_remove_{index}"
         dpg.add_button(
             label="Remove",
+            tag=remove_tag,
             parent="tracking_bindings_group",
             callback=lambda s=None, a=None, u=None, i=index: _remove_tracking_binding(i),
         )
+        help_tooltip(remove_tag, "tracking.binding_remove")
 
 
 def on_tracking_event_test(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
@@ -9982,10 +10027,22 @@ def show_tracking_events_window(
                 width=120,
             )
             dpg.add_input_int(tag="tracking_event_mapping", width=110, default_value=1, min_value=1)
+            help_tooltip("tracking_event_kind", "tracking.event_kind")
+            help_tooltip("tracking_event_detail", "tracking.event_detail")
+            help_tooltip("tracking_event_mapping", "tracking.event_mapping")
         with dpg.group(horizontal=True):
-            dpg.add_button(label="Add binding", callback=lambda: _add_tracking_binding())
-            dpg.add_button(label="Test", callback=on_tracking_event_test)
-            dpg.add_button(label="Clear events", callback=on_tracking_events_clear)
+            dpg.add_button(
+                label="Add binding",
+                tag="tracking_event_add",
+                callback=lambda: _add_tracking_binding(),
+            )
+            dpg.add_button(label="Test", tag="tracking_event_test", callback=on_tracking_event_test)
+            dpg.add_button(
+                label="Clear events", tag="tracking_event_clear", callback=on_tracking_events_clear
+            )
+            help_tooltip("tracking_event_add", "tracking.event_add")
+            help_tooltip("tracking_event_test", "tracking.event_test")
+            help_tooltip("tracking_event_clear", "tracking.event_clear")
         dpg.add_separator()
         with dpg.child_window(height=230, tag="tracking_bindings_group"):
             _refresh_tracking_bindings()
@@ -10083,6 +10140,7 @@ def show_tracking_source_picker(
                         callback=on_tracking_signal_click,
                         user_data=(row.engine, row.group_id, row.key),
                     )
+                    help_tooltip(tag, "tracking.signals_row")
                 dpg.add_separator()
     show_centered_window(TRACKING_PICKER_WINDOW)
 
@@ -10150,6 +10208,19 @@ def tracking_panic() -> None:
     _sync_zones_widgets()
     _sync_body_widgets()
     append_log("Tracking", "PANIC: every engine off; re-enable one to resume")
+
+
+def on_tracking_prefer_frame_rate(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    """Machine preference: keep the sensor frame rate (e94s01)."""
+    enabled = bool(app_data)
+    if enabled == state.tracking_prefer_frame_rate:
+        return  # the boot sync pushed the value we already have
+    trackchild.set_prefer_frame_rate(enabled)
+    for device in (state.handtrack_device, state.body_device, state.zones_device):
+        if device:
+            handio.set_frame_rate_priority(device, enabled)
 
 
 def on_tracking_host_change(
@@ -10470,24 +10541,12 @@ def tick_handtrack_preview() -> None:
         return
     if seq == state.tracking_preview_uploaded_seq:
         return
-    height, width = frame.shape[:2]
-    rgba = np.dstack([frame.astype(np.float32) / 255.0, np.ones((height, width), dtype=np.float32)])
-    if "handtrack_preview_tex" not in _preview_textures:
-        dpg.add_raw_texture(
-            width=width,
-            height=height,
-            default_value=rgba.reshape(-1),
-            tag="handtrack_preview_tex",
-            parent="texture_registry",
-        )
-        dpg.add_image(
-            "handtrack_preview_tex",
-            tag="handtrack_preview_img",
-            parent="handtrack_preview_panel_slot",
-        )
-        _preview_textures.add("handtrack_preview_tex")
-    else:
-        dpg.set_value("handtrack_preview_tex", rgba.reshape(-1))
+    _ensure_preview_texture(
+        "handtrack_preview_tex",
+        "handtrack_preview_img",
+        "handtrack_preview_panel_slot",
+        frame,
+    )
     if dpg.does_item_exist("handtrack_preview_img"):
         dpg.configure_item("handtrack_preview_img", show=True)
     if dpg.does_item_exist("handtrack_preview_wait_text"):
@@ -10568,7 +10627,9 @@ def on_zones_enable(sender: Any = None, app_data: Any = None, user_data: Any = N
 
 def on_zones_camera(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
     """Camera combo: persist a CHANGE and ask the worker to reopen the device."""
-    device = str(app_data)
+    device = handio.device_from_label(str(app_data), handio.list_devices())
+    if not device:
+        return  # the node vanished between the build and the click
     if device == state.zones_device:
         return
     zonetrack.set_option("device", device)
@@ -10769,8 +10830,10 @@ def _sync_zones_camera_combo() -> None:
     if not dpg.does_item_exist("zones_camera"):
         return
     devices = handio.list_devices()
-    dpg.configure_item("zones_camera", items=devices)
-    dpg.set_value("zones_camera", state.zones_device or (devices[0] if devices else ""))
+    labels = handio.device_labels(devices)
+    dpg.configure_item("zones_camera", items=labels)
+    chosen = state.zones_device or handio.capture_device(devices)
+    dpg.set_value("zones_camera", handio.device_label(chosen) if chosen else "")
 
 
 def _refresh_zones_rows() -> None:
@@ -10836,11 +10899,14 @@ def _refresh_zones_rows() -> None:
     # Tooltips are attached AFTER every row exists, so a mis-parented tooltip
     # can never hide the row or the next rows. The swatch is a real BUTTON with a
     # per-zone theme: an item-clicked registry on a drawlist did not receive the
-    # click reliably (the button callback does).
+    # click reliably (the button callback does). e93s01: every row control carries
+    # its own card, the same path the other Tracking controls use.
     for zone in state.zones_config:
         zone_id = int(zone["id"])
-        with dpg.tooltip(parent=f"zones_color_{zone_id}", delay=HELP_HOVER_DELAY_S):
-            dpg.add_text("Zone colour - click to change")
+        help_tooltip(f"zones_name_{zone_id}", "zones.zone_name")
+        help_tooltip(f"zones_color_{zone_id}", "zones.zone_color")
+        help_tooltip(f"zones_energy_{zone_id}", "zones.zone_energy")
+        help_tooltip(f"zones_delete_{zone_id}", "zones.zone_delete")
 
 
 def _sync_zones_widgets() -> None:
@@ -10925,26 +10991,20 @@ def tick_zones_preview() -> None:
         return
     if state.zones_edit and state.zones_draft:
         frame = zonetrack.draw_draft(frame, state.zones_draft)
-    height, width = frame.shape[:2]
-    rgba = np.dstack([frame.astype(np.float32) / 255.0, np.ones((height, width), dtype=np.float32)])
-    if "zones_preview_tex" not in _preview_textures:
-        dpg.add_raw_texture(
-            width=width,
-            height=height,
-            default_value=rgba.reshape(-1),
-            tag="zones_preview_tex",
-            parent="texture_registry",
-        )
-        dpg.add_image(
-            "zones_preview_tex", tag="zones_preview_img", parent="zones_preview_panel_slot"
-        )
+    created = _ensure_preview_texture(
+        "zones_preview_tex",
+        "zones_preview_img",
+        "zones_preview_panel_slot",
+        frame,
+    )
+    if created:
+        # a recreated image must receive the click handlers again
+        if dpg.does_item_exist("zones_preview_reg"):
+            dpg.delete_item("zones_preview_reg")
         with dpg.item_handler_registry(tag="zones_preview_reg"):
             dpg.add_item_clicked_handler(0, callback=on_zones_preview_left_click)
             dpg.add_item_clicked_handler(1, callback=on_zones_preview_right_click)
         dpg.bind_item_handler_registry("zones_preview_img", "zones_preview_reg")
-        _preview_textures.add("zones_preview_tex")
-    else:
-        dpg.set_value("zones_preview_tex", rgba.reshape(-1))
     if dpg.does_item_exist("zones_preview_img"):
         dpg.configure_item("zones_preview_img", show=True)
     if dpg.does_item_exist("zones_preview_wait_text"):
@@ -10965,88 +11025,130 @@ TRACKING_PREVIEW_PAD: int = max(0, (TRACKING_TAB_INNER_W - 320) // 2)
 HANDTRACK_PREVIEW_PAD = TRACKING_PREVIEW_PAD
 ZONES_PREVIEW_PAD = TRACKING_PREVIEW_PAD
 BODY_PREVIEW_PAD = TRACKING_PREVIEW_PAD
+# e93s02: '/dev/videoN - <driver name>' must be readable without opening the
+# list twice. 330 px holds the longest measured name at the default font.
+CAMERA_COMBO_WIDTH: int = 330
 
 
 def _build_zones_tab() -> None:
     """Build the hidden Stage zones window (called once, at UI construction)."""
     with dpg.tab(label="Zones", tag="tracking_tab_zones"):
         with dpg.group(horizontal=True):
-            dpg.add_checkbox(
-                label="Enable zones",
-                tag="zones_enable",
-                default_value=state.zones_enabled,
-                callback=on_zones_enable,
+            help_tooltip(
+                dpg.add_checkbox(
+                    label="Enable zones",
+                    tag="zones_enable",
+                    default_value=state.zones_enabled,
+                    callback=on_zones_enable,
+                ),
+                "zones.enable",
             )
             dpg.add_group(horizontal=True, tag=ZONES_TOGGLE_LEARN_SLOT)
         with dpg.group(horizontal=True):
-            themed_text("Camera", slot="text_dim")
+            help_label("Camera", "zones.camera", tag="tracking_lbl_zones_camera")
             _zones_devices = handio.list_devices()
-            dpg.add_combo(
-                items=_zones_devices,
-                default_value=state.zones_device or (_zones_devices[0] if _zones_devices else ""),
-                width=190,
-                tag="zones_camera",
-                callback=on_zones_camera,
+            help_tooltip(
+                dpg.add_combo(
+                    items=handio.device_labels(_zones_devices),
+                    default_value=handio.device_label(state.zones_device)
+                    if state.zones_device
+                    else (
+                        handio.device_label(handio.capture_device(_zones_devices))
+                        if _zones_devices
+                        else ""
+                    ),
+                    width=CAMERA_COMBO_WIDTH,
+                    tag="zones_camera",
+                    callback=on_zones_camera,
+                ),
+                "zones.camera",
             )
         with dpg.group(horizontal=True):
-            dpg.add_drag_int(
-                label="Processing",
-                tag="zones_processing",
-                width=120,
-                min_value=zonetrack.PROCESSING_WIDTH_MIN,
-                max_value=zonetrack.PROCESSING_WIDTH_MAX,
-                default_value=state.zones_processing_width,
-                callback=on_zones_processing,
+            help_tooltip(
+                dpg.add_drag_int(
+                    label="Processing",
+                    tag="zones_processing",
+                    width=120,
+                    min_value=zonetrack.PROCESSING_WIDTH_MIN,
+                    max_value=zonetrack.PROCESSING_WIDTH_MAX,
+                    default_value=state.zones_processing_width,
+                    callback=on_zones_processing,
+                ),
+                "zones.processing",
             )
-            dpg.add_slider_float(
-                label="Threshold",
-                tag="zones_threshold",
-                width=120,
-                min_value=zonetrack.THRESHOLD_MIN,
-                max_value=zonetrack.THRESHOLD_MAX,
-                default_value=state.zones_threshold,
-                callback=on_zones_threshold,
-            )
-        with dpg.group(horizontal=True):
-            dpg.add_slider_float(
-                label="Min area",
-                tag="zones_min_area",
-                width=120,
-                min_value=zonetrack.MIN_AREA_MIN,
-                max_value=zonetrack.MIN_AREA_MAX,
-                default_value=state.zones_min_area,
-                callback=on_zones_min_area,
-            )
-            dpg.add_slider_float(
-                label="Max Hz",
-                tag="zones_max_hz",
-                width=120,
-                min_value=zonetrack.MAX_HZ_MIN,
-                max_value=zonetrack.MAX_HZ_MAX,
-                default_value=state.zones_max_hz,
-                callback=on_zones_max_hz,
+            help_tooltip(
+                dpg.add_slider_float(
+                    label="Threshold",
+                    tag="zones_threshold",
+                    width=120,
+                    min_value=zonetrack.THRESHOLD_MIN,
+                    max_value=zonetrack.THRESHOLD_MAX,
+                    default_value=state.zones_threshold,
+                    callback=on_zones_threshold,
+                ),
+                "zones.threshold",
             )
         with dpg.group(horizontal=True):
-            dpg.add_checkbox(
-                label="Preview",
-                tag="zones_preview_check",
-                default_value=state.zones_preview,
-                callback=on_zones_preview,
+            help_tooltip(
+                dpg.add_slider_float(
+                    label="Min area",
+                    tag="zones_min_area",
+                    width=120,
+                    min_value=zonetrack.MIN_AREA_MIN,
+                    max_value=zonetrack.MIN_AREA_MAX,
+                    default_value=state.zones_min_area,
+                    callback=on_zones_min_area,
+                ),
+                "zones.min_area",
+            )
+            help_tooltip(
+                dpg.add_slider_float(
+                    label="Max Hz",
+                    tag="zones_max_hz",
+                    width=120,
+                    min_value=zonetrack.MAX_HZ_MIN,
+                    max_value=zonetrack.MAX_HZ_MAX,
+                    default_value=state.zones_max_hz,
+                    callback=on_zones_max_hz,
+                ),
+                "zones.maxhz",
+            )
+        with dpg.group(horizontal=True):
+            help_tooltip(
+                dpg.add_checkbox(
+                    label="Preview",
+                    tag="zones_preview_check",
+                    default_value=state.zones_preview,
+                    callback=on_zones_preview,
+                ),
+                "zones.preview",
             )
             dpg.add_group(horizontal=True, tag=ZONES_OVERLAY_LEARN_SLOT)
-            dpg.add_checkbox(
-                label="Edit zones",
-                tag="zones_edit_check",
-                default_value=state.zones_edit,
-                callback=on_zones_edit,
+            help_tooltip(
+                dpg.add_checkbox(
+                    label="Edit zones",
+                    tag="zones_edit_check",
+                    default_value=state.zones_edit,
+                    callback=on_zones_edit,
+                ),
+                "zones.edit",
             )
             dpg.add_group(horizontal=True, tag=ZONES_EDIT_LEARN_SLOT)
         with dpg.group(horizontal=True):
-            dpg.add_button(label="New zone", tag="zones_new", callback=on_zones_new)
-            dpg.add_button(label="Restart", tag="zones_restart", callback=on_zones_restart)
+            help_tooltip(
+                dpg.add_button(label="New zone", tag="zones_new", callback=on_zones_new),
+                "zones.new",
+            )
+            help_tooltip(
+                dpg.add_button(label="Restart", tag="zones_restart", callback=on_zones_restart),
+                "zones.restart",
+            )
             dpg.add_group(horizontal=True, tag=ZONES_RESTART_LEARN_SLOT)
-            dpg.add_button(
-                label="Reset activity", tag="zones_reset", callback=on_zones_reset_activity
+            help_tooltip(
+                dpg.add_button(
+                    label="Reset activity", tag="zones_reset", callback=on_zones_reset_activity
+                ),
+                "zones.reset",
             )
             dpg.add_group(horizontal=True, tag=ZONES_RESET_LEARN_SLOT)
         dpg.add_separator()
@@ -11090,8 +11192,10 @@ def _sync_body_camera_combo() -> None:
     if not dpg.does_item_exist("body_camera"):
         return
     devices = handio.list_devices()
-    dpg.configure_item("body_camera", items=devices)
-    dpg.set_value("body_camera", state.body_device or (devices[0] if devices else ""))
+    labels = handio.device_labels(devices)
+    dpg.configure_item("body_camera", items=labels)
+    chosen = state.body_device or handio.capture_device(devices)
+    dpg.set_value("body_camera", handio.device_label(chosen) if chosen else "")
 
 
 def on_body_enable(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
@@ -11107,7 +11211,9 @@ def on_body_enable(sender: Any = None, app_data: Any = None, user_data: Any = No
 
 
 def on_body_camera(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
-    device = str(app_data)
+    device = handio.device_from_label(str(app_data), handio.list_devices())
+    if not device:
+        return  # the node vanished between the build and the click
     if device == state.body_device:
         return
     bodytrack.set_option("device", device)
@@ -11225,20 +11331,9 @@ def tick_body_preview() -> None:
         return
     if seq == state.tracking_preview_uploaded_seq:
         return
-    height, width = frame.shape[:2]
-    rgba = np.dstack([frame.astype(np.float32) / 255.0, np.ones((height, width), dtype=np.float32)])
-    if "body_preview_tex" not in _preview_textures:
-        dpg.add_raw_texture(
-            width=width,
-            height=height,
-            default_value=rgba.reshape(-1),
-            tag="body_preview_tex",
-            parent="texture_registry",
-        )
-        dpg.add_image("body_preview_tex", tag="body_preview_img", parent="body_preview_panel_slot")
-        _preview_textures.add("body_preview_tex")
-    else:
-        dpg.set_value("body_preview_tex", rgba.reshape(-1))
+    _ensure_preview_texture(
+        "body_preview_tex", "body_preview_img", "body_preview_panel_slot", frame
+    )
     if dpg.does_item_exist("body_preview_img"):
         dpg.configure_item("body_preview_img", show=True)
     if dpg.does_item_exist("body_preview_wait_text"):
@@ -11251,61 +11346,89 @@ def _build_body_tab() -> None:
     devices = handio.list_devices()
     with dpg.tab(label="Bodies", tag="tracking_tab_bodies"):
         with dpg.group(horizontal=True):
-            dpg.add_checkbox(
-                label="Enable body",
-                tag="body_enable",
-                default_value=state.body_enabled,
-                callback=on_body_enable,
+            help_tooltip(
+                dpg.add_checkbox(
+                    label="Enable body",
+                    tag="body_enable",
+                    default_value=state.body_enabled,
+                    callback=on_body_enable,
+                ),
+                "body.enable",
             )
             dpg.add_group(horizontal=True, tag=BODY_TOGGLE_LEARN_SLOT)
         with dpg.group(horizontal=True):
-            themed_text("Camera", slot="text_dim")
-            dpg.add_combo(
-                items=devices,
-                default_value=state.body_device or (devices[0] if devices else ""),
-                width=190,
-                tag="body_camera",
-                callback=on_body_camera,
+            help_label("Camera", "body.camera", tag="tracking_lbl_body_camera")
+            help_tooltip(
+                dpg.add_combo(
+                    items=handio.device_labels(devices),
+                    default_value=handio.device_label(state.body_device)
+                    if state.body_device
+                    else (handio.device_label(handio.capture_device(devices)) if devices else ""),
+                    width=CAMERA_COMBO_WIDTH,
+                    tag="body_camera",
+                    callback=on_body_camera,
+                ),
+                "body.camera",
             )
         with dpg.group(horizontal=True):
-            dpg.add_slider_float(
-                label="Max Hz",
-                tag="body_max_hz",
-                width=110,
-                min_value=bodytrack.MAX_HZ_MIN,
-                max_value=bodytrack.MAX_HZ_MAX,
-                default_value=state.body_max_hz,
-                callback=on_body_max_hz,
+            help_tooltip(
+                dpg.add_slider_float(
+                    label="Max Hz",
+                    tag="body_max_hz",
+                    width=110,
+                    min_value=bodytrack.MAX_HZ_MIN,
+                    max_value=bodytrack.MAX_HZ_MAX,
+                    default_value=state.body_max_hz,
+                    callback=on_body_max_hz,
+                ),
+                "body.maxhz",
             )
-            dpg.add_drag_int(
-                label="Bodies",
-                tag="body_max_bodies",
-                width=110,
-                min_value=1,
-                max_value=bodytrack.BODY_MAX,
-                default_value=state.body_max_bodies,
-                callback=on_body_max_bodies,
+            help_tooltip(
+                dpg.add_drag_int(
+                    label="Bodies",
+                    tag="body_max_bodies",
+                    width=110,
+                    min_value=1,
+                    max_value=bodytrack.BODY_MAX,
+                    default_value=state.body_max_bodies,
+                    callback=on_body_max_bodies,
+                ),
+                "body.bodies",
             )
-            dpg.add_drag_int(
-                label="Detect every",
-                tag="body_detect_every",
-                width=110,
-                min_value=1,
-                max_value=6,
-                default_value=state.body_detect_every,
-                callback=on_body_detect_every,
+            help_tooltip(
+                dpg.add_drag_int(
+                    label="Detect every",
+                    tag="body_detect_every",
+                    width=110,
+                    min_value=bodytrack.DETECT_EVERY_MIN,
+                    max_value=bodytrack.DETECT_EVERY_MAX,
+                    default_value=state.body_detect_every,
+                    callback=on_body_detect_every,
+                ),
+                "body.detect_every",
             )
         with dpg.group(horizontal=True):
-            dpg.add_checkbox(
-                label="Preview",
-                tag="body_preview_check",
-                default_value=state.body_preview,
-                callback=on_body_preview,
+            help_tooltip(
+                dpg.add_checkbox(
+                    label="Preview",
+                    tag="body_preview_check",
+                    default_value=state.body_preview,
+                    callback=on_body_preview,
+                ),
+                "body.preview",
             )
             dpg.add_group(horizontal=True, tag=BODY_OVERLAY_LEARN_SLOT)
-            dpg.add_button(label="Restart", tag="body_restart", callback=on_body_restart)
+            help_tooltip(
+                dpg.add_button(label="Restart", tag="body_restart", callback=on_body_restart),
+                "body.restart",
+            )
             dpg.add_group(horizontal=True, tag=BODY_RESTART_LEARN_SLOT)
-            dpg.add_button(label="Reset tracks", tag="body_reset", callback=on_body_reset_tracks)
+            help_tooltip(
+                dpg.add_button(
+                    label="Reset tracks", tag="body_reset", callback=on_body_reset_tracks
+                ),
+                "body.reset",
+            )
             dpg.add_group(horizontal=True, tag=BODY_RESET_LEARN_SLOT)
         dpg.add_separator()
         dpg.add_text("", tag="body_status")
@@ -15818,6 +15941,11 @@ _handtrack_side = handtrack.SideStabilizer()
 _handtrack_source: Any = None
 _handtrack_model: Any = None
 _handtrack_last_tick: float = 0.0
+_handtrack_last_infer: float = 0.0
+# e94s02: the preview-only pass reuses the last box/cursor state, so an inference
+# pass at 12 Hz does not make the cursor blink at 20 Hz.
+_handtrack_last_fields: dict[str, float] | None = None
+_handtrack_last_engaged: bool = False
 # e90s02: the supervised tracker child (camera + models OUT of this process).
 # The inline path stays the reference implementation and the fallback.
 _track_child = trackchild.TrackerChild()
@@ -15849,6 +15977,8 @@ def _track_child_config() -> dict[str, Any]:
     """The parent's Control message: all three engines, one camera owner."""
     hand_on = state.handtrack_enabled and state.hand_provider == handtrack.PROVIDER_WEBCAM
     return {
+        "prefer_frame_rate": state.tracking_prefer_frame_rate,
+        "preview_hz": handtrack.PREVIEW_HZ,
         "hand": {
             "enabled": hand_on,
             "device": state.handtrack_device,
@@ -15921,6 +16051,7 @@ def _decode_child_preview(raw: bytes | None) -> Any:
 def _handtrack_stop() -> None:
     """Release the camera + forget the tracking state (disable / provider switch)."""
     global _handtrack_source, _handtrack_model, _handtrack_last_tick, _handtrack_child_seq
+    global _handtrack_last_infer, _handtrack_last_fields, _handtrack_last_engaged
     if state.tracking_host == trackchild.HOST_CHILD:
         _track_child.configure(_track_child_config())
     if _handtrack_source is not None:
@@ -15928,6 +16059,9 @@ def _handtrack_stop() -> None:
     _handtrack_source = None
     _handtrack_model = None
     _handtrack_last_tick = 0.0
+    _handtrack_last_infer = 0.0
+    _handtrack_last_fields = None
+    _handtrack_last_engaged = False
     _handtrack_child_seq = -1
     _handtrack_gate.reset()
     _handtrack_poses.reset()
@@ -15942,6 +16076,38 @@ def _handtrack_stop() -> None:
 # creation record (dpg.does_item_exist is not enough: the tag can outlive a
 # rebuild) and it is what the tests reset.
 _preview_textures: set[str] = set()
+# e93s04: the texture size follows the frame. A raw texture has FIXED dimensions
+# in DearPyGui, so switching from a 4:3 camera to a 16:9 one must recreate it.
+_preview_texture_sizes: dict[str, tuple[int, int]] = {}
+
+
+def _ensure_preview_texture(tex_tag: str, image_tag: str, parent: str, frame: Any) -> bool:
+    """Create/update one preview texture; True when it was (re)created.
+
+    Recreating on a size change is what lets the preview follow the camera's
+    aspect: uploading a 320x180 frame into a 320x240 texture would corrupt it.
+    """
+    height, width = int(frame.shape[0]), int(frame.shape[1])
+    size = (width, height)
+    rgba = np.dstack([frame.astype(np.float32) / 255.0, np.ones((height, width), dtype=np.float32)])
+    if _preview_texture_sizes.get(tex_tag) == size:
+        dpg.set_value(tex_tag, rgba.reshape(-1))
+        return False
+    if dpg.does_item_exist(image_tag):
+        dpg.delete_item(image_tag)
+    if dpg.does_item_exist(tex_tag):
+        dpg.delete_item(tex_tag)
+    dpg.add_raw_texture(
+        width=width,
+        height=height,
+        default_value=rgba.reshape(-1),
+        tag=tex_tag,
+        parent="texture_registry",
+    )
+    dpg.add_image(tex_tag, tag=image_tag, parent=parent)
+    _preview_texture_sizes[tex_tag] = size
+    _preview_textures.add(tex_tag)
+    return True
 
 
 def _publish_tracking_preview(engine: str, frame: Any) -> None:
@@ -15963,7 +16129,8 @@ def _handtrack_publish_preview(rgb: Any, fields: dict[str, float] | None, engage
     """
     if not state.handtrack_preview or rgb is None:
         return
-    small = handio.resize_rgb(rgb, (HANDTRACK_PREVIEW_W, HANDTRACK_PREVIEW_H))
+    size = handio.fit_size(rgb.shape, HANDTRACK_PREVIEW_W, HANDTRACK_PREVIEW_H)
+    small = handio.resize_rgb(rgb, size)
     frame = handtrack.draw_preview(
         small,
         None if fields is None else fields["palm_x"],
@@ -16006,6 +16173,7 @@ def _handtrack_apply(landmarks: Any, side: str, preview: Any, now: float) -> dic
     Shared by the inline producer and the child producer: the SOURCE of the
     landmarks changed (e90s02), the semantics did not (HIGH-1: pure cores).
     """
+    global _handtrack_last_fields, _handtrack_last_engaged
     snapshot: dict[str, float] = {}
     if landmarks is not None:
         fields = handtrack.normalize_landmarks(
@@ -16021,6 +16189,8 @@ def _handtrack_apply(landmarks: Any, side: str, preview: Any, now: float) -> dic
             fist=fields["grab"] >= handtrack.CURL_FIST,
         )
         fields["engaged"] = 1.0 if engaged else 0.0
+        _handtrack_last_fields = fields
+        _handtrack_last_engaged = engaged
         # e87s05: the pose signals ride the same snapshot (webcam provider only).
         fields.update(_handtrack_pose_signals(fields, landmarks, engaged, now))
         hand_side = _handtrack_side.update(side, now)
@@ -16028,6 +16198,8 @@ def _handtrack_apply(landmarks: Any, side: str, preview: Any, now: float) -> dic
         state.handtrack_status = "tracking"
         _handtrack_publish_preview(preview, fields, engaged)
     else:
+        _handtrack_last_fields = None
+        _handtrack_last_engaged = False
         _handtrack_gate.step(now, present=False, inside=False, palm_facing=0.0, fist=False)
         _handtrack_poses.step(now, None)  # tracking loss never latches a pose
         state.handtrack_status = "searching"
@@ -16058,12 +16230,10 @@ def _handtrack_child_iteration() -> None:
     _track_child.configure(config)
     _track_child.start(config)
     state.handtrack_status = _handtrack_child_status()
-    frame = _track_child.latest(trackpipe.ENGINE_HAND)
+    frame = _track_child.wait_next(
+        trackpipe.ENGINE_HAND, _handtrack_child_seq, HANDTRACK_IDLE_SLEEP_S
+    )
     if not isinstance(frame, trackpipe.TrackingFrame):
-        time.sleep(HANDTRACK_IDLE_SLEEP_S)
-        return
-    if frame.seq == _handtrack_child_seq:
-        time.sleep(HANDTRACK_IDLE_SLEEP_S)
         return
     _handtrack_child_seq = frame.seq
     now = time.monotonic()
@@ -16072,12 +16242,11 @@ def _handtrack_child_iteration() -> None:
     landmarks = None if frame.payload_shape[0] == 0 else frame.payload
     snapshot = _handtrack_apply(landmarks, frame.label, _decode_child_preview(frame.preview), now)
     _handtrack_after_frame(snapshot, now)
-    time.sleep(1.0 / max(state.handtrack_max_hz, 1.0))
 
 
 def _handtrack_worker_iteration() -> None:
     """One webcam-engine pass; the loop guard keeps the thread alive on any error."""
-    global _handtrack_source, _handtrack_model, _handtrack_last_tick
+    global _handtrack_source, _handtrack_model, _handtrack_last_tick, _handtrack_last_infer
     state.handtrack_worker_tick = time.time()
     if not handtrack.engine_active():
         if state.tracking_host == trackchild.HOST_CHILD:
@@ -16101,7 +16270,12 @@ def _handtrack_worker_iteration() -> None:
             state.handtrack_status = "no-camera"
             time.sleep(HANDTRACK_RETRY_SLEEP_S)
             return
-        source = handio.CameraSource(device, HANDTRACK_CAMERA_WIDTH, HANDTRACK_CAMERA_HEIGHT)
+        source = handio.open_capture(
+            device,
+            HANDTRACK_CAMERA_WIDTH,
+            HANDTRACK_CAMERA_HEIGHT,
+            state.tracking_prefer_frame_rate,
+        )
         if not source.open():
             source.close()
             # BUG-2026-10-23T220000: a wedged driver blocks inside av.open(); say
@@ -16113,6 +16287,7 @@ def _handtrack_worker_iteration() -> None:
         _handtrack_model = handio.HandModel()
         _handtrack_gate.reset()
         _handtrack_last_tick = 0.0
+        _handtrack_last_infer = 0.0
         append_log("Hand tracking", f"camera {device}")
     started = time.monotonic()
     rgb = _handtrack_source.read()
@@ -16120,6 +16295,18 @@ def _handtrack_worker_iteration() -> None:
         state.handtrack_status = "lost" if _handtrack_source.lost else "no-camera"
         time.sleep(_handtrack_source.retry_delay())
         return
+    tracked = state.handtrack_status == "tracking"
+    infer_hz = handtrack_inference_hz(tracked, state.handtrack_max_hz)
+    preview_hz = handtrack.PREVIEW_HZ if state.handtrack_preview else 0.0
+    cadence = max(infer_hz, preview_hz, 1.0)
+    # e94s02: the preview has its own cadence. A pass that is not due for the
+    # model still publishes the frame, so the panel follows the camera instead of
+    # the inference rate.
+    if state.handtrack_preview and time.monotonic() - _handtrack_last_infer < 1.0 / infer_hz:
+        _handtrack_publish_preview(rgb, _handtrack_last_fields, _handtrack_last_engaged)
+        time.sleep(max(0.0, 1.0 / cadence - (time.monotonic() - started)))
+        return
+    _handtrack_last_infer = time.monotonic()
     hands = _handtrack_model.detect(rgb, now=started)
     now = time.monotonic()
     state.handtrack_latency_ms = (now - started) * 1000.0
@@ -16130,8 +16317,7 @@ def _handtrack_worker_iteration() -> None:
         snapshot = _handtrack_apply(None, "", rgb, now)
     state.handtrack_frame_age_ms = getattr(_handtrack_source, "frame_age_ms", 0.0)
     _handtrack_after_frame(snapshot, now)
-    interval = 1.0 / max(handtrack_inference_hz(bool(hands), state.handtrack_max_hz), 1.0)
-    time.sleep(max(0.0, interval - (time.monotonic() - started)))
+    time.sleep(max(0.0, 1.0 / cadence - (time.monotonic() - started)))
 
 
 def handtrack_control_loop() -> None:
@@ -16216,7 +16402,8 @@ def _zones_publish_preview(rgb: Any, snapshot: dict[str, dict[str, float]]) -> N
     """Store the overlay frame; the main thread uploads it at its own cadence."""
     if not state.zones_preview:
         return
-    small = handio.resize_rgb(rgb, (ZONES_PREVIEW_W, ZONES_PREVIEW_H))
+    size = handio.fit_size(rgb.shape, ZONES_PREVIEW_W, ZONES_PREVIEW_H)
+    small = handio.resize_rgb(rgb, size)
     frame = zonetrack.draw_overlay(small, state.zones_config, snapshot, mirror=state.zones_mirror)
     _publish_tracking_preview("zones", frame)
 
@@ -16228,9 +16415,8 @@ def _zones_child_iteration() -> None:
     _track_child.configure(config)
     _track_child.start(config)
     state.zones_status = _child_host_status("live")
-    message = _track_child.latest(trackpipe.ENGINE_ZONES)
-    if not isinstance(message, trackpipe.Signals) or message.seq == _zones_child_seq:
-        time.sleep(ZONES_IDLE_SLEEP_S)
+    message = _track_child.wait_next(trackpipe.ENGINE_ZONES, _zones_child_seq, ZONES_IDLE_SLEEP_S)
+    if not isinstance(message, trackpipe.Signals):
         return
     _zones_child_seq = message.seq
     now = time.monotonic()
@@ -16249,7 +16435,6 @@ def _zones_child_iteration() -> None:
     state.zones_status = "live"
     drive_zone_mappings(message.values, now=now)
     _publish_tracking_preview("zones", _decode_child_preview(message.preview))
-    time.sleep(1.0 / max(state.zones_max_hz, 1.0))
 
 
 def _zones_worker_iteration() -> None:
@@ -16278,7 +16463,9 @@ def _zones_worker_iteration() -> None:
             state.zones_status = "no-camera"
             time.sleep(ZONES_RETRY_SLEEP_S)
             return
-        source = handio.CameraSource(device, state.zones_width, state.zones_height)
+        source = handio.open_capture(
+            device, state.zones_width, state.zones_height, state.tracking_prefer_frame_rate
+        )
         if not source.available():
             if state.zones_status != "missing-deps":
                 append_log("Stage zones", "PyAV is missing")
@@ -16349,7 +16536,7 @@ BODY_RETRY_SLEEP_S: float = 2.0
 BODY_FPS_TAU_S: float = 0.5
 BODY_PREVIEW_W: int = 320
 BODY_PREVIEW_H: int = 240
-BODY_PREVIEW_HZ: float = 10.0
+BODY_PREVIEW_HZ: float = 20.0
 
 _body_source: Any = None
 _body_detector: Any = None
@@ -16383,7 +16570,8 @@ def _body_publish_preview(rgb: Any, tracker: Any) -> None:
     if not state.body_preview:
         return
     frame = bodytrack.draw_overlay(rgb, bodytrack.landmarks_by_slot(tracker))
-    small = handio.resize_rgb(frame, (BODY_PREVIEW_W, BODY_PREVIEW_H))
+    size = handio.fit_size(frame.shape, BODY_PREVIEW_W, BODY_PREVIEW_H)
+    small = handio.resize_rgb(frame, size)
     _publish_tracking_preview("body", small)
 
 
@@ -16394,9 +16582,8 @@ def _body_child_iteration() -> None:
     _track_child.configure(config)
     _track_child.start(config)
     state.body_status = _child_host_status("live")
-    message = _track_child.latest(trackpipe.ENGINE_BODY)
-    if not isinstance(message, trackpipe.Signals) or message.seq == _body_child_seq:
-        time.sleep(BODY_IDLE_SLEEP_S)
+    message = _track_child.wait_next(trackpipe.ENGINE_BODY, _body_child_seq, BODY_IDLE_SLEEP_S)
+    if not isinstance(message, trackpipe.Signals):
         return
     _body_child_seq = message.seq
     now = time.monotonic()
@@ -16413,7 +16600,6 @@ def _body_child_iteration() -> None:
     _body_last_tick = now
     state.body_status = "live"
     _publish_tracking_preview("body", _decode_child_preview(message.preview))
-    time.sleep(1.0 / max(state.body_max_hz, 1.0))
 
 
 def _body_worker_iteration() -> None:
@@ -16447,7 +16633,9 @@ def _body_worker_iteration() -> None:
             state.body_status = "no-camera"
             time.sleep(BODY_RETRY_SLEEP_S)
             return
-        source = handio.CameraSource(device, state.body_width, state.body_height)
+        source = handio.open_capture(
+            device, state.body_width, state.body_height, state.tracking_prefer_frame_rate
+        )
         if not source.open():
             source.close()
             state.body_status = "stalled" if source.stalled else "no-camera"
@@ -21615,116 +21803,102 @@ def _build_leap_tab() -> None:
 
 
 def _build_hands_tab() -> None:
-    """The webcam engine + the provider selector that picks the hand source."""
-    with dpg.tab(label="Hands", tag="tracking_tab_hands"):
+    """The webcam engine tab (e93s05: the tab IS the engine choice)."""
+    with dpg.tab(label="Hands", tag="tracking_tab_hands"), dpg.group(tag="webcam_provider_group"):
         with dpg.group(horizontal=True):
-            themed_text("Engine", slot="text_dim")
+            help_tooltip(
+                dpg.add_checkbox(
+                    label="Enable webcam",
+                    tag="handtrack_enable_cb",
+                    default_value=state.handtrack_enabled,
+                    callback=on_handtrack_enable,
+                ),
+                "handtrack.enable",
+            )
+            dpg.add_group(horizontal=True, tag=HANDTRACK_TOGGLE_LEARN_SLOT)
+        with dpg.group(horizontal=True):
+            help_label("Camera", "handtrack.camera", tag="tracking_lbl_hands_camera")
             help_tooltip(
                 dpg.add_combo(
-                    items=[handtrack.PROVIDER_LABELS[p] for p in handtrack.HAND_PROVIDERS],
-                    default_value=handtrack.PROVIDER_LABELS[state.hand_provider],
-                    width=200,
-                    tag="handtrack_provider_cb",
-                    callback=on_hand_provider_change,
+                    items=[],
+                    width=CAMERA_COMBO_WIDTH,
+                    tag="handtrack_camera_cb",
+                    callback=on_handtrack_camera,
                 ),
-                "hands.provider",
+                "handtrack.camera",
+            )
+            help_label("Mirror", "handtrack.mirror", tag="tracking_lbl_mirror")
+            help_tooltip(
+                dpg.add_checkbox(
+                    tag="handtrack_mirror_cb",
+                    default_value=state.handtrack_mirror,
+                    callback=on_handtrack_mirror,
+                ),
+                "handtrack.mirror",
+            )
+        with dpg.group(horizontal=True):
+            help_tooltip(
+                dpg.add_slider_float(
+                    label="Box",
+                    tag="handtrack_box_slider",
+                    width=120,
+                    min_value=handtrack.BOX_FRACTION_MIN,
+                    max_value=handtrack.BOX_FRACTION_MAX,
+                    default_value=state.handtrack_box,
+                    callback=on_handtrack_box,
+                ),
+                "handtrack.box",
+            )
+            help_tooltip(
+                dpg.add_slider_float(
+                    label="Max Hz",
+                    tag="handtrack_maxhz_slider",
+                    width=110,
+                    min_value=handtrack.MAX_HZ_MIN,
+                    max_value=handtrack.MAX_HZ_MAX,
+                    default_value=state.handtrack_max_hz,
+                    callback=on_handtrack_maxhz,
+                ),
+                "handtrack.maxhz",
+            )
+            help_tooltip(
+                dpg.add_checkbox(
+                    label="Preview",
+                    tag="handtrack_preview_cb",
+                    default_value=state.handtrack_preview,
+                    callback=on_handtrack_preview,
+                ),
+                "handtrack.preview",
             )
         dpg.add_separator()
-        with dpg.group(tag="webcam_provider_group"):
-            with dpg.group(horizontal=True):
-                help_tooltip(
-                    dpg.add_checkbox(
-                        label="Enable webcam",
-                        tag="handtrack_enable_cb",
-                        default_value=state.handtrack_enabled,
-                        callback=on_handtrack_enable,
-                    ),
-                    "handtrack.enable",
-                )
-                dpg.add_group(horizontal=True, tag=HANDTRACK_TOGGLE_LEARN_SLOT)
-            with dpg.group(horizontal=True):
-                themed_text("Camera", slot="text_dim")
-                help_tooltip(
-                    dpg.add_combo(
-                        items=[],
-                        width=190,
-                        tag="handtrack_camera_cb",
-                        callback=on_handtrack_camera,
-                    ),
-                    "handtrack.camera",
-                )
-                themed_text("Mirror", slot="text_dim")
-                help_tooltip(
-                    dpg.add_checkbox(
-                        tag="handtrack_mirror_cb",
-                        default_value=state.handtrack_mirror,
-                        callback=on_handtrack_mirror,
-                    ),
-                    "handtrack.mirror",
-                )
-            with dpg.group(horizontal=True):
-                help_tooltip(
-                    dpg.add_slider_float(
-                        label="Box",
-                        tag="handtrack_box_slider",
-                        width=120,
-                        min_value=handtrack.BOX_FRACTION_MIN,
-                        max_value=handtrack.BOX_FRACTION_MAX,
-                        default_value=state.handtrack_box,
-                        callback=on_handtrack_box,
-                    ),
-                    "handtrack.box",
-                )
-                help_tooltip(
-                    dpg.add_slider_float(
-                        label="Max Hz",
-                        tag="handtrack_maxhz_slider",
-                        width=110,
-                        min_value=handtrack.MAX_HZ_MIN,
-                        max_value=handtrack.MAX_HZ_MAX,
-                        default_value=state.handtrack_max_hz,
-                        callback=on_handtrack_maxhz,
-                    ),
-                    "handtrack.maxhz",
-                )
-                help_tooltip(
-                    dpg.add_checkbox(
-                        label="Preview",
-                        tag="handtrack_preview_cb",
-                        default_value=state.handtrack_preview,
-                        callback=on_handtrack_preview,
-                    ),
-                    "handtrack.preview",
-                )
-            dpg.add_separator()
-            dpg.add_text("", tag="handtrack_status_text")
-            dpg.add_text("", tag="handtrack_fps_text")
-            # Operator request 2026-10-28: the PREVIEW comes first, right under the
-            # status. It used to sit after the 34-row signal monitor, so it was
-            # always below the fold and the window had to be scrolled to see it.
-            with (
-                dpg.child_window(
-                    height=HANDTRACK_PREVIEW_PANEL_H,
-                    show=state.handtrack_preview,  # BUG-2026-10-24: a stored ON opens it
-                    tag="handtrack_preview_panel",
-                ),
-                dpg.group(horizontal=True),
-            ):
-                dpg.add_spacer(width=HANDTRACK_PREVIEW_PAD)
-                with dpg.group(tag="handtrack_preview_panel_slot"):
-                    dpg.add_text("Waiting for the camera...", tag="handtrack_preview_wait_text")
-            # Operator rig 2026-10-28: one COMPACT row per hand (label + value
-            # inline) instead of a 17-line column inside its own scroll box.
-            with dpg.group(tag="handtrack_monitor_group"):
-                for hand in handtrack.MONITOR_HANDS:
-                    with dpg.group(horizontal=True, tag=f"handtrack_mon_{hand}"):
-                        themed_text(hand[0].upper(), slot="text_bright")
-                        for field in handtrack.MONITOR_FIELDS:
-                            themed_text(handtrack.field_label(field), slot="text_dim")
-                            dpg.add_text(
-                                handtrack.MONITOR_PLACEHOLDER,
-                                tag=f"handtrack_mon_{hand}_{field}",
-                            )
+        dpg.add_text("", tag="handtrack_status_text")
+        dpg.add_text("", tag="handtrack_fps_text")
+        # Operator request 2026-10-28: the PREVIEW comes first, right under the
+        # status. It used to sit after the 34-row signal monitor, so it was
+        # always below the fold and the window had to be scrolled to see it.
+        with (
+            dpg.child_window(
+                height=HANDTRACK_PREVIEW_PANEL_H,
+                show=state.handtrack_preview,  # BUG-2026-10-24: a stored ON opens it
+                tag="handtrack_preview_panel",
+            ),
+            dpg.group(horizontal=True),
+        ):
+            dpg.add_spacer(width=HANDTRACK_PREVIEW_PAD)
+            with dpg.group(tag="handtrack_preview_panel_slot"):
+                dpg.add_text("Waiting for the camera...", tag="handtrack_preview_wait_text")
+        # Operator rig 2026-10-28: one COMPACT row per hand (label + value
+        # inline) instead of a 17-line column inside its own scroll box.
+        with dpg.group(tag="handtrack_monitor_group"):
+            for hand in handtrack.MONITOR_HANDS:
+                with dpg.group(horizontal=True, tag=f"handtrack_mon_{hand}"):
+                    themed_text(hand[0].upper(), slot="text_bright")
+                    for field in handtrack.MONITOR_FIELDS:
+                        themed_text(handtrack.field_label(field), slot="text_dim")
+                        dpg.add_text(
+                            handtrack.MONITOR_PLACEHOLDER,
+                            tag=f"handtrack_mon_{hand}_{field}",
+                        )
 
 
 TRACKING_WINDOW_TAG = "tracking_window"
@@ -21767,6 +21941,54 @@ TRACKING_ACTION_ROWS: tuple[tuple[str, str, str], ...] = (
     ("Bodies", "body_enable", "body_restart_action"),
     ("Zones", "zones_enable", "zones_restart_action"),
 )
+# e93s01: the operator-facing surface of this epic. The controls are registered in
+# HELP_TARGETS (the boot applier attaches them); the row WORDS are separate ImGui
+# items, so they carry their own card through help_label.
+TRACKING_HELP_CONTROLS: tuple[str, ...] = (
+    "tracking_host_cb",
+    "tracking_fps_first_cb",
+    "leap_enable_cb",
+    "leap_restart_btn",
+    "leap_viz_cb",
+    "handtrack_enable_cb",
+    "handtrack_camera_cb",
+    "handtrack_mirror_cb",
+    "handtrack_box_slider",
+    "handtrack_maxhz_slider",
+    "handtrack_preview_cb",
+    "body_enable",
+    "body_camera",
+    "body_max_hz",
+    "body_max_bodies",
+    "body_detect_every",
+    "body_preview_check",
+    "body_restart",
+    "body_reset",
+    "zones_enable",
+    "zones_camera",
+    "zones_processing",
+    "zones_threshold",
+    "zones_min_area",
+    "zones_max_hz",
+    "zones_preview_check",
+    "zones_edit_check",
+    "zones_new",
+    "zones_restart",
+    "zones_reset",
+    "tracking_signals_btn",
+    "tracking_events_btn",
+    "tracking_freeze_btn",
+    "tracking_panic_btn",
+    "tracking_inline_btn",
+    "tracking_retry_btn",
+)
+TRACKING_HELP_LABELS: tuple[tuple[str, str], ...] = (
+    ("tracking_lbl_host", "tracking.host"),
+    ("tracking_lbl_hands_camera", "handtrack.camera"),
+    ("tracking_lbl_mirror", "handtrack.mirror"),
+    ("tracking_lbl_body_camera", "body.camera"),
+    ("tracking_lbl_zones_camera", "zones.camera"),
+)
 
 
 def _build_tracking_window() -> None:
@@ -21781,7 +22003,7 @@ def _build_tracking_window() -> None:
         no_scrollbar=True,
     ):
         with dpg.group(horizontal=True):
-            themed_text("Host", slot="text_dim")
+            help_label("Host", "tracking.host", tag="tracking_lbl_host")
             help_tooltip(
                 dpg.add_combo(
                     items=[TRACKING_HOST_LABELS[host] for host in trackchild.HOSTS],
@@ -21793,6 +22015,15 @@ def _build_tracking_window() -> None:
                 "tracking.host",
             )
             dpg.add_text("", tag="tracking_host_hint")
+            help_tooltip(
+                dpg.add_checkbox(
+                    label="Prefer frame rate",
+                    tag="tracking_fps_first_cb",
+                    default_value=state.tracking_prefer_frame_rate,
+                    callback=on_tracking_prefer_frame_rate,
+                ),
+                "tracking.frame_rate",
+            )
         # e90 rig 2026-10-28: a real TABLE, not padded monospace text, so every
         # status cell can carry its own colour and the columns never drift.
         with dpg.table(
@@ -21864,11 +22095,14 @@ def _build_tracking_window() -> None:
                 "tracking.panic",
             )
             dpg.add_group(horizontal=True, tag=TRACKING_PANIC_LEARN_SLOT)
-            dpg.add_button(
-                label="Run inline",
-                tag="tracking_inline_btn",
-                callback=on_tracking_inline,
-                width=110,
+            help_tooltip(
+                dpg.add_button(
+                    label="Run inline",
+                    tag="tracking_inline_btn",
+                    callback=on_tracking_inline,
+                    width=110,
+                ),
+                "tracking.inline",
             )
             dpg.add_group(horizontal=True, tag=TRACKING_INLINE_LEARN_SLOT)
             help_tooltip(

@@ -696,6 +696,7 @@ _controller_profiles: dict[str, dict[str, Any]] = {}
 # the show down); `inline` is the reference in-process path and the fallback.
 # `tracking_status` is the HOST state; the engines keep their own status too.
 tracking_host: str = "inline"  # inline | child
+tracking_prefer_frame_rate: bool = False  # e94: Dynamic Framerate off at open
 tracking_status: str = "off"  # off | starting | live | stalled | offline | mismatch | inline
 tracking_engine_status: str = ""  # the child's own engine status (live, searching, ...)
 tracking_frame_age: float = 0.0  # seconds since the newest accepted frame

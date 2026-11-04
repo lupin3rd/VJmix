@@ -448,7 +448,8 @@ HELP: dict[str, HelpEntry] = {
     "settings.viosc_restart": HelpEntry("Restart viOSC", "Restart the viOSC daemon."),
     "leap.enable": HelpEntry(
         "Enable Leap Motion",
-        "Feed hand tracking into the Mapper controls. Only one hand engine runs at a time.",
+        "Feed hand tracking into the Mapper controls. It turns the webcam engine off:"
+        " one hand engine at a time.",
     ),
     "leap.restart": HelpEntry(
         "Restart engine", "Rebuild the device connection; the app need not restart."
@@ -456,17 +457,15 @@ HELP: dict[str, HelpEntry] = {
     "leap.viz": HelpEntry(
         "Device view", "Show the device view and both hands; it is a diagnostic."
     ),
-    "hands.provider": HelpEntry(
-        "Engine",
-        "Which hand engine feeds the Mapper. Only one engine runs at a time.",
-        (("Leap Motion", "the infrared device"), ("Webcam", "the front camera")),
-    ),
     "handtrack.enable": HelpEntry(
         "Enable webcam",
         "Track one hand from the front camera; it turns the Leap engine off.",
     ),
     "handtrack.camera": HelpEntry(
-        "Camera", "The capture device; the list refreshes when the webcam block opens."
+        "Camera",
+        "The capture device; the name after the dash comes from the driver. A node"
+        " marked 'metadata, no video' carries no picture: pick the other one. The"
+        " format follows the camera.",
     ),
     "handtrack.mirror": HelpEntry(
         "Mirror", "Follow you like a mirror: your right hand moves the value right."
@@ -477,6 +476,11 @@ HELP: dict[str, HelpEntry] = {
         " outside it the mapping holds.",
     ),
     "handtrack.maxhz": HelpEntry("Max Hz", "Inference cadence above the camera rate."),
+    "tracking.frame_rate": HelpEntry(
+        "Prefer frame rate",
+        "Keep the sensor frame rate: turns the UVC dynamic-framerate control off."
+        " Smoother and less late, but darker in low light; UVC on Linux only.",
+    ),
     "tracking.host": HelpEntry(
         "Host",
         "Where the camera and the models run. Child process isolates a native crash:"
@@ -516,6 +520,122 @@ HELP: dict[str, HelpEntry] = {
     ),
     "handtrack.preview": HelpEntry(
         "Preview", "Show the camera frame with the box and the palm cursor; off by default."
+    ),
+    # --- e93s01: the Bodies tab, the Zones tab and the tracking editors -----------
+    "body.enable": HelpEntry(
+        "Enable body",
+        "Track up to three bodies from the front camera. It takes the camera from the"
+        " hands and the zones: only one engine owns it.",
+    ),
+    "body.camera": HelpEntry(
+        "Camera",
+        "The capture device for the body engine. A node marked 'metadata, no video'"
+        " carries no picture: pick the other one. The format follows the camera.",
+    ),
+    "body.maxhz": HelpEntry(
+        "Max Hz",
+        "Poses computed per second, 2 to 10. Higher follows motion better; lower leaves"
+        " CPU for the render.",
+    ),
+    "body.bodies": HelpEntry(
+        "Bodies",
+        "How many people the engine tracks at once, 1 to 3. Every extra body costs inference time.",
+    ),
+    "body.detect_every": HelpEntry(
+        "Detect every",
+        "Run the person detector every N frames (1 to 6) and follow the skeletons in"
+        " between; higher is cheaper but re-acquires slower.",
+    ),
+    "body.preview": HelpEntry(
+        "Preview", "Draw the camera frame and the tracked skeletons; off it costs nothing."
+    ),
+    "body.restart": HelpEntry("Restart", "Rebuild the body engine and reopen the camera."),
+    "body.reset": HelpEntry(
+        "Reset tracks", "Forget every tracked body and start the body slots over."
+    ),
+    "zones.enable": HelpEntry(
+        "Enable zones",
+        "Measure how much of each stage zone is occupied. It takes the camera from the"
+        " hands and the bodies.",
+    ),
+    "zones.camera": HelpEntry(
+        "Camera",
+        "The capture device for the zones engine. A node marked 'metadata, no video'"
+        " carries no picture: pick the other one. The format follows the camera.",
+    ),
+    "zones.processing": HelpEntry(
+        "Processing",
+        "Width the frame is reduced to before analysis, 160 to 640. Larger sees farther;"
+        " smaller is cheaper.",
+    ),
+    "zones.threshold": HelpEntry(
+        "Threshold",
+        "Brightness that separates a body from the background, 4 to 60. Too low counts"
+        " noise as presence.",
+    ),
+    "zones.min_area": HelpEntry(
+        "Min area",
+        "Smallest blob, as a share of the frame, that counts as presence: 0.0005 to 0.1.",
+    ),
+    "zones.maxhz": HelpEntry(
+        "Max Hz", "Analysis passes per second, 2 to 15; higher reacts faster and costs CPU."
+    ),
+    "zones.preview": HelpEntry(
+        "Preview", "Show the camera frame with the zone polygons and their energy."
+    ),
+    "zones.edit": HelpEntry(
+        "Edit zones",
+        "Arm the polygon editor: click the preview to add points, 3 or more, and the"
+        " zone is stored.",
+    ),
+    "zones.new": HelpEntry(
+        "New zone", "Start a fresh polygon; the next clicks on the preview add its points."
+    ),
+    "zones.restart": HelpEntry("Restart", "Rebuild the zones engine and reopen the camera."),
+    "zones.reset": HelpEntry(
+        "Reset activity", "Drop the energy history of every zone but keep the zone shapes."
+    ),
+    "zones.zone_name": HelpEntry(
+        "Zone name", "The label used by the signals, the events and the Mapper."
+    ),
+    "zones.zone_color": HelpEntry(
+        "Zone colour", "Colour of the polygon in the preview and the overlay; click to change."
+    ),
+    "zones.zone_energy": HelpEntry(
+        "Energy", "How much of the zone is moving now, and whether it counts as occupied."
+    ),
+    "zones.zone_delete": HelpEntry(
+        "Delete zone", "Remove this zone; its signals stop and its Mapper lines hold."
+    ),
+    "tracking.event_kind": HelpEntry(
+        "Event kind",
+        "The stage edge that fires the cue. A cue fires once per edge, not every frame.",
+        (
+            ("Zone entered", "a body enters a zone"),
+            ("Zone left", "a body leaves a zone"),
+            ("Pose held", "a body holds a pose past the cooldown"),
+            ("Pose released", "the held pose ends"),
+            ("Body track lost", "a tracked body disappears"),
+        ),
+    ),
+    "tracking.event_detail": HelpEntry(
+        "Detail", "The zone, body slot or pose the edge must match; empty matches any."
+    ),
+    "tracking.event_mapping": HelpEntry("Cue", "The cue mapping id started when the edge fires."),
+    "tracking.event_add": HelpEntry(
+        "Add binding", "Bind the selected edge to the cue; it fires once per edge."
+    ),
+    "tracking.event_test": HelpEntry(
+        "Test", "Fire the selected event now, to wire a cue in an empty room."
+    ),
+    "tracking.event_clear": HelpEntry(
+        "Clear events", "Drop every binding and the detector's remembered edges."
+    ),
+    "tracking.binding_remove": HelpEntry(
+        "Remove", "Delete this binding; the cue itself is untouched."
+    ),
+    "tracking.signals_row": HelpEntry(
+        "Signal", "Click to add a Mapper line for this signal on the selected vimix source."
     ),
     "cue.kind": HelpEntry(
         "Kind",

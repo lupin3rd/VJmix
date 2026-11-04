@@ -25,8 +25,8 @@ with release **1.0.0**, download
 [GitHub Releases](https://github.com/lupin3rd/VJmix/releases) page, then:
 
 ```bash
-chmod +x vjmix-1.2.0-x86_64.AppImage
-./vjmix-1.2.0-x86_64.AppImage
+chmod +x vjmix-1.2.1-x86_64.AppImage
+./vjmix-1.2.1-x86_64.AppImage
 ```
 
 ### Where your data lives
