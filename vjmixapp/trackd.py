@@ -37,6 +37,11 @@ ENV_TOKEN = "VJMIX_TRACK_TOKEN"
 
 HEARTBEAT_S = 0.5
 IDLE_SLEEP_S = 0.05
+# e94s02: the preview has its own cadence; inference keeps its own. 20 Hz is
+# smooth on a 30 fps camera without running the model on every read.
+DEFAULT_PREVIEW_HZ = 20.0
+MIN_PREVIEW_HZ = 1.0
+MAX_PREVIEW_HZ = 30.0
 CONTROL_TIMEOUT_S = 0.2
 # A failed camera open is retried on a slow cadence: retrying at the frame rate
 # burns CPU in ffmpeg probing (measured 26 % with a missing device).
@@ -82,6 +87,7 @@ class HandConfig:
     preview: bool = False
     preview_w: int = 160
     preview_h: int = 120
+    prefer_frame_rate: bool = False
 
 
 @dataclass
@@ -99,6 +105,7 @@ class BodyConfig:
     preview_w: int = 320
     preview_h: int = 240
     reset: int = 0
+    prefer_frame_rate: bool = False
 
 
 @dataclass
@@ -118,6 +125,7 @@ class ZonesConfig:
     preview_h: int = 180
     reset: int = 0
     zones: list[dict[str, Any]] = field(default_factory=list)
+    prefer_frame_rate: bool = False
 
 
 def hand_config(raw: Any) -> HandConfig:
@@ -207,15 +215,37 @@ class ChildConfig:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._preview_hz = DEFAULT_PREVIEW_HZ
         self._hand = HandConfig()
         self._body = BodyConfig()
         self._zones = ZonesConfig()
 
     def apply(self, message: trackpipe.Control) -> None:
         with self._lock:
+            prefer = bool(message.config.get("prefer_frame_rate", False))
             self._hand = hand_config(message.config.get("hand"))
             self._body = body_config(message.config.get("body"))
             self._zones = zones_config(message.config.get("zones"))
+            self._hand.prefer_frame_rate = prefer
+            self._body.prefer_frame_rate = prefer
+            self._zones.prefer_frame_rate = prefer
+            self._preview_hz = _number(
+                message.config.get("preview_hz"),
+                DEFAULT_PREVIEW_HZ,
+                MIN_PREVIEW_HZ,
+                MAX_PREVIEW_HZ,
+            )
+
+    def preview_hz(self) -> float:
+        with self._lock:
+            return self._preview_hz
+
+    def loop_hz(self, config: Any) -> float:
+        """Capture cadence: inference rate, raised to the preview rate when on."""
+        cadence = max(float(config.max_hz), 1.0)
+        if getattr(config, "preview", False):
+            cadence = max(cadence, self.preview_hz())
+        return cadence
 
     def hand(self) -> HandConfig:
         with self._lock:
@@ -254,12 +284,14 @@ def encode_preview(rgb: np.ndarray, width: int, height: int) -> bytes | None:
         return None
 
 
-def open_camera(device: str, width: int, height: int) -> tuple[Any, str]:
+def open_camera(
+    device: str, width: int, height: int, prefer_frame_rate: bool = False
+) -> tuple[Any, str]:
     """Open one V4L2 node; returns ``(source, status)`` with status ``ok`` on success."""
     chosen = device or next(iter(handio.list_devices()), "")
     if not chosen:
         return None, STATUS_NO_CAMERA
-    source = handio.CameraSource(chosen, width, height)
+    source = handio.open_capture(chosen, width, height, prefer_frame_rate)
     if not source.open():
         stalled = bool(getattr(source, "stalled", False))
         source.close()
@@ -282,6 +314,8 @@ class HandProducer:
         self.source: Any = None
         self.model: Any = None
         self.status = STATUS_OFF
+        self._last: Any = None
+        self._last_infer = 0.0
 
     def close(self) -> None:
         if self.source is not None:
@@ -291,7 +325,9 @@ class HandProducer:
         self.status = STATUS_OFF
 
     def _open(self, config: HandConfig) -> bool:
-        source, status = open_camera(config.device, config.width, config.height)
+        source, status = open_camera(
+            config.device, config.width, config.height, config.prefer_frame_rate
+        )
         if source is None:
             self.status = status
             return False
@@ -311,7 +347,31 @@ class HandProducer:
         if rgb is None:
             self.status = status
             return None
-        return self._frame(rgb, config, seq, started)
+        if self._preview_only(config, started):
+            return self._preview_frame(rgb, config, seq)
+        self._last_infer = started
+        frame = self._frame(rgb, config, seq, started)
+        self._last = frame
+        return frame
+
+    def _preview_only(self, config: HandConfig, now: float) -> bool:
+        """e94s02: a preview-only pass when the inference interval has not elapsed."""
+        if self._last is None or not config.preview:
+            return False
+        return now - self._last_infer < 1.0 / max(float(config.max_hz), 1.0)
+
+    def _preview_frame(self, rgb: np.ndarray, config: HandConfig, seq: int) -> Any:
+        preview = encode_preview(
+            rgb, *handio.fit_size(rgb.shape, config.preview_w, config.preview_h)
+        )
+        now = time.monotonic()
+        return replace(
+            self._last,
+            seq=seq,
+            t_mono=now,
+            timings=(float(getattr(self.source, "frame_age_ms", 0.0)), 0.0),
+            preview=preview,
+        )
 
     def _frame(
         self, rgb: np.ndarray, config: HandConfig, seq: int, started: float
@@ -321,7 +381,9 @@ class HandProducer:
         capture_ms = float(getattr(self.source, "frame_age_ms", 0.0))
         infer_ms = (now - started) * 1000.0
         preview = (
-            encode_preview(rgb, config.preview_w, config.preview_h) if config.preview else None
+            encode_preview(rgb, *handio.fit_size(rgb.shape, config.preview_w, config.preview_h))
+            if config.preview
+            else None
         )
         if not hands:
             self.status = STATUS_SEARCHING
@@ -372,6 +434,8 @@ class BodyProducer:
         self.passes = 0
         self.reset_seen = 0
         self.status = STATUS_OFF
+        self._last: Any = None
+        self._last_infer = 0.0
 
     def close(self) -> None:
         if self.source is not None:
@@ -385,7 +449,9 @@ class BodyProducer:
         if not bodyio.available():
             self.status = STATUS_MISSING_DEPS
             return False
-        source, status = open_camera(config.device, config.width, config.height)
+        source, status = open_camera(
+            config.device, config.width, config.height, config.prefer_frame_rate
+        )
         if source is None:
             self.status = status
             return False
@@ -411,11 +477,24 @@ class BodyProducer:
         if config.reset != self.reset_seen:
             self.reset_seen = config.reset
             self.tracker.reset()
+        if (
+            self._last is not None
+            and config.preview
+            and started - self._last_infer < 1.0 / max(float(config.max_hz), 1.0)
+        ):
+            return replace(
+                self._last,
+                seq=seq,
+                t_mono=time.monotonic(),
+                timings=(float(getattr(self.source, "frame_age_ms", 0.0)), 0.0),
+                preview=self._preview(rgb, config),
+            )
+        self._last_infer = started
         snapshot = self._snapshot(rgb, config, started)
         now = time.monotonic()
         self.status = STATUS_LIVE
         preview = self._preview(rgb, config)
-        return trackpipe.Signals(
+        signals = trackpipe.Signals(
             engine=trackpipe.ENGINE_BODY,
             seq=seq,
             t_mono=now,
@@ -423,6 +502,8 @@ class BodyProducer:
             timings=(float(getattr(self.source, "frame_age_ms", 0.0)), (now - started) * 1000.0),
             preview=preview,
         )
+        self._last = signals
+        return signals
 
     def _snapshot(self, rgb: np.ndarray, config: BodyConfig, started: float) -> dict[str, Any]:
         self.passes += 1
@@ -440,7 +521,9 @@ class BodyProducer:
         if not config.preview:
             return None
         overlay = bodytrack.draw_overlay(rgb, bodytrack.landmarks_by_slot(self.tracker))
-        return encode_preview(overlay, config.preview_w, config.preview_h)
+        return encode_preview(
+            overlay, *handio.fit_size(overlay.shape, config.preview_w, config.preview_h)
+        )
 
 
 class ZonesProducer:
@@ -452,6 +535,8 @@ class ZonesProducer:
         self.key: tuple[Any, ...] | None = None
         self.reset_seen = 0
         self.status = STATUS_OFF
+        self._last: Any = None
+        self._last_infer = 0.0
 
     def close(self) -> None:
         if self.source is not None:
@@ -486,7 +571,9 @@ class ZonesProducer:
         return self.engine
 
     def _open(self, config: ZonesConfig) -> bool:
-        source, status = open_camera(config.device, config.width, config.height)
+        source, status = open_camera(
+            config.device, config.width, config.height, config.prefer_frame_rate
+        )
         if source is None:
             self.status = status
             return False
@@ -505,10 +592,23 @@ class ZonesProducer:
         if config.reset != self.reset_seen:
             self.reset_seen = config.reset
             engine.reset_activity()
+        if (
+            self._last is not None
+            and config.preview
+            and started - self._last_infer < 1.0 / max(float(config.max_hz), 1.0)
+        ):
+            return replace(
+                self._last,
+                seq=seq,
+                t_mono=time.monotonic(),
+                timings=(float(getattr(self.source, "frame_age_ms", 0.0)), 0.0),
+                preview=self._preview(rgb, config, self._last.values),
+            )
+        self._last_infer = started
         snapshot = engine.step(rgb, started)
         now = time.monotonic()
         self.status = STATUS_LIVE
-        return trackpipe.Signals(
+        signals = trackpipe.Signals(
             engine=trackpipe.ENGINE_ZONES,
             seq=seq,
             t_mono=now,
@@ -516,15 +616,18 @@ class ZonesProducer:
             timings=(float(getattr(self.source, "frame_age_ms", 0.0)), (now - started) * 1000.0),
             preview=self._preview(rgb, config, snapshot),
         )
+        self._last = signals
+        return signals
 
     def _preview(
         self, rgb: np.ndarray, config: ZonesConfig, snapshot: dict[str, Any]
     ) -> bytes | None:
         if not config.preview:
             return None
-        small = handio.resize_rgb(rgb, (config.preview_w, config.preview_h))
+        size = handio.fit_size(rgb.shape, config.preview_w, config.preview_h)
+        small = handio.resize_rgb(rgb, size)
         overlay = zonetrack.draw_overlay(small, config.zones, snapshot, mirror=config.mirror)
-        return encode_preview(overlay, config.preview_w, config.preview_h)
+        return encode_preview(overlay, *size)
 
 
 class ChildRuntime:
@@ -652,7 +755,7 @@ class ChildRuntime:
             self.send(envelope)
             self._beat(now, producer.status)
             self.last_progress = time.monotonic()
-            time.sleep(1.0 / max(float(config.max_hz), 1.0))
+            time.sleep(1.0 / self.config.loop_hz(config))
         except Exception as exc:  # the child must survive anything (see pyproject)
             self._beat(time.monotonic(), STATUS_LOST)
             print(f"trackd: {exc!r}", file=sys.stderr)

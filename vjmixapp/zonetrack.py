@@ -54,7 +54,7 @@ CAMERA_HEIGHT_MAX = 1080
 MAX_HZ_DEFAULT = 10.0
 MAX_HZ_MIN = 2.0
 MAX_HZ_MAX = 15.0
-PREVIEW_HZ = 10.0
+PREVIEW_HZ = 20.0
 
 # Energy: the fraction of a zone that reads as "full" motion. A performer
 # crossing a zone rarely fills it; 35 % is a useful ceiling for the Mapper.

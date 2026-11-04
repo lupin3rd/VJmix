@@ -148,6 +148,7 @@ class TrackerChild:
         self._spawn = spawn
         self._clock = clock
         self._lock = threading.RLock()
+        self._frame_ready = threading.Condition(self._lock)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._generation = 0
@@ -178,6 +179,26 @@ class TrackerChild:
     def latest(self, engine: str) -> trackpipe.TrackingFrame | trackpipe.Signals | None:
         with self._lock:
             return self._latest.get(engine)
+
+    def wait_next(
+        self, engine: str, after_seq: int, timeout: float
+    ) -> trackpipe.TrackingFrame | trackpipe.Signals | None:
+        """Block until the engine has a frame with a NEW sequence (e94s03).
+
+        The reader thread has already stored it; this removes the 200 ms polling
+        sleep that made the parent miss the freshest frame. None on timeout.
+        """
+        deadline = self._clock() + max(0.0, float(timeout))
+        with self._frame_ready:
+            while not self._stop.is_set():
+                frame = self._latest.get(engine)
+                if frame is not None and frame.seq != after_seq:
+                    return frame
+                remaining = deadline - self._clock()
+                if remaining <= 0.0:
+                    return None
+                self._frame_ready.wait(remaining)
+        return None
 
     def failures(self) -> int:
         with self._lock:
@@ -382,6 +403,7 @@ class TrackerChild:
             if not self._guard.accept(frame):
                 return
             self._latest[frame.engine] = frame
+            self._frame_ready.notify_all()
         state.tracking_frame_age = 0.0
 
     # -- failures -----------------------------------------------------------
@@ -439,9 +461,31 @@ def host_from_config(cfg: dict[str, Any]) -> str:
     return host if host in HOSTS else HOST_INLINE
 
 
+def prefer_frame_rate_from_config(cfg: dict[str, Any]) -> bool:
+    """The machine preference: keep the sensor frame rate (e94s01)."""
+    block = cfg.get("tracking")
+    return bool(block.get("prefer_frame_rate", False)) if isinstance(block, dict) else False
+
+
 def init_from_config(cfg: dict[str, Any]) -> None:
-    """Boot: mirror the persisted host into the state (never spawns anything)."""
+    """Boot: mirror the persisted host and camera preference (never spawns)."""
     state.tracking_host = host_from_config(cfg)
+    state.tracking_prefer_frame_rate = prefer_frame_rate_from_config(cfg)
+
+
+def set_prefer_frame_rate(enabled: bool) -> bool:
+    """Persist the frame-rate preference (machine settings, not project content)."""
+    state.tracking_prefer_frame_rate = bool(enabled)
+    cfg = load_config()
+    block = cfg.get("tracking")
+    if not isinstance(block, dict):
+        block = {}
+        cfg["tracking"] = block
+    block["prefer_frame_rate"] = bool(enabled)
+    if save_config(cfg):
+        return True
+    log_error("Tracking", "frame-rate preference not persisted - this session only")
+    return False
 
 
 def set_host(host: str) -> bool:

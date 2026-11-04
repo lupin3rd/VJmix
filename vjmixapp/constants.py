@@ -1167,7 +1167,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # e90: where the camera + inference run. `child` is the crash-isolated
     # path (a supervised `python -m vjmixapp.trackd`); `inline` is the
     # reference implementation and the fallback.
-    "tracking": {"host": "inline"},
+    "tracking": {"host": "inline", "prefer_frame_rate": False},
     "handtrack": {
         "provider": "leap",
         "device": "",

@@ -132,6 +132,220 @@ def list_devices() -> list[str]:
     return sorted(p for p in glob.glob("/dev/video*") if os.path.exists(p))
 
 
+# e93s02: the kernel publishes a human name per node here. Reading it is a
+# bounded, read-only sysfs lookup: no new dependency and no dpg (HIGH-1).
+VIDEO4LINUX_SYSFS = "/sys/class/video4linux"
+DEVICE_NAME_MAX_CHARS = 64
+# e93s03: UVC cameras expose a VIDEO_CAPTURE node and a METADATA_CAPTURE node on
+# the same USB device. Only the first carries a picture, and both report the same
+# driver name, so the combo marks the second one explicitly. VIDIOC_QUERYCAP is
+# the kernel's own answer; the struct's `device_caps` field sits at byte 88.
+VIDIOC_QUERYCAP = 0x80685600
+V4L2_CAPABILITY_SIZE = 104
+V4L2_DEVICE_CAPS_OFFSET = 88
+V4L2_CAP_VIDEO_CAPTURE = 0x00000001
+V4L2_CAP_METADATA_CAPTURE = 0x00800000
+METADATA_NODE_MARKER = "metadata, no video"
+_caps_cache: dict[str, int] = {}
+# e94s01: UVC's "Exposure, Dynamic Framerate": 1 lets auto-exposure lower the
+# frame rate in low light (measured 16.6 fps on a 30 fps mode); 0 keeps the rate.
+V4L2_CID_EXPOSURE_AUTO_PRIORITY = 0x009A0903
+VIDIOC_S_CTRL = 0xC008561C
+DYNAMIC_FRAMERATE_ON = 1
+DYNAMIC_FRAMERATE_OFF = 0
+# e93s04: the capture mode follows the device, not a constant. The pipeline
+# requests MJPEG, so the enumeration asks for MJPEG modes only.
+VIDIOC_ENUM_FRAMESIZES = 0xC02C564A
+V4L2_FRMSIZE_SIZE = 44
+V4L2_FRMSIZE_TYPE_OFFSET = 8
+V4L2_FRMSIZE_DISCRETE_OFFSET = 12
+V4L2_FRMSIZE_TYPE_DISCRETE = 1
+V4L2_PIX_FMT_MJPG = 0x47504A4D
+MAX_ENUMERATED_FRAMESIZES = 64
+ASPECT_TOLERANCE = 0.02
+_frame_sizes_cache: dict[str, list[tuple[int, int]]] = {}
+
+
+def frame_sizes(path: str) -> list[tuple[int, int]]:
+    """The MJPG discrete modes the node supports, largest list first seen order.
+
+    Empty when the node cannot be queried (missing device, no fcntl on Windows,
+    a driver without VIDIOC_ENUM_FRAMESIZES): the caller keeps its target size.
+    """
+    text = str(path)
+    cached = _frame_sizes_cache.get(text)
+    if cached is not None:
+        return list(cached)
+    try:
+        import fcntl
+        import struct
+
+        handle = os.open(text, os.O_RDONLY | os.O_NONBLOCK)
+    except (ImportError, OSError):
+        return []
+    modes: list[tuple[int, int]] = []
+    try:
+        for index in range(MAX_ENUMERATED_FRAMESIZES):
+            buffer = bytearray(V4L2_FRMSIZE_SIZE)
+            struct.pack_into("II", buffer, 0, index, V4L2_PIX_FMT_MJPG)
+            try:
+                fcntl.ioctl(handle, VIDIOC_ENUM_FRAMESIZES, buffer)
+            except OSError:
+                break
+            kind = struct.unpack_from("I", buffer, V4L2_FRMSIZE_TYPE_OFFSET)[0]
+            if kind != V4L2_FRMSIZE_TYPE_DISCRETE:
+                break
+            width, height = struct.unpack_from("II", buffer, V4L2_FRMSIZE_DISCRETE_OFFSET)
+            if width > 0 and height > 0:
+                modes.append((int(width), int(height)))
+    finally:
+        os.close(handle)
+    _frame_sizes_cache[text] = list(modes)
+    return modes
+
+
+def capture_size(device: str, target_w: int, target_h: int) -> tuple[int, int]:
+    """The mode to request: the device's NATIVE aspect near the target width.
+
+    A UVC camera exposes both 16:9 and 4:3 modes; forcing a 4:3 target on a 16:9
+    camera (an HDMI capture stick, a 720p webcam) is what squashed the preview.
+    The largest mode by area names the native aspect; the width closest to the
+    target among the modes of that aspect wins. Unknown devices keep the target.
+    """
+    width = max(1, int(target_w))
+    height = max(1, int(target_h))
+    modes = frame_sizes(str(device))
+    if not modes:
+        return width, height
+    native = max(modes, key=lambda mode: mode[0] * mode[1])
+    native_aspect = native[0] / native[1]
+    same_aspect = [
+        mode for mode in modes if abs(mode[0] / mode[1] - native_aspect) <= ASPECT_TOLERANCE
+    ]
+    if not same_aspect:
+        return width, height
+    chosen = min(same_aspect, key=lambda mode: (abs(mode[0] - width), mode[0] * mode[1]))
+    return int(chosen[0]), int(chosen[1])
+
+
+def fit_size(shape: Sequence[int], max_w: int, max_h: int) -> tuple[int, int]:
+    """Contain one frame in a ``max_w`` x ``max_h`` box, keeping its aspect."""
+    height, width = int(shape[0]), int(shape[1])
+    box_w, box_h = max(1, int(max_w)), max(1, int(max_h))
+    if width <= 0 or height <= 0:
+        return box_w, box_h
+    scale = min(box_w / width, box_h / height)
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
+def device_caps(path: str) -> int | None:
+    """The node's ``device_caps`` from VIDIOC_QUERYCAP, or None when unknown.
+
+    ``fcntl`` is imported here on purpose: Windows has no fcntl and must degrade
+    to None instead of failing the import. A successful answer is cached (a node
+    does not change type while it exists); a failure is not, because the node
+    may appear later.
+    """
+    text = str(path)
+    if text in _caps_cache:
+        return _caps_cache[text]
+    try:
+        import fcntl
+        import struct
+
+        handle = os.open(text, os.O_RDONLY | os.O_NONBLOCK)
+    except (ImportError, OSError):
+        return None
+    try:
+        buffer = bytearray(V4L2_CAPABILITY_SIZE)
+        fcntl.ioctl(handle, VIDIOC_QUERYCAP, buffer)
+        (caps,) = struct.unpack_from("I", buffer, V4L2_DEVICE_CAPS_OFFSET)
+    except OSError:
+        return None
+    finally:
+        os.close(handle)
+    _caps_cache[text] = int(caps)
+    return int(caps)
+
+
+def is_video_capture(caps: int | None) -> bool:
+    """True when the node produces frames (the one to use)."""
+    return caps is not None and bool(int(caps) & V4L2_CAP_VIDEO_CAPTURE)
+
+
+def is_metadata_capture(caps: int | None) -> bool:
+    """True for a UVC metadata node: same camera, no picture."""
+    return (
+        caps is not None
+        and bool(int(caps) & V4L2_CAP_METADATA_CAPTURE)
+        and not (int(caps) & V4L2_CAP_VIDEO_CAPTURE)
+    )
+
+
+def capture_device(devices: Sequence[str]) -> str:
+    """The first node that produces frames; else the first node; else ""."""
+    for device in devices:
+        if is_video_capture(device_caps(str(device))):
+            return str(device)
+    return str(devices[0]) if devices else ""
+
+
+def device_name(path: str, sysfs_root: str = VIDEO4LINUX_SYSFS) -> str:
+    """The driver's name for one V4L2 node, or "" when the kernel has none."""
+    node = os.path.basename(str(path))
+    if not node:
+        return ""
+    try:
+        with open(
+            os.path.join(sysfs_root, node, "name"),
+            encoding="utf-8",
+            errors="replace",
+        ) as handle:
+            return handle.read(DEVICE_NAME_MAX_CHARS).strip()
+    except OSError:
+        return ""
+
+
+def device_label(path: str, sysfs_root: str = VIDEO4LINUX_SYSFS) -> str:
+    """``/dev/videoN - <driver name>``; the path alone when the name is unknown.
+
+    The path is always kept: two nodes of one camera often share the same
+    driver name (measured: /dev/video0 and /dev/video1 both report
+    "Integrated Camera: Integrated C").
+    """
+    name = device_name(path, sysfs_root)
+    label = f"{path} - {name}" if name else str(path)
+    if is_metadata_capture(device_caps(str(path))):
+        label = f"{label} ({METADATA_NODE_MARKER})"
+    return label
+
+
+def device_labels(devices: Sequence[str], sysfs_root: str = VIDEO4LINUX_SYSFS) -> list[str]:
+    """The combo items for a list of capture nodes."""
+    return [device_label(device, sysfs_root) for device in devices]
+
+
+def device_from_label(
+    label: str,
+    devices: Sequence[str],
+    sysfs_root: str = VIDEO4LINUX_SYSFS,
+) -> str:
+    """The persisted node for one combo label; "" when the node has vanished.
+
+    A renamed node still resolves through the path prefix, and a raw path is
+    accepted, so an old config keeps working.
+    """
+    text = str(label)
+    nodes = [str(device) for device in devices]
+    if text in nodes:
+        return text
+    for node in nodes:
+        if device_label(node, sysfs_root) == text:
+            return node
+    prefix = text.split(" - ", 1)[0]
+    return prefix if prefix in nodes else ""
+
+
 # ---------------------------------------------------------------------------
 # Geometry (pure numpy/PIL, unit-tested without a camera)
 # ---------------------------------------------------------------------------
@@ -510,6 +724,52 @@ class CameraSource:
         """Exponential backoff after consecutive failures (bounded)."""
         exponent = max(0, self.failures - 1)
         return min(CAMERA_RETRY_MAX_S, CAMERA_RETRY_MIN_S * (2.0**exponent))
+
+
+def set_frame_rate_priority(device: str, enabled: bool) -> bool:
+    """Prefer the sensor frame rate over auto-exposure's slowdown (e94s01).
+
+    ``enabled`` writes 0 to V4L2_CID_EXPOSURE_AUTO_PRIORITY (Dynamic Framerate
+    OFF); False restores the driver default (1). Best effort: a missing node, no
+    fcntl (Windows) or a driver without the control returns False and changes
+    nothing.
+    """
+    try:
+        import fcntl
+        import struct
+
+        handle = os.open(str(device), os.O_RDWR | os.O_NONBLOCK)
+    except (ImportError, OSError):
+        return False
+    try:
+        buffer = bytearray(8)
+        struct.pack_into(
+            "Ii",
+            buffer,
+            0,
+            V4L2_CID_EXPOSURE_AUTO_PRIORITY,
+            DYNAMIC_FRAMERATE_OFF if enabled else DYNAMIC_FRAMERATE_ON,
+        )
+        fcntl.ioctl(handle, VIDIOC_S_CTRL, buffer)
+    except OSError:
+        return False
+    finally:
+        os.close(handle)
+    return True
+
+
+def open_capture(
+    device: str, target_w: int, target_h: int, prefer_frame_rate: bool = False
+) -> CameraSource:
+    """A CameraSource opened at the mode the device actually supports (e93s04).
+
+    e94s01: when the operator prefers fluidity, the Dynamic Framerate control is
+    turned off before the stream opens, so the sensor keeps its frame rate.
+    """
+    if prefer_frame_rate:
+        set_frame_rate_priority(str(device), True)
+    width, height = capture_size(str(device), target_w, target_h)
+    return CameraSource(str(device), width, height)
 
 
 class HandModel:
