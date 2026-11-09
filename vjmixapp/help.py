@@ -147,6 +147,37 @@ HELP: dict[str, HelpEntry] = {
             ("trigger", "no arguments, a bare address"),
         ),
     ),
+    "mapper.so.transport": HelpEntry(
+        "OSC | MIDI",
+        "Where this Secondary Output is sent. OSC writes a UDP datagram to a "
+        "host/port/address; MIDI writes a message to a MIDI output device. "
+        "Both carry the value the Mapping already sends.",
+    ),
+    "mapper.so.device": HelpEntry(
+        "Device",
+        "The MIDI output port that receives the Secondary Output. Any output port "
+        "can be chosen, not only the configured controllers. A saved device that "
+        "is not connected stays selected and is marked; it sends nothing until it "
+        "comes back.",
+    ),
+    "mapper.so.midi_message": HelpEntry(
+        "Message",
+        "The MIDI message kind. CC sends a continuous controller value; Note sends "
+        "a note-on and a note-off after the gate.",
+        (
+            ("cc", "controller value: control Number, SO value"),
+            ("note", "note on, SO value = velocity, released"),
+        ),
+    ),
+    "mapper.so.number": HelpEntry(
+        "Number",
+        "CC number or note number, 0..127.",
+    ),
+    "mapper.so.gate": HelpEntry(
+        "Gate (ms)",
+        "How long a Note stays held before its note-off. Without a release a note "
+        "would stick; 60 ms is the default.",
+    ),
     "mapper.so.scale": HelpEntry(
         "Scale from/to",
         "Rescales the Mapping's output value into the Secondary Output range "
@@ -665,6 +696,28 @@ HELP: dict[str, HelpEntry] = {
     ),
     "mapper.filter_global": HelpEntry(
         "Clock+Constant", "Show the mappings driven by the transport or by a fixed value."
+    ),
+    "mapper.edit": HelpEntry(
+        "Edit",
+        "Temporary: shows every card full so you can edit it. It changes "
+        "nothing permanently - uncheck it and each card returns to its own "
+        "Compact flag. Compact/Expand are the permanent ones.",
+    ),
+    "mapper.compact": HelpEntry(
+        "Compact",
+        "Permanently sets every mapping to the half-size compact card (two per "
+        "cell). Saved with the project. Undo with Expand.",
+    ),
+    "mapper.expand": HelpEntry(
+        "Expand",
+        "Permanently gives every mapping its full card. Saved with the project. "
+        "Compact does the opposite.",
+    ),
+    "mapper.io_leds": HelpEntry(
+        "I/O LEDs",
+        "Two squares per card. Cyan: a value reached this mapping (even if it "
+        "held it or is muted). Accent: it sent to its Destination/SO. Cyan with "
+        "no accent means the value never left.",
     ),
     "mapper.new": HelpEntry(
         "New mapping", "Create a mapping of any Type; it asks which Source when needed."

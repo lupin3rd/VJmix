@@ -89,6 +89,9 @@ def derive_palette(primaries: dict[str, list[int]]) -> dict[str, list[int]]:
         "play_bg": _blend(border, [255, 255, 255], 0.25),
         "play_on_bg": _blend(accent, [255, 255, 255], 0.35),
         "spectrum": _blend(accent, [255, 255, 255], 0.25),
+        # e96: fixed hue (the `warning` precedent) — the Mapper card RX square is
+        # CYAN on every palette so it never reads as the accent-coloured TX one.
+        "led_in": [90, 220, 210],
     }
 
 

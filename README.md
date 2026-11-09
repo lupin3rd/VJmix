@@ -19,14 +19,13 @@ MIDI controller support (Novation Launchpad profiles included).
 
 The easiest way to run VJmix on Linux is the self-contained AppImage: a single
 file with Python, all libraries and the app bundled — **no Python, no pip, no
-root** (PortAudio included, so no `libportaudio2` package is needed). Starting
-with release **1.0.0**, download
+root** (PortAudio included, so no `libportaudio2` package is needed). Download
 `vjmix-<version>-x86_64.AppImage` from the
 [GitHub Releases](https://github.com/lupin3rd/VJmix/releases) page, then:
 
 ```bash
-chmod +x vjmix-1.2.1-x86_64.AppImage
-./vjmix-1.2.1-x86_64.AppImage
+chmod +x vjmix-1.3.0-x86_64.AppImage
+./vjmix-1.3.0-x86_64.AppImage
 ```
 
 ### Where your data lives
@@ -51,16 +50,38 @@ python3.13 -m venv .venv
 
 ## Requirements
 
-- [viOSC](https://github.com/lupin3rd/viosc) **0.8.0+** (the daemon that bridges
-  VJmix and Vimix). From 1.1.0 the link is HTTP-first: `/vimix/*` commands still
-  ride OSC, while the state table arrives as a snapshot (`GET /state`, revision +
-  ETag) plus a delta stream (`GET /events`, Server-Sent Events) and the Mapper
-  declares what it needs with `POST /interest`. An older viOSC keeps working
-  through the deprecated `/viosc/*` lanes.
+- [viOSC](https://github.com/lupin3rd/viosc) **1.0.0+** — the daemon that speaks
+  to Vimix. It must run on the same machine as Vimix; VJmix reaches it over the
+  network. A pre-1.0 viOSC is refused with one visible line.
 - [Vimix](https://github.com/brunoherbelin/vimix) **0.9.3 stable or newer** — the
   stable release that carries the OSC fixes VJmix relies on (some of them are not
   documented in the Vimix wiki yet).
 - (optional) a Novation Launchpad MK1/MK2/MK3 for pad control
+
+## How VJmix talks to Vimix
+
+VJmix never speaks OSC to Vimix: **viOSC does**, on the machine where Vimix runs.
+Between the two apps there is one HTTP link, one port, one token (the pairing
+code viOSC shows at start), and everything travels on it:
+
+- **Commands.** Every Mapper, Sequencer, Cue and toolbar action is sent as a JSON
+  frame (`{"address": "/vimix/…", "args": [...]}`) on one long-lived chunked
+  `POST /link` stream. Ordered, nothing lost, and value sets coalesce per address
+  while the link is down so a reconnection lands on the newest value.
+- **State.** viOSC keeps the mirror of the session. VJmix reads it as a snapshot
+  (`GET /state`, revision + `ETag`, `304` when nothing changed) and follows it
+  with an ordered delta stream (`GET /events`, Server-Sent Events). What the
+  Mapper needs at a higher rate is declared explicitly with `POST /interest`.
+- **Everything else** — thumbnails (`/thumb`), media preview and metadata
+  (`/preview`), a read-only file manager for sessions and media (`/fs`), and the
+  daemon's own configuration (`/config`) — is a plain HTTP resource on the same
+  port.
+- **The link has a state**, shown in the viOSC panel and on its LED: `connected`,
+  `connecting`, `reconnecting`, `incompatible`.
+
+OSC enters the picture only where something other than viOSC is on the other
+end: a Mapper line with an OSC destination, or the Secondary Output. It is never
+used to talk to Vimix.
 
 ## Support
 

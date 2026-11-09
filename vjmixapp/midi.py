@@ -8,6 +8,7 @@ the worker loops live in the composition root and call these.
 
 import contextlib
 import copy
+import re
 import threading
 import time
 from collections.abc import Iterable
@@ -23,6 +24,11 @@ from vjmixapp.constants import (
     GRID_LED_OFF,
     GRID_LED_WHITE,
     MAPPER_MAX_MAPPINGS,
+    MAPPING_SO_MIDI_CHANNEL,
+    MAPPING_SO_MIDI_GATE_MAX_MS,
+    MAPPING_SO_MIDI_GATE_MIN_MS,
+    MAPPING_SO_MIDI_GATE_MS,
+    MAPPING_SO_MIDI_NUMBER,
     MIDI_ACTION_MAPPER_ENABLE,
     MIDI_ACTION_MAPPER_MAPPING,
     MIDI_ACTION_MAPPING_TOGGLE,
@@ -31,6 +37,7 @@ from vjmixapp.constants import (
     MIDI_ACTION_SEQ_ROW_ENABLE,
     MIDI_ACTION_SEQ_TOGGLE,
     MIDI_ACTION_TRANSPORT_PLAY,
+    MIDI_KIND_CC,
     MIDI_KIND_NOTE,
     MIDI_LED_BEHAVIOR_PRESS,
     MIDI_LED_BEHAVIOR_STATE,
@@ -59,6 +66,8 @@ from vjmixapp.constants import (
     MIDI_STEP_SIZE,
     NUM_STEPS,
     NUM_TRACKS,
+    SO_IO_DETAIL,
+    SO_MIDI_MESSAGES,
 )
 from vjmixapp.profiles import (
     _DEFAULT_GRID_NOTE_FORMULA,
@@ -1188,6 +1197,126 @@ def stale_ports(open_ports: Iterable[str], live: Iterable[str]) -> list[str]:
     return [port for port in open_ports if port not in live_set]
 
 
+# --- BUG-2026-11-08T183721: a controller keeps its identity across a renumber ---
+# An ALSA port name embeds the DYNAMIC client id (`Launchpad:Launchpad MIDI 1 24:0`),
+# so a replug, a different USB port or a reboot renames the same hardware. The stored
+# role and its bindings would point at a name nobody can open, and every renumber added
+# a second, empty controller. The key is therefore the port STEM, and adoption is
+# SILENT when exactly one live port carries it (operator decision 2026-11-08): two
+# identical devices are never guessed.
+PORT_EXACT = "exact"
+PORT_ADOPTED = "adopted"
+PORT_AMBIGUOUS = "ambiguous"
+PORT_ABSENT = "absent"
+
+_ALSA_ADDRESS_RE = re.compile(r"^(?P<stem>.*?)\s+\d+:\d+$")
+
+
+def port_stem(port_name: str) -> str:
+    """The device's stable key: the port name without the trailing `<client>:<port>`.
+
+    `Launchpad:Launchpad MIDI 1 24:0` -> `Launchpad:Launchpad MIDI 1`. A name with no
+    address (macOS/CoreMIDI) is its own stem, so the key costs nothing there.
+    """
+    name = str(port_name or "")
+    match = _ALSA_ADDRESS_RE.match(name)
+    return match.group("stem") if match else name
+
+
+def resolve_live_port(stored: str, live: Iterable[str]) -> tuple[str | None, str]:
+    """The live port a stored one means now, and why: (port, PORT_*).
+
+    Exact match first. Otherwise the live ports that share the stored stem: exactly
+    one is the same device under a new client id, several are two identical devices
+    (never guessed), none means the device is absent.
+    """
+    names = [str(name) for name in live]
+    stored = str(stored or "")
+    if stored in names:
+        return stored, PORT_EXACT
+    if not stored:
+        return None, PORT_ABSENT
+    stem = port_stem(stored)
+    candidates = [name for name in names if port_stem(name) == stem]
+    if len(candidates) == 1:
+        return candidates[0], PORT_ADOPTED
+    if candidates:
+        return None, PORT_AMBIGUOUS
+    return None, PORT_ABSENT
+
+
+def _rewrite_controller_port(controller: dict[str, Any], old: str, new: str) -> None:
+    """Point the controller and every binding it owns at the adopted port."""
+    controller["port"] = new
+    for field in ("bindings", "auto_bindings"):
+        for binding in controller.get(field) or []:
+            if str(binding.get("device") or "") == old:
+                binding["device"] = new
+
+
+def _binding_identity(binding: dict[str, Any]) -> tuple[Any, ...]:
+    """What makes two bindings the same physical control (params excluded on purpose).
+
+    Two rows on one control with different params are still one press: folding must
+    keep one, never both, or a single pad would fire twice.
+    """
+    return (
+        str(binding.get("type") or ""),
+        int(binding.get("channel") or 0),
+        int(binding.get("number") or 0),
+        str(binding.get("action") or ""),
+    )
+
+
+def _fold_controller_group(port_name: str) -> int:
+    """Collapse the controllers that ended up on one port; returns how many went.
+
+    The role owner survives (else the first), and the twins' bindings are merged
+    without duplicates: a replug must not leave a ghost, and it must not double a
+    pad either.
+    """
+    group = [c for c in midi_controllers if str(c.get("port") or "") == port_name]
+    if len(group) < 2:
+        return 0
+    owner = next((c for c in group if role_sequencer_index(c.get("role")) is not None), group[0])
+    merged = list(owner.get("bindings") or [])
+    seen = {_binding_identity(binding) for binding in merged}
+    for twin in group:
+        if twin is owner:
+            continue
+        for binding in twin.get("bindings") or []:
+            if _binding_identity(binding) in seen:
+                continue
+            seen.add(_binding_identity(binding))
+            merged.append(binding)
+        midi_controllers.remove(twin)
+    owner["bindings"] = merged
+    return len(group) - 1
+
+
+def adopt_controller_ports(live: Iterable[str]) -> list[tuple[str, str, str]]:
+    """Adopt renumbered devices and fold the duplicates (BUG-2026-11-08T183721).
+
+    Returns the ``(stored, live, reason)`` rewrites for the caller to log and
+    persist. Silent by design: nothing is guessed, so an ambiguous stem or an absent
+    device simply stays as it is (the operator still sees it in the window).
+    """
+    names = [str(name) for name in live]
+    actions: list[tuple[str, str, str]] = []
+    for controller in list(midi_controllers):
+        stored = str(controller.get("port") or "")
+        if not stored:
+            continue
+        resolved, reason = resolve_live_port(stored, names)
+        if resolved is None or resolved == stored:
+            continue
+        _rewrite_controller_port(controller, stored, resolved)
+        actions.append((stored, resolved, reason))
+    for port_name in {str(controller.get("port") or "") for controller in list(midi_controllers)}:
+        _fold_controller_group(port_name)
+    return actions
+
+
 def save_midi_controllers(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
     """Persist the controllers list (port, profile, role, per-controller bindings) (e14s03)."""
     cfg = load_config()
@@ -1441,6 +1570,7 @@ def set_midi_enabled(enabled: bool) -> None:
     state.midi_enabled = enabled
     if not enabled:
         disconnect_all_controllers()
+        close_so_outputs()  # e95: a disabled engine keeps no SO device open
     else:
         reconnect_all_controllers()
     cfg = load_config()
@@ -1631,39 +1761,83 @@ def _mapping_wants_output(port_name: str) -> bool:
 
 
 def controller_connect(controller: dict[str, Any], mido: Any) -> None:
-    """Open the controller's LED output, send setup SysEx, register grid bindings (e14s02).
+    """Arm the controller's pads and open its LED output (e14s02).
 
-    e40s01 relaxes the LED-only guard: the output opens when the device declares
-    ``features.leds`` OR a Mapping targets it (the setup SysEx and the grid
-    bindings still need the profile). BUG-2026-09-07T152802: the output-port
-    lookup is INSIDE the guard — with ALSA refusing sequencer clients the lookup
-    raises and must log + disconnect, never escape into the MIDI re-enable UI
-    callback.
+    BUG-2026-11-08T192000: the INPUT comes first and depends on nothing but the
+    profile, the role and the geometry. The LED output used to be opened before the
+    grid bindings were registered, and a missing output port made the whole connect
+    return — after `controller_disconnect` had just emptied the pads. ALSA/rtmidi
+    enumerate an input before its output often enough at boot that the pads stayed
+    dead until a replug ("the pad buttons work only sometimes").
+
+    The output is now an extra: its absence is logged, the pads stay armed, and
+    `retry_controller_output` picks the port up on a later rescan.
     """
     controller_disconnect(controller)
     profile = controller_profile_of(controller)
+    arm_grid_bindings(controller, profile)
+    connect_controller_output(controller, profile, mido)
+
+
+def arm_grid_bindings(controller: dict[str, Any], profile: dict[str, Any] | None) -> int:
+    """Project (role, profile, geometry) onto the grid bindings; returns how many (e67s06).
+
+    Pure arming: no output, no I/O. A controller without a role, without a grid
+    profile or with no pads in the live geometry ends up with NONE armed — the
+    projection is total, so a slot that moved away cannot leave the old device hot
+    (BUG-2026-10-16).
+    """
+    if (
+        profile is None
+        or not profile.get("features", {}).get("grid")
+        or role_sequencer_index(controller.get("role")) is None
+    ):
+        controller["auto_bindings"] = []
+        return 0
+    _register_grid_bindings(controller, profile)
+    armed = len(controller.get("auto_bindings") or [])
+    # e78: say HOW MANY pads are armed. "LEDs work but a press does nothing" is a data
+    # question (0 pads = the role was never projected), and this line answers it.
+    slot = "A" if role_sequencer_index(controller.get("role")) == 0 else "B"
+    append_log("MIDI", f"{controller.get('port')}: grid {slot} - {armed} pads armed")
+    return armed
+
+
+def connect_controller_output(
+    controller: dict[str, Any], profile: dict[str, Any] | None, mido: Any
+) -> bool:
+    """Open the LED/mapping output and send the layout setup; False when it is absent.
+
+    e40s01: the output opens when the device declares ``features.leds`` OR a Mapping
+    targets it. BUG-2026-09-07T152802: the port lookup lives inside this guard — with
+    ALSA refusing sequencer clients the lookup raises and must log, never escape into
+    the caller. A failure never touches the pads (BUG-2026-11-08T192000).
+    """
+    port = str(controller.get("port") or "")
     leds = bool(profile is not None and profile.get("features", {}).get("leds"))
-    if not leds and not _mapping_wants_output(str(controller.get("port") or "")):
-        return
+    if not leds and not _mapping_wants_output(port):
+        return False
     try:
-        out_name = _find_output_port(controller["port"], mido)
+        out_name = _find_output_port(port, mido)
         if out_name is None:
-            return
+            # Once per controller: the rescan retries, and a line per attempt would
+            # drown the Logs window in a device that is simply not there yet.
+            if not controller.get("output_missing_logged"):
+                controller["output_missing_logged"] = True
+                append_log("MIDI", f"{port}: no LED output yet - pads stay armed, retrying")
+            return False
         with _controller_lock:
             controller["output"] = mido.open_output(out_name)
-        # e80: the MK1 family selects its LAYOUT with a CC (not SysEx), so the device always
-        # speaks the note space the profile and the auto bindings are built on.
+        # e80: the MK1 family selects its LAYOUT with a CC (not SysEx), so the device
+        # always speaks the note space the profile and the auto bindings are built on.
         if leds and profile is not None and profile.get("setup_cc"):
-            # e80: the layout selection of the MK1 family is a CONTROL CHANGE, not SysEx.
-            # Forcing it at connect is what makes the pads speak the note space the
-            # profile (and every auto binding) is built on.
             setup_cc = profile["setup_cc"]
             _send_observed(
                 controller["output"],
                 mido.Message(
                     "control_change", control=int(setup_cc["control"]), value=int(setup_cc["value"])
                 ),
-                str(controller.get("port") or "?"),
+                port or "?",
                 "cc",
                 int(setup_cc["control"]),
                 int(setup_cc["value"]),
@@ -1674,32 +1848,37 @@ def controller_connect(controller: dict[str, Any], mido: Any) -> None:
             _send_observed(
                 controller["output"],
                 mido.Message("sysex", data=setup),
-                str(controller.get("port") or "?"),
+                port or "?",
                 "sysex",
                 0,
                 0,
                 f"controller setup ({len(setup)} bytes)",
             )
-        if (
-            leds
-            and profile is not None
-            and role_sequencer_index(controller.get("role")) is not None
-            and profile.get("features", {}).get("grid")
-        ):
-            _register_grid_bindings(controller, profile)
-            # e78: say HOW MANY pads are armed. "LEDs work but a press does nothing" is a
-            # data question (0 pads = the role was never projected), and this line answers it.
-            slot = "A" if role_sequencer_index(controller.get("role")) == 0 else "B"
-            append_log(
-                "MIDI",
-                f"{controller.get('port')}: grid {slot} - "
-                f"{len(controller.get('auto_bindings') or [])} pads armed",
-            )
-        name = profile.get("name", controller["port"]) if profile else controller["port"]
+        controller.pop("output_missing_logged", None)
+        name = profile.get("name", port) if profile else port
         append_log("MIDI", f"{name} output on {out_name}")
+        return True
     except Exception as e:
-        log_error("MIDI", f"output {controller['port']}: {e}")
-        controller_disconnect(controller)
+        log_error("MIDI", f"output {port}: {e}")
+        with _controller_lock:
+            controller["output"] = None
+        return False
+
+
+def retry_controller_output(controller: dict[str, Any], mido: Any) -> bool:
+    """Open a controller's output that was not there when it connected (BUG-2026-11-08T192000).
+
+    Called on the worker's port rescan: a controller whose input is open but whose
+    LED output never materialised gets another chance, and the pads are untouched
+    because nothing here disconnects.
+    """
+    if controller.get("output") is not None:
+        return False
+    profile = controller_profile_of(controller)
+    leds = bool(profile is not None and profile.get("features", {}).get("leds"))
+    if not leds and not _mapping_wants_output(str(controller.get("port") or "")):
+        return False
+    return connect_controller_output(controller, profile, mido)
 
 
 def controller_disconnect(controller: dict[str, Any]) -> None:
@@ -1814,6 +1993,144 @@ def send_mapping_midi(
         return True
     except Exception as e:
         log_error("MIDI", f"mapping output {controller.get('port')}: {e}")
+        return False
+
+
+# e95: the SO MIDI egress. One cached output per DEVICE NAME, because the SO
+# may target any port, not only a configured controller; a controller output is
+# reused when the name matches (some backends refuse a second open). Only the
+# outputs VJmix opened itself are closed by the lifecycle helpers.
+_so_outputs: dict[str, Any] = {}
+_so_owned: set[str] = set()
+
+
+def so_output(device: str) -> Any | None:
+    """The output port for an SO device, opening and caching it on first use (e95).
+
+    Returns None for an empty name or a failing open; never raises. A configured
+    controller's open output is reused rather than reopened.
+    """
+    name = str(device or "").strip()
+    if not name:
+        return None
+    for controller in midi_controllers:
+        if str(controller.get("port") or "") != name:
+            continue
+        output = controller.get("output")
+        if output is not None:
+            _so_outputs.setdefault(name, output)  # not owned: the controller closes it
+            return output
+    cached = _so_outputs.get(name)
+    if cached is not None:
+        return cached
+    import mido
+
+    with _controller_lock:
+        output = mido.open_output(name)
+        _so_outputs[name] = output
+        _so_owned.add(name)
+    return output
+
+
+def close_so_outputs() -> None:
+    """Close and forget every SO output VJmix opened itself (e95).
+
+    A reused controller output is left alone: its owner closes it when the
+    controller disconnects.
+    """
+    for name in list(_so_outputs):
+        if name not in _so_owned:
+            continue
+        output = _so_outputs.pop(name)
+        _so_owned.discard(name)
+        with contextlib.suppress(Exception):
+            output.close()
+    _so_outputs.clear()
+    _so_owned.clear()
+
+
+def prune_so_outputs(live_names: Iterable[str]) -> None:
+    """Drop cached SO outputs whose port vanished from the live device list (e95)."""
+    live = set(live_names)
+    for name in list(_so_outputs):
+        if name in live:
+            continue
+        output = _so_outputs.pop(name)
+        if name in _so_owned:
+            _so_owned.discard(name)
+            with contextlib.suppress(Exception):
+                output.close()
+
+
+def _schedule_note_off(device: str, channel: int, number: int, gate_ms: int) -> None:
+    """Release an SO note after its gate, off the beat thread (e95)."""
+    threading.Timer(gate_ms / 1000.0, _so_note_off, args=(device, channel, number)).start()
+
+
+def _so_note_off(device: str, channel: int, number: int) -> None:
+    """Send one SO note release on the cached output; best-effort (e95)."""
+    output = _so_outputs.get(device)
+    if output is None:
+        return
+    try:
+        import mido
+
+        _send_observed(
+            output,
+            mido.Message("note_off", channel=channel, note=number, velocity=0),
+            device,
+            "note off",
+            number,
+            0,
+            SO_IO_DETAIL,
+        )
+    except Exception:
+        pass  # defensive: a release must never break the Timer thread
+
+
+def send_secondary_output_midi(spec: Any, value: int) -> bool:
+    """Send one SO value to its MIDI device; False when nothing was sent (e95).
+
+    Respects the engine switch (a disabled MIDI engine opens nothing), clamps
+    every field into the MIDI ranges and never raises. A Note sends its release
+    after the spec's gate, so a step can never leave a stuck note.
+    """
+    if not state.midi_enabled or not isinstance(spec, dict):
+        return False
+    device = str(spec.get("device") or "").strip()
+    if not device:
+        return False
+    channel = max(0, min(15, int(spec.get("channel", MAPPING_SO_MIDI_CHANNEL))))
+    number = max(0, min(127, int(spec.get("number", MAPPING_SO_MIDI_NUMBER))))
+    velocity = max(0, min(127, int(value)))
+    gate = int(
+        max(
+            MAPPING_SO_MIDI_GATE_MIN_MS,
+            min(MAPPING_SO_MIDI_GATE_MAX_MS, int(spec.get("gate", MAPPING_SO_MIDI_GATE_MS))),
+        )
+    )
+    msg = str(spec.get("msg") or MIDI_KIND_CC)
+    if msg not in SO_MIDI_MESSAGES:
+        msg = MIDI_KIND_CC
+    try:
+        import mido
+
+        output = so_output(device)
+        if output is None:
+            return False
+        if msg == MIDI_KIND_NOTE:
+            message = mido.Message("note_on", channel=channel, note=number, velocity=velocity)
+            _send_observed(output, message, device, "note", number, velocity, SO_IO_DETAIL)
+            _schedule_note_off(device, channel, number, gate)
+        else:
+            message = mido.Message(
+                "control_change", channel=channel, control=number, value=velocity
+            )
+            _send_observed(output, message, device, "cc", number, velocity, SO_IO_DETAIL)
+        return True
+    except Exception as e:
+        _so_outputs.pop(device, None)
+        log_error("MIDI", f"secondary output {device}: {e}")
         return False
 
 

@@ -123,6 +123,13 @@ def load_config() -> dict[str, Any]:
         section = merged.get(block)
         if isinstance(section, dict):
             section.pop("enabled", None)
+    # e98s05: VJmix has no OSC listener any more, so its bind pair is dead state.
+    # Stripped on load (like `handtrack.enabled`), so the file self-cleans on the
+    # next save instead of keeping two keys that do nothing.
+    osc_section = merged.get("osc")
+    if isinstance(osc_section, dict):
+        for dead in ("listen_ip", "listen_port"):
+            osc_section.pop(dead, None)
     # e11s02: drop unknown top-level keys (the legacy "layout" block) so a stale
     # config file self-cleans on the next save instead of carrying dead state.
     return {key: merged[key] for key in DEFAULT_CONFIG}

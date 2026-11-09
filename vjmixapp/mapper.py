@@ -16,6 +16,7 @@ from vjmixapp import (
     bodytrack,
     catalog,
     handtrack,
+    secondary,
     shadercode,
     sourcekind,
     sourcestatus,
@@ -34,6 +35,8 @@ from vjmixapp.constants import (
     IO_MONITOR_OUTCOME_HOLD,
     IO_MONITOR_OUTCOME_MUTED,
     IO_MONITOR_OUTCOME_SENT,
+    MAPPER_IO_LED_S,
+    MAPPER_IO_RX_EPSILON,
     MAPPER_MAX_MAPPINGS,
     MAPPER_PERSISTED_KEYS,
     MAPPING_DEFAULT_CADENCE_MS,
@@ -49,7 +52,7 @@ from vjmixapp.constants import (
     ORIGIN_STATE,
     ORIGINS,
 )
-from vjmixapp.osc import osc_client, sanitize_secondary_output, send_secondary_output
+from vjmixapp.osc import osc_client, sanitize_secondary_output
 from vjmixapp.queues import log_error
 
 # Property catalog: single-float vimix source attributes usable with a
@@ -1149,6 +1152,10 @@ def restore_mappings(
 def remove_mapping(mapping_id: int) -> None:
     """Remove a mapping by id; unknown ids are a no-op (e16s01)."""
     state.mapper_mappings[:] = [m for m in state.mapper_mappings if m["id"] != mapping_id]
+    # e96: a removed card must not leave a lit I/O square behind.
+    state.mapping_io_in_until.pop(int(mapping_id), None)
+    state.mapping_io_out_until.pop(int(mapping_id), None)
+    state.mapping_io_last_in.pop(int(mapping_id), None)
 
 
 # e51s02: the Mapper clipboard (Copy/Cut/Paste) and in-line moves. The clipboard
@@ -1363,6 +1370,78 @@ def line_number(target_id: str) -> int | None:
     return targets.index(target_id) + 1
 
 
+# e97: compact cards are packed TWO per 150x72 cell, because the row height is
+# pinned at 72 px by the 110x70 row thumbnail. Sliders stack (two 150x35 cards),
+# knob/button pairs sit side by side (two 75x72 cards), a cue list owns its cell
+# (its opener + progress need the width) and so does a FULL (non-compact) card.
+MAPPER_PACK_CLASSES: dict[str, str] = {
+    "slider": "v",
+    "knob": "h",
+    "button": "h",
+    "cue list": "s",
+}
+_HALF_SLOTS: dict[str, tuple[str, str]] = {"v": ("v0", "v1"), "h": ("h0", "h1")}
+
+
+def compact_cells(
+    mappings: list[dict[str, Any]], compact_ids: set[int] | None = None
+) -> list[list[tuple[dict[str, Any], str]]]:
+    """Group one row's mappings into 150x72 compact CELLS (e97).
+
+    Consecutive mappings of the same packing class share a cell — sliders are
+    stacked (`v0` above `v1`), knob/button pairs sit side by side (`h0` left,
+    `h1` right). A class change, a cue list and a NON-compact card break the
+    run: they take a whole cell with the `full` slot. An odd half run leaves the
+    other half of its cell empty on purpose (the grid never reflows, so the
+    columns stay aligned across lines). The input list is never mutated.
+    """
+    ids = compact_ids if compact_ids is not None else {int(m["id"]) for m in mappings}
+    cells: list[list[tuple[dict[str, Any], str]]] = []
+    run_class = ""
+    run: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        if not run:
+            return
+        first, second = _HALF_SLOTS[run_class]
+        for index in range(0, len(run), 2):
+            cell = [(run[index], first)]
+            if index + 1 < len(run):
+                cell.append((run[index + 1], second))
+            cells.append(cell)
+        run.clear()
+
+    for mapping in mappings:
+        control = str(mapping.get("control") or "")
+        cls = MAPPER_PACK_CLASSES.get(control, "s")
+        if int(mapping.get("id", -1)) not in ids:
+            cls = "full"
+        if cls in ("s", "full"):
+            flush()
+            run_class = ""
+            cells.append([(mapping, "full")])
+            continue
+        if cls != run_class:
+            flush()
+            run_class = cls
+        run.append(mapping)
+    flush()
+    return cells
+
+
+def compact_lines(
+    mappings: list[dict[str, Any]], compact_ids: set[int] | None, per_line: int
+) -> list[list[list[tuple[dict[str, Any], str]]]]:
+    """Chunk the compact CELLS of one row into visual lines (e97).
+
+    `per_line` is the cell capacity the window allows (the same number the full
+    layout uses), so a line holds twice the mappings it used to.
+    """
+    cells = compact_cells(mappings, compact_ids)
+    per = max(1, int(per_line))
+    return [cells[index : index + per] for index in range(0, len(cells), per)]
+
+
 def row_slots(card_count: int, per_line: int) -> list[list[int]]:
     """Visual-line groups of one mapper row's CARDS (e34s01).
 
@@ -1508,14 +1587,63 @@ def reset_mapping_value(mapping_id: int) -> float:
     return mapping["value"]
 
 
+def _pulse(mapping: dict[str, Any], store: dict[int, float]) -> None:
+    """Light one I/O square for MAPPER_IO_LED_S (e96). Worker-safe, HIGH-1.
+
+    A DEADLINE, not a last-seen stamp: the main-loop tick only compares
+    `now < deadline`, so it never needs the pulse length. Unknown ids are a
+    silent no-op.
+    """
+    mid = mapping.get("id")
+    if mid is None:
+        return
+    store[int(mid)] = time.monotonic() + MAPPER_IO_LED_S
+
+
+def pulse_in(mapping: dict[str, Any], raw: float, *, force: bool = False) -> None:
+    """The Mapping RECEIVED a NEW value from a source (e96).
+
+    Even one it holds or cannot send: RX on / TX dark is the diagnosis the
+    operator asked for. A value identical to the previous one is NOT movement —
+    an attached band drives the Mapping ~30x/s even in silence, so an
+    unconditional stamp would keep the square permanently lit (operator report
+    2026-11-07). The threshold scales with the input window, so 0..1 bands read
+    micro-jitter as silence while one MIDI step always counts.
+
+    `force` is the PRESS path: a note-on re-sent at the same velocity is a new
+    event (the square must pulse on every hit), not a re-read.
+    """
+    mid = mapping.get("id")
+    if mid is None:
+        return
+    previous = state.mapping_io_last_in.get(int(mid))
+    state.mapping_io_last_in[int(mid)] = float(raw)
+    if previous is not None and not force:
+        window = _input_window(
+            float(mapping.get("input_from") or 0.0), float(mapping.get("input_to") or 1.0)
+        )
+        span = (window[1] - window[0]) or 1.0
+        if abs(float(raw) - previous) <= MAPPER_IO_RX_EPSILON * span:
+            return
+    _pulse(mapping, state.mapping_io_in_until)
+
+
+def pulse_out(mapping: dict[str, Any]) -> None:
+    """The Mapping EMITTED (primary Destination and/or SO, e96): one lamp."""
+    _pulse(mapping, state.mapping_io_out_until)
+
+
 def _send(mapping: dict[str, Any], *, force: bool = False) -> None:
     """Send the primary Destination, then mirror it to the Mapping's SO (e92).
 
     The SO only fires when the primary actually emitted, so a muted Mapping, an
     unresolved/blocked uniform, `set current` and a cue-list card never mirror.
+    e96: a REAL emission pulses the card's TX square (before the SO mirror, so
+    the pair costs one lamp, not two).
     """
     if not _send_primary(mapping, force=force):
         return
+    pulse_out(mapping)
     send_mapping_secondary_output(mapping)
 
 
@@ -1531,7 +1659,7 @@ def send_mapping_secondary_output(mapping: dict[str, Any]) -> bool:
     spec = mapping.get("secondary_output")
     if not isinstance(spec, dict) or not spec.get("enabled", True):
         return False
-    return send_secondary_output(
+    return secondary.send_so(
         spec,
         float(mapping["value"]),
         float(mapping["output_from"]),
@@ -1933,22 +2061,26 @@ def apply_input_value(mapping_id: int, raw: float, source_type: str = "") -> flo
     mapping = find_mapping(mapping_id)
     if mapping is None:
         return 0.0
+    # e96: ANY arrival pulses RX — including the HOLD and MUTED branches below.
+    pulse_in(mapping, raw)
     if is_momentary_button(mapping):
         # e77: a momentary button treats a source edge exactly like a click.
         if not _press_matches(mapping, raw, source_type):
             return float(mapping["value"])  # release / not my press: hold
+        pulse_in(mapping, raw, force=True)  # a press is an event, even at the same velocity
         return send_button_mapping(mapping_id)
     if toggle_on_press(mapping, source_type):
         if not _press_matches(mapping, raw, source_type):
             return float(mapping["value"])  # not my press value: hold
+        pulse_in(mapping, raw, force=True)  # every press is an event
         return _send_toggled(mapping_id)
     unit = _raw_unit(mapping, raw)
     if unit is None:
         return float(mapping["value"])  # outside my window: hold (zone ownership)
-    return apply_unit_value(mapping_id, unit)
+    return apply_unit_value(mapping_id, unit, inbound=False)
 
 
-def apply_unit_value(mapping_id: int, unit: float) -> float:
+def apply_unit_value(mapping_id: int, unit: float, *, inbound: bool = True) -> float:
     """Drive a mapping from a clamped 0..1 unit value (e18).
 
     e23: the unit is rescaleped onto the mapping's OUTPUT range, stored on the
@@ -1959,6 +2091,11 @@ def apply_unit_value(mapping_id: int, unit: float) -> float:
     mapping = find_mapping(mapping_id)
     if mapping is None:
         return 0.0
+    # e96: a direct unit drive is an arrival too (RX; TX comes from _send).
+    # `apply_input_value` stamps its RAW value and passes inbound=False here, so
+    # one drive never counts as two arrivals on two different scales.
+    if inbound:
+        pulse_in(mapping, unit)
     value = _rescaled_unit_value(mapping, unit)
     mapping["value"] = value
     _send(mapping)

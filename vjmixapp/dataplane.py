@@ -21,6 +21,7 @@ from vjmixapp.constants import (
     INTEREST_PATH,
     STATE_PATH,
     THUMB_PATH_PREFIX,
+    THUMB_REGEN_PATH,
 )
 
 
@@ -148,3 +149,32 @@ def fetch_state(host: str, port: int) -> tuple[str | None, bool]:
     """
     text, answered, _status = fetch_state_ex(host, port)
     return text, answered
+
+
+def thumb_regen_url(host: str, port: int) -> str:
+    """HTTP URL of the thumbnail regeneration resource (e98s05)."""
+    return f"http://{host}:{port}{THUMB_REGEN_PATH}"
+
+
+def post_thumb_regen(host: str, port: int, source: str) -> tuple[dict | None, int | None]:
+    """POST /thumb/regen -> (report, status); never raises.
+
+    The only regen path since 1.0: the OSC ``/viosc/regen_thumb`` lane is gone,
+    so a failure here is a tile that keeps its old frame, not a fallback.
+    """
+    if not host or not port:
+        return None, None
+    body = json.dumps({"source": str(source)}).encode("utf-8")
+    request = urllib.request.Request(
+        thumb_regen_url(host, port),
+        data=body,
+        headers={**pairing.http_headers(), "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=DATA_PLANE_TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8")), resp.status
+    except urllib.error.HTTPError as e:
+        return None, e.code
+    except Exception:
+        return None, None

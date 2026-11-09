@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import random  # noqa: F401 — module attribute (test harness patches vjmix.random)
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -17,9 +18,8 @@ import essentia
 import numpy as np
 import sounddevice as sd
 from PIL import Image
-from pythonosc import dispatcher, udp_client
 
-import vjmixapp  # noqa: F401  scaffold hook (REFACTOR_LATEST.md commit 1): proves the package import path works at boot
+import vjmixapp  # scaffold hook: the package path must resolve at boot
 from vjmixapp import (
     actions,
     bodyio,
@@ -146,6 +146,7 @@ from vjmixapp.constants import (
     IO_MONITOR_TRANSPORT_MIDI,
     IO_MONITOR_TRANSPORT_OSC,
     LAYOUT_WINDOW_TAGS,
+    LEGACY_LINK_PORTS,
     LOG_HISTORY_LIMIT,
     MAP_ACTIONS_ROWS_TAG,
     MAP_ACTIONS_WINDOW_TAG,
@@ -171,6 +172,8 @@ from vjmixapp.constants import (
     MAPPER_MAX_MAPPINGS,
     MAPPER_MINI_W,
     MAPPER_MOMENTARY_FLASH_S,
+    MAPPER_NEW_H,
+    MAPPER_NEW_W,
     MAPPER_PASTE_SLOT_W,
     MAPPER_PASTE_W,
     MAPPER_RESET_H,
@@ -200,6 +203,13 @@ from vjmixapp.constants import (
     MAPPING_SO_DEFAULT_ADDRESS,
     MAPPING_SO_DEFAULT_HOST,
     MAPPING_SO_DEFAULT_PORT,
+    MAPPING_SO_DEFAULT_TRANSPORT,
+    MAPPING_SO_MIDI_CHANNEL,
+    MAPPING_SO_MIDI_GATE_MAX_MS,
+    MAPPING_SO_MIDI_GATE_MIN_MS,
+    MAPPING_SO_MIDI_GATE_MS,
+    MAPPING_SO_MIDI_NUMBER,
+    MAPPING_SO_MIDI_SCALE_TO,
     MAPPING_STEPS_CONTINUOUS,
     MAPPING_TICK_INTERVAL_S,
     MARKER_GROUP_GAP,
@@ -242,6 +252,7 @@ from vjmixapp.constants import (
     MIDI_ACTION_MAPPER_BAND,
     MIDI_ACTION_MAPPER_CUE_OPEN,
     MIDI_ACTION_MAPPER_ENABLE,
+    MIDI_ACTION_MAPPER_IO_LEDS,
     MIDI_ACTION_MAPPER_LINE,
     MIDI_ACTION_MAPPER_MAPPING,
     MIDI_ACTION_MAPPER_RESET,
@@ -323,7 +334,6 @@ from vjmixapp.constants import (
     ORIGIN_CONST,
     ORIGIN_CONTROL,
     ORIGIN_STATE,
-    PREVIEW_PORT,
     PREVIEW_SPEED_DEFAULT,
     PREVIEW_SPEED_MAX,
     PREVIEW_SPEED_MIN,
@@ -384,6 +394,7 @@ from vjmixapp.constants import (
     SHADER_WINDOW_PADDING,
     SHADER_WINDOW_TAG,
     SHADER_WINDOW_WIDTH,
+    SO_MIDI_MESSAGES,
     SOURCES_DATA_BUTTON_TAG,
     SOURCES_DATA_GROUP_TAG,
     SOURCES_DATA_LEARN_SLOT,
@@ -447,7 +458,6 @@ from vjmixapp.constants import (
     TRANSPORT_ROW_SIDE_PAD,
     VIMIX_MEDIA_WINDOW_W,
     VIOSC_IP,
-    VIOSC_LISTEN_PORT,
     VIOSC_PORT,
 )
 from vjmixapp.leap import (
@@ -466,6 +476,7 @@ from vjmixapp.midi import (
     _close_midi_input,
     _parse_midi_msg,
     add_mode,
+    adopt_controller_ports,
     apply_project_mapper_bindings,
     apply_project_mode_bindings,
     available_controller_ports,
@@ -508,6 +519,7 @@ from vjmixapp.midi import (
     resolve_midi_message,  # noqa: F401 — facade re-export (REFACTOR_LATEST contract)
     resolve_midi_message_report,
     restore_mode_defs,
+    retry_controller_output,
     role_sequencer_index,
     save_midi_controllers,
     scan_midi_inputs,
@@ -524,17 +536,12 @@ from vjmixapp.midi import (
 )
 from vjmixapp.osc import (
     ALL_PROPERTIES,
-    VjmixOSCUDPServer,
     find_source_by_name,
     get_current_target_id,
-    incoming_osc_handler,
     next_thumb_frame_index,
     osc_client,
-    request_thumbnail_over_osc,
     sanitize_secondary_output,
     send_mapping_osc,
-    send_secondary_output,
-    size_receive_buffer,
     state_poll_worker,
     thumbnail_decoder_worker,
     thumbnail_fetch_worker,
@@ -569,6 +576,7 @@ from vjmixapp.queues import (
     log_warn,
     ui_task,
 )
+from vjmixapp.secondary import send_so
 from vjmixapp.sequencer import (
     _timed_bpm_live,
     advance_fade,
@@ -656,7 +664,7 @@ Image.MAX_IMAGE_PIXELS = 25_000_000  # PIL's hard ceiling (~25 MP)
 # 0.4.0 — Leap Motion mapper source, per-mapping reset, project save + OSC config persist,
 # Mapper tile/row workflows (thumb assign, Add-to-Mapper submenu, line numbers).
 # 0.3.0 — Mapper family (rows/rescale/enable/cycle), compact Vimix-sources grid, windows, XDG.
-APP_VERSION: str = "1.2.1"
+APP_VERSION: str = "1.3.0"
 
 # The VJmix project repository, shown as a link in the Info window (e08s01; retargeted from the
 # author's profile to the project by e08s03, user request).
@@ -1112,9 +1120,22 @@ def _restore_track(row: int, track_data: dict[str, Any]) -> None:
 
 
 def _apply_audio_state(audio: dict[str, Any]) -> None:
-    """Re-apply the audio-analyzer section (device, low-pass, bands) (e11s01)."""
-    if audio.get("device") in input_devices_list:
-        dpg.set_value("combo_devices", audio["device"])
+    """Re-apply the audio-analyzer section (device, low-pass, bands) (e11s01).
+
+    BUG-2026-11-07T150000: a stored device is healed by NAME (a PortAudio index
+    shift used to drop it silently, leaving an unroutable raw device selected);
+    a device that no longer exists is reported instead of ignored.
+    """
+    stored = str(audio.get("device") or "")
+    if stored:
+        resolved = resolve_input_device(stored)
+        if resolved is None:
+            log_warn(
+                "Audio",
+                f"project input device {stored!r} is not available; keeping the current one",
+            )
+        else:
+            dpg.set_value("combo_devices", resolved)
     state.lowpass_enabled = bool(audio.get("lowpass", True))
     if dpg.does_item_exist("cb_lowpass"):
         dpg.set_value("cb_lowpass", state.lowpass_enabled)
@@ -1879,6 +1900,10 @@ def apply_boot_config() -> None:
     apply_hover_help(state.hover_help)  # drop the cards built at import when it is off
     if dpg.does_item_exist("help_hover_cb"):
         dpg.set_value("help_hover_cb", state.hover_help)
+    state.mapper_io_leds = mapper_io_leds_enabled(cfg)  # e96: display preference
+    if dpg.does_item_exist("mapper_io_leds_cb"):
+        dpg.set_value("mapper_io_leds_cb", state.mapper_io_leds)
+    apply_audio_device_preference()  # BUG-2026-11-07T150000: the remembered input
     linkengine.start_link_thread()  # e75: the Ableton Link session (optional dependency)
     if dpg.does_item_exist("midi_enable_cb"):
         # The MIDI window is built before the config loads, so the Enable checkbox
@@ -1906,8 +1931,6 @@ def apply_boot_config() -> None:
     for tag, value in (
         ("viosc_ip", endpoints["client_ip"]),
         ("viosc_port", endpoints["client_port"]),
-        ("listen_ip", endpoints["listen_ip"]),
-        ("listen_port", endpoints["listen_port"]),
     ):
         if dpg.does_item_exist(tag):
             dpg.set_value(tag, value)
@@ -2053,10 +2076,79 @@ BAND_DEFAULT_RANGES = {
 # e10s04: consecutive unanswered thumb requests per source -> failed tile state
 
 
+# BUG-2026-11-07T150000: the SESSION MIXER is the only routable input. A capture
+# stream on a raw ALSA device never appears in PipeWire/PulseAudio, so there is no
+# node to route audio into and the analyzer is deaf. These names are listed first,
+# which makes the combo's default choice the one that works.
+SESSION_MIXER_DEVICE_NAMES: tuple[str, ...] = ("pulse", "pipewire")
+
+
+def _device_name(device_string: str) -> str:
+    """The NAME of an 'INDEX: name' combo entry (the part an index shift keeps)."""
+    _index, sep, name = str(device_string).partition(":")
+    return name.strip() if sep else str(device_string).strip()
+
+
 def get_input_devices() -> list[str]:
+    """Input devices for the combo, session mixer FIRST (BUG-2026-11-07T150000).
+
+    Every input is offered, but the `pulse`/`pipewire` entries come first: only
+    they create the named `vjmix-capture` node the operator routes audio into.
+    Each entry keeps its PortAudio index, so a stored "INDEX: name" string keeps
+    its meaning (and `resolve_input_device` heals a shifted index by name).
+    """
     devices = sd.query_devices()
     inputs = [f"{i}: {d['name']}" for i, d in enumerate(devices) if d["max_input_channels"] > 0]
-    return inputs if inputs else ["No input device found"]
+    if not inputs:
+        return ["No input device found"]
+    mixer = [entry for entry in inputs if _device_name(entry) in SESSION_MIXER_DEVICE_NAMES]
+    return mixer + [entry for entry in inputs if entry not in mixer]
+
+
+def resolve_input_device(device_string: str, available: list[str] | None = None) -> str | None:
+    """The live combo entry for a stored device, healing an index shift by NAME.
+
+    Exact match first (the stored string is unchanged when the order is), then
+    the same NAME at its new index. None when the device is gone.
+    """
+    entries = input_devices_list if available is None else available
+    text = str(device_string or "")
+    if not text or "No input device" in text:
+        return None
+    if text in entries:
+        return text
+    name = _device_name(text)
+    for entry in entries:
+        if "No input device" in entry:
+            continue
+        if _device_name(entry) == name:
+            return entry
+    return None
+
+
+def apply_audio_device_preference() -> None:
+    """Boot: point the analyzer at the remembered device (rig setting, e28s04 class).
+
+    The device is the machine's input, not the show's content, so it lives in
+    the app config beside the OSC endpoints; a project that carries `audio.device`
+    still wins because `_apply_audio_state` runs later.
+    """
+    stored = str(load_config().get("ui", {}).get("audio_device") or "")
+    if not stored:
+        return
+    resolved = resolve_input_device(stored)
+    if resolved is None:
+        log_warn("Audio", f"stored input device {stored!r} is not available; keeping the default")
+        return
+    if dpg.does_item_exist("combo_devices"):
+        dpg.set_value("combo_devices", resolved)
+
+
+def on_audio_device(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """The analyzer's device combo: remember the choice for the next run (rig setting)."""
+    cfg = load_config()
+    cfg.setdefault("ui", {})["audio_device"] = str(app_data)
+    save_config(cfg)
 
 
 def flash_led(tag: str) -> None:
@@ -2350,7 +2442,7 @@ def _on_paste_key(sender: Any, app_data: Any, user_data: Any) -> None:
         on_paste_shortcut(sender, app_data, user_data)
 
 
-INPUT_WIDGET_TAGS = ("manual_bpm_input", "viosc_ip", "viosc_port", "listen_ip", "listen_port")
+INPUT_WIDGET_TAGS = ("manual_bpm_input", "viosc_ip", "viosc_port")
 
 
 def _any_input_focused() -> bool:
@@ -2511,8 +2603,13 @@ def _render_step_so_marker(
         _style_trigger_theme(tag, True)
     else:
         dpg.bind_item_theme(tag, theme_so_muted)
+    transport = (
+        str(spec.get("transport") or MAPPING_SO_DEFAULT_TRANSPORT)
+        if isinstance(spec, dict)
+        else MAPPING_SO_DEFAULT_TRANSPORT
+    )
     with dpg.tooltip(tag, delay=HELP_HOVER_DELAY_S) as tip_tag:
-        dpg.add_text("Secondary OSC output")
+        dpg.add_text("Secondary MIDI output" if transport == "midi" else "Secondary OSC output")
     dpg.bind_item_theme(tip_tag, HELP_THEME_TOOLTIP)
 
 
@@ -3061,9 +3158,8 @@ def on_tile_context_click(sender: Any = None, app_data: Any = None, user_data: A
 
 def regen_thumb_callback(sender: Any, app_data: Any, user_data: Any) -> None:
     target_id = user_data
-    if state.viosc_client:
-        msg_addr = f"/viosc/regen_thumb/{target_id}"
-        state.viosc_client.send_message(msg_addr, [])
+    if state.dataplane_host and state.dataplane_port:
+        dataplane.post_thumb_regen(state.dataplane_host, state.dataplane_port, target_id)
 
     with dpg.mutex():
         tex_tags = thumbnails_data.pop(target_id, None)
@@ -3594,17 +3690,16 @@ def request_missing_thumbnails(now: float) -> None:
         last_thumb = request_timestamps.get(f"thumb_{target_id}", 0)
         if now - last_thumb <= THUMB_REQUEST_INTERVAL:
             continue
-        if state.thumb_http_supported is False:
-            request_thumbnail_over_osc(target_id, frame_index)
-        else:
-            state.thumb_fetch_queue.put((target_id, frame_index))
+        state.thumb_fetch_queue.put((target_id, frame_index))
         request_timestamps[f"thumb_{target_id}"] = now
         if received == 0:
             # nothing has arrived yet: keep the e10s04 retry/failure accounting
             thumb_fail_count[target_id] = thumb_fail_count.get(target_id, 0) + 1
             if thumb_fail_count[target_id] == THUMB_FAIL_THRESHOLD:
-                regen_addr = f"/viosc/regen_thumb/{target_id}"
-                state.viosc_client.send_message(regen_addr, [])
+                if state.dataplane_host and state.dataplane_port:
+                    dataplane.post_thumb_regen(
+                        state.dataplane_host, state.dataplane_port, target_id
+                    )
                 _show_failed_tile_label(target_id)
         else:
             thumb_frames_at_last_request[target_id] = received
@@ -4189,12 +4284,14 @@ _preview_error_shown = False
 
 
 def _preview_endpoints(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Effective preview endpoint: host follows the OSC client (the viOSC
-    machine, machine A), port from cfg['preview'] (default PREVIEW_PORT)."""
+    """The preview endpoint IS the link endpoint (e98s05: one port).
+
+    Before 1.0 the preview had its own port in `cfg['preview']`; since the HTTP
+    surface carries both, a second setting could only drift. The kept function
+    shape lets every caller keep calling it.
+    """
     osc = _osc_endpoints_from_config(cfg)
-    raw = cfg.get("preview")
-    pcfg = raw if isinstance(raw, dict) else {}
-    return {"host": osc["client_ip"], "port": int(pcfg.get("port") or PREVIEW_PORT)}
+    return {"host": osc["client_ip"], "port": int(osc["client_port"])}
 
 
 def _source_props(target_id: str) -> dict[str, Any] | None:
@@ -4631,28 +4728,6 @@ def tick_source_preview(_now: float) -> None:
         )
 
 
-def start_osc_server(ip: str, port: int) -> bool:
-    """Start the local OSC listening server (main thread); True when it is up."""
-    if state.is_server_running:
-        return True
-    try:
-        disp = dispatcher.Dispatcher()
-        disp.set_default_handler(incoming_osc_handler)
-        state.local_osc_server = VjmixOSCUDPServer((ip, port), disp)
-        size_receive_buffer(getattr(state.local_osc_server, "socket", None))
-        state.local_server_thread = threading.Thread(
-            target=state.local_osc_server.serve_forever, daemon=True
-        )
-        state.local_server_thread.start()
-        state.is_server_running = True
-        dpg.set_item_label("btn_server_toggle", "Stop Server")
-        dpg.set_value("server_status", f"Server Status: Listening on {ip}:{port}")
-        return True
-    except Exception as e:
-        dpg.set_value("server_status", f"Server Status: ERROR ({e})")
-        return False
-
-
 def _osc_endpoints_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
     """The effective OSC endpoints: cfg['osc'] merged over the constants (e28s04)."""
     raw = cfg.get("osc")
@@ -4660,16 +4735,12 @@ def _osc_endpoints_from_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return {
         "client_ip": str(osc_cfg.get("client_ip") or VIOSC_IP),
         "client_port": int(osc_cfg.get("client_port") or VIOSC_PORT),
-        "listen_ip": str(osc_cfg.get("listen_ip") or VIOSC_IP),
-        "listen_port": int(osc_cfg.get("listen_port") or VIOSC_LISTEN_PORT),
     }
 
 
 def persist_osc_endpoints(
     client_ip: str | None = None,
     client_port: int | None = None,
-    listen_ip: str | None = None,
-    listen_port: int | None = None,
 ) -> None:
     """Persist OSC endpoint fields into cfg['osc'] (e28s04); None leaves a field."""
     cfg = load_config()
@@ -4678,46 +4749,139 @@ def persist_osc_endpoints(
         osc["client_ip"] = client_ip
     if client_port is not None:
         osc["client_port"] = client_port
-    if listen_ip is not None:
-        osc["listen_ip"] = listen_ip
-    if listen_port is not None:
-        osc["listen_port"] = listen_port
     save_config(cfg)
 
 
-def toggle_local_server() -> None:
-    if state.is_server_running:
-        if state.local_osc_server and state.local_server_thread is not None:
-            state.local_osc_server.shutdown()
-            state.local_server_thread.join(timeout=1.0)
-            state.local_osc_server = None
-        state.is_server_running = False
-        dpg.set_item_label("btn_server_toggle", "Start Server")
-        dpg.set_value("server_status", "Server Status: Stopped")
-    else:
-        ip = str(dpg.get_value("listen_ip"))
-        port = int(dpg.get_value("listen_port"))
-        if start_osc_server(ip, port):
-            persist_osc_endpoints(listen_ip=ip, listen_port=port)  # e28s04
+LINK_MIN_VIOSC_VERSION = "1.0.0"
+
+
+def _version_tuple(text: str) -> tuple[int, ...]:
+    """'1.0.0' -> (1, 0, 0); unparsable -> () (treated as too old, e98s03)."""
+    parts = []
+    for chunk in str(text or "").strip().lstrip("vV").split("."):
+        match = re.match(r"\d+", chunk)
+        if not match:
+            break
+        parts.append(int(match.group()))
+    return tuple(parts)
+
+
+def _legacy_preview_port() -> int:
+    """The pre-1.0 `preview.port` from the raw config file, or 0 (e98s03).
+
+    An upgraded install keeps its JSON: the operator pointed 1.2.x at :6666 for
+    commands and :8686 for the data plane. The endpoint migration reads the old
+    key once, adopts the port that answers, and persists it — no form to fill.
+    """
+    try:
+        with open(vjmixapp.config.CONFIG_PATH, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        return 0
+    preview = raw.get("preview") if isinstance(raw, dict) else None
+    if isinstance(preview, dict):
+        try:
+            return int(preview.get("port") or 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def probe_link_version(ip: str, port: int) -> str:
+    """The daemon's `app_version` from GET /config, or "" when unknown (e98s03).
+
+    Needs the Bearer token: with pairing on, an unpaired call answers 401 and the
+    version is unknown. That is why the ENDPOINT probe below does not use it.
+    """
+    payload, _err = viosccfg.fetch_config(ip, port)
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("app_version") or "")
+
+
+def probe_link_alive(ip: str, port: int) -> bool:
+    """True when a viOSC HTTP surface ANSWERS on `ip:port` (e98s03).
+
+    Any answer counts, a 401 included: before pairing that is exactly what viOSC
+    replies, and treating it as "nothing there" is what made an upgraded config
+    (commands on the old 6666) unable to pair — the endpoint never migrated.
+    """
+    if not ip or not port:
+        return False
+    _text, answered, _status = dataplane.fetch_state_ex(ip, port)
+    return bool(answered)
+
+
+def _link_endpoint_candidates(port: int) -> list[int]:
+    """The ports to try, in order: the configured one, then the 1.0 migration set."""
+    candidates = [int(port)]
+    legacy = _legacy_preview_port()
+    if legacy:
+        candidates.append(legacy)
+    if int(port) in LEGACY_LINK_PORTS:
+        candidates.append(VIOSC_PORT)
+    ordered: list[int] = []
+    for candidate in candidates:
+        if candidate and candidate not in ordered:
+            ordered.append(candidate)
+    return ordered
+
+
+def resolve_link_endpoint(ip: str, port: int) -> tuple[str, int]:
+    """The one HTTP endpoint, adopting the legacy one when it is what answers.
+
+    A 1.2.x install points at `:6666` for commands and `:8686` for the data
+    plane. In 1.0 only the HTTP port exists, so the first candidate that actually
+    ANSWERS wins (a 401 counts: unpaired is still alive), it is persisted, and one
+    line says so. Nothing to retype, and pairing reaches the right port.
+    """
+    for candidate in _link_endpoint_candidates(port):
+        if probe_link_alive(ip, candidate):
+            if candidate != int(port):
+                persist_osc_endpoints(client_port=candidate)
+                append_log("viOSC link", f"endpoint migrated to {ip}:{candidate} (one HTTP port)")
+            return ip, candidate
+    return ip, int(port)
 
 
 def connect_osc_client(ip: str, port: int) -> bool:
-    """Create the viOSC client (main thread); True when ready."""
+    """Create the command link (main thread); True when it was created (e98s01).
+
+    One endpoint for everything (e98s03): the command stream, the snapshot, the
+    delta stream and the thumbnails share this host:port, so the data plane no
+    longer has a second port to configure. The link connects in its own thread and
+    reports through the four states; a daemon that is down is `reconnecting`, not
+    a failed connect.
+    """
     try:
-        state.viosc_client = osc.observe_client(
-            udp_client.SimpleUDPClient(ip, port), f"{ip}:{port}"
-        )
-        # e41s03: the HTTP data plane lives on the SAME machine as viOSC, so its
-        # host follows the OSC client and its port comes from the preview config
-        # (the e38 server the thumbnails now use). Refreshed whenever the client
-        # is (re)connected, which is the only place the endpoint can change.
+        ip, port = resolve_link_endpoint(ip, port)
+        version = probe_link_version(ip, port)
+        state.viosc_app_version = version
+        link = osc.cmdlink.CommandLink(ip, port)
+        state.command_link = link
+        state.viosc_client = osc.observe_client(link, f"{ip}:{port}")
         state.dataplane_host = str(ip)
-        state.dataplane_port = int(_preview_endpoints(load_config())["port"])
-        dpg.set_value("viosc_status", f"Client Status: Ready on {ip}:{port}")
+        state.dataplane_port = int(port)
+        if version and _version_tuple(version) < _version_tuple(LINK_MIN_VIOSC_VERSION):
+            link.mark_incompatible(version)
+            log_error(
+                "viOSC link",
+                f"viOSC {version} cannot be driven by this VJmix "
+                f"(needs {LINK_MIN_VIOSC_VERSION}+) — update viOSC",
+            )
+        else:
+            link.start()
+        dpg.set_value("viosc_status", f"Link: {link_state_text()}")
         return True
     except Exception:
         dpg.set_value("viosc_status", "Client Status: Initialization error")
         return False
+
+
+def viosc_link_state() -> str:
+    """The link state as one word (e98s03): connected/connecting/reconnecting."""
+    link = state.command_link
+    return str(getattr(link, "state", "connecting"))
 
 
 def connect_to_viosc() -> None:
@@ -4733,7 +4897,6 @@ def autostart_osc() -> None:
     on the persisted endpoints (e28s04); constants when the config has none."""
     endpoints = _osc_endpoints_from_config(load_config())
     connect_osc_client(endpoints["client_ip"], endpoints["client_port"])
-    start_osc_server(endpoints["listen_ip"], endpoints["listen_port"])
 
 
 # --- e58s03: viOSC REMOTE CONFIG PAGE ---
@@ -4816,7 +4979,7 @@ def save_viosc_config() -> None:
                 _set_viosc_cfg_status(f"{key}: invalid input")
                 return
     endpoints = _osc_endpoints_from_config(load_config())
-    edited.update(viosccfg.link_fields(endpoints["listen_ip"], endpoints["listen_port"]))
+    edited.update(viosccfg.link_fields(endpoints["client_ip"], endpoints["client_port"]))
     report, err = viosccfg.apply_config(host, port, viosccfg.config_diff(original, edited))
     if err or report is None:
         _set_viosc_cfg_status(f"viOSC error: {err or 'no report'}")
@@ -4832,45 +4995,58 @@ def restart_viosc() -> None:
     _set_viosc_cfg_status("" if ok else f"Restart failed: {err}")
 
 
-def change_osc_endpoint(viosc_listen_ip: str, viosc_listen_port: int) -> str:
-    """Two-sided OSC bind change: tell viOSC, persist our side, reconnect (e58s04).
+def change_osc_endpoint(viosc_ip: str, viosc_port: int) -> str:
+    """Point VJmix's link at a new viOSC endpoint and reconnect (e58s04, e98s05).
 
-    viOSC's OSC input bind and VJmix's client endpoint are two sides of the same
-    link: changing one without the other points the control plane at a dead port.
-    The order is: tell viOSC the new bind -> persist our matching endpoint ->
-    restart viOSC -> reconnect and verify. HTTP stays reachable throughout (its
-    bind is local-only, e58s02), so a failure never locks the operator out — the
-    repair path is this page.
+    Before 1.0 this had to move TWO settings on two sides (viOSC's OSC input bind
+    and VJmix's client). There is one endpoint now, and it is machine-A-local, so
+    the daemon refuses to be moved through its own management plane: the operator
+    changes the bind in the viOSC window, and this entry point only re-points the
+    consumer (persist our side, reconnect).
     """
-    host, port = _viosc_dataplane_endpoint()
-    if not host or not port:
-        return "viOSC endpoint not configured"
-    report, err = viosccfg.apply_config(
-        host, port, {"listen_ip": viosc_listen_ip, "listen_port": viosc_listen_port}
-    )
-    if err or report is None:
-        return f"viOSC unreachable: {err or 'no report'}"
-    if viosccfg.has_problems(report):
-        return " | ".join(viosccfg.report_lines(report))
-    persist_osc_endpoints(client_ip=viosc_listen_ip, client_port=viosc_listen_port)
-    ok, rerr = viosccfg.trigger_restart(host, port)
-    if not ok:
-        return f"restart failed: {rerr} — repair the bind from this page"
-    if not connect_osc_client(viosc_listen_ip, viosc_listen_port):
-        return "reconnect failed — repair the bind from this page"
-    return f"viOSC OSC bind moved to {viosc_listen_ip}:{viosc_listen_port}"
+    if not viosc_ip or not viosc_port:
+        return "invalid endpoint"
+    persist_osc_endpoints(client_ip=viosc_ip, client_port=viosc_port)
+    if not connect_osc_client(viosc_ip, viosc_port):
+        return "reconnect failed — check the viOSC window for the bind"
+    return f"link moved to {viosc_ip}:{viosc_port}"
+
+
+def link_state_text() -> str:
+    """The four-state link label (e98s03): one string for the panel and the LED.
+
+    `incompatible` is a REFUSAL, not a failure: the daemon answered with a
+    version this VJmix cannot drive (pre-1.0), so nothing was sent and the
+    operator is told to update it instead of watching a half-working rig.
+    """
+    link = state.command_link
+    if link is None:
+        return "no link configured"
+    state_name = str(getattr(link, "state", "connecting"))
+    if state_name == "incompatible":
+        return f"incompatible viOSC {state.viosc_app_version or '?'} — update viOSC"
+    if state_name == "connected":
+        return f"connected to {getattr(link, 'peer', lambda: '')()}"
+    if state_name == "reconnecting":
+        return f"reconnecting to {getattr(link, 'peer', lambda: '')()}…"
+    return f"connecting to {getattr(link, 'peer', lambda: '')()}…"
 
 
 def tick_viosc_led() -> None:
-    """Colour the viOSC connection LED (e58s03).
+    """Colour the viOSC LED and print the link state (e58s03, e98s03).
 
-    Green when the OSC client is connected AND state has arrived recently (either
-    lane), red otherwise — a client object alone does not mean viOSC answers.
+    Green only when the command stream is up AND state has arrived recently: a
+    client object alone does not mean viOSC answers, and since 1.0 the link state
+    is the one thing the operator must be able to read at a glance.
     """
+    text = link_state_text()
+    if dpg.does_item_exist("viosc_status"):
+        dpg.set_value("viosc_status", f"Link: {text}")
     if not dpg.does_item_exist(VIOSC_LED_TAG):
         return
     alive = (
-        state.viosc_client is not None
+        state.command_link is not None
+        and getattr(state.command_link, "state", "") == "connected"
         and (time.monotonic() - state.last_viosc_state_ts) < VIOSC_LED_STALE_SECONDS
     )
     dpg.configure_item(VIOSC_LED_TAG, fill=VIOSC_LED_OK_RGBA if alive else VIOSC_LED_DOWN_RGBA)
@@ -4996,18 +5172,22 @@ def _on_pairing_succeeded() -> None:
     """Re-establish the transport after a successful pairing (e42s02).
 
     BUG-2026-09-13T231500: VJmix boots and starts talking BEFORE the code is
-    entered, so viOSC drops the boot-time OSC — but the memoization records the
-    watch/monitor plan as sent, and the state pull reads the boot 401 as an old
-    daemon. Forget all of it so the next sync re-issues the whole plan and both
-    lanes retry now that a token and a bound peer exist.
+    entered, so viOSC answers 401 — but the interest plan is memoized as sent and
+    the state pull counts the 401 as a failure. Forget both so the next sync
+    re-issues the whole plan now that a token exists (e98s05: the plan is the
+    only transport state left).
     """
     state.mapping_watch_plan = {}
-    state.mapping_subscriptions = {}
-    state.osc_watch_supported = None
-    state.state_pull_supported = None
     state.state_pull_failures = 0
-    state.thumb_http_supported = None
-    state.thumb_http_failures = 0
+    # e98s03: the gate needs a token to read /config, so it is re-evaluated here —
+    # before pairing the version is unknown, after it the refusal is final.
+    link = state.command_link
+    if link is not None:
+        version = probe_link_version(state.dataplane_host, state.dataplane_port)
+        state.viosc_app_version = version or state.viosc_app_version
+        if version and _version_tuple(version) < _version_tuple(LINK_MIN_VIOSC_VERSION):
+            link.mark_incompatible(version)
+            log_error("viOSC link", f"viOSC {version} needs an update to {LINK_MIN_VIOSC_VERSION}+")
     _sync_mapping_subscriptions()
 
 
@@ -6442,6 +6622,18 @@ def _log_stale_midi_target(action: str, detail: str) -> None:
     append_log("MIDI", f"{action}: {detail}")
 
 
+def _exec_mapper_io_leds(params: dict[str, Any], value: int) -> None:
+    """e96: toggle the card I/O squares from a MIDI control (e33 rule).
+
+    Same path as the toolbar checkbox (`set_mapper_io_leds`), so the controller
+    and the mouse always agree AND the preference is persisted. A press below
+    the trigger threshold is a release, not a toggle.
+    """
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    set_mapper_io_leds(not state.mapper_io_leds)
+
+
 def _exec_mapper_enable(params: dict[str, Any], value: int) -> None:
     """e33s02: toggle a mapping's armed flag (note / CC >= 64); stale id no-op."""
     mid = int(params.get("mapping_id", -1))
@@ -6926,6 +7118,8 @@ _MIDI_EXECUTORS: dict[str, Callable[[dict[str, Any], int], None]] = {
     # e33s02: card caption learn markers (armed flag, reset)
     MIDI_ACTION_MAPPER_ENABLE: _exec_mapper_enable,
     MIDI_ACTION_MAPPER_RESET: _exec_mapper_reset,
+    # e96: the card I/O square switch (a display preference, mappable per e33)
+    MIDI_ACTION_MAPPER_IO_LEDS: _exec_mapper_io_leds,
     # e33s03: row line assign (variant B) + audio-band source
     MIDI_ACTION_MAPPER_LINE: _exec_mapper_line,
     MIDI_ACTION_MAPPER_BAND: _exec_mapper_band,
@@ -7219,6 +7413,7 @@ def _refresh_learn_surfaces() -> None:
     _sync_seq_row_learn_strip()
     _sync_monitor_learn_marker()
     _sync_filter_learn_marker()
+    _sync_mapper_leds_learn_marker()  # e96: the I/O-LED switch
     _sync_settings_pairing_learn_marker()
     _sync_file_manager_learn_marker()
     _sync_drafts_learn_markers()
@@ -8112,9 +8307,6 @@ HELP_TARGETS: dict[str, str] = {
     "theme_preset": "settings.theme_preset",
     "viosc_ip": "settings.client_ip",
     "viosc_port": "settings.client_port",
-    "listen_ip": "settings.listen_ip",
-    "listen_port": "settings.listen_port",
-    "btn_server_toggle": "settings.server",
     PAIRING_CODE_INPUT_TAG: "pairing.code",
     # MIDI
     "midi_enable_cb": "midi.enable",
@@ -8189,6 +8381,10 @@ HELP_TARGETS: dict[str, str] = {
     "mapper_filter_get": "mapper.filter_state",
     "mapper_filter_global": "mapper.filter_global",
     "mapper_filter_add": "mapper.new",
+    "mapper_io_leds_cb": "mapper.io_leds",
+    "mapper_configure_cb": "mapper.edit",
+    "mapper_compact_all": "mapper.compact",
+    "mapper_expand_all": "mapper.expand",
     # Logs window (e81): the system window's own controls
     "log_level_combo": "logs.level",
     "log_pause_btn": "logs.pause",
@@ -9115,6 +9311,24 @@ def _sync_sources_data_learn_marker() -> None:
         )
 
 
+def _sync_mapper_leds_learn_marker() -> None:
+    """(Re)render the I/O-LED switch's learn marker (e96, e33 rule).
+
+    The filter bar is built once at boot, so the marker is emitted on every
+    learn transition instead of at render time (`_sync_filter_learn_marker`).
+    """
+    if not dpg.does_item_exist("mapper_leds_learn_slot"):
+        return
+    dpg.delete_item("mapper_leds_learn_slot", children_only=True)
+    if state.midi_learn_mode:
+        learn_marker(
+            MIDI_ACTION_MAPPER_IO_LEDS,
+            {},
+            parent="mapper_leds_learn_slot",
+            tag="mapper_mk_leds",
+        )
+
+
 def _sync_filter_learn_marker() -> None:
     """(Re)render the filter bar's create-action learn marker (e40s11, e33 rule).
 
@@ -9347,13 +9561,12 @@ _sources_data_wanted = False
 
 
 def _post_interest(target: str, spec: dict[str, Any]) -> bool:
-    """Declare (or release, with no props) ONE target over HTTP (e82s05).
+    """Declare (or release, with no props) ONE target over HTTP (e82s05, e98s05).
 
-    Returns False when the daemon has no /interest (an older viOSC), which makes
-    the caller fall back to the OSC watch lane for the rest of the session.
+    Returns False when the request did not land. There is no OSC watch lane to
+    fall back to: a 404 here means the daemon is too old, and the version gate
+    already refused it, so the honest answer is "not declared" and one log line.
     """
-    if state.interest_supported is False:
-        return False
     _report, status = dataplane.post_interest(
         state.dataplane_host,
         state.dataplane_port,
@@ -9370,15 +9583,9 @@ def _post_interest(target: str, spec: dict[str, Any]) -> bool:
         status,
     )
     if status == 404:
-        state.interest_supported = False
-        log_error(
-            "Interest lane", "no /interest on the endpoint (older viOSC) — using /viosc/watch"
-        )
+        log_error("Interest lane", "no /interest on the endpoint — update viOSC")
         return False
-    if status == 200:
-        state.interest_supported = True
-        return True
-    return False
+    return status == 200
 
 
 def _refresh_asked_props() -> None:
@@ -9450,44 +9657,23 @@ def tick_raw_flash() -> None:
 
 
 def _sync_mapping_subscriptions() -> None:
-    """Hold the State Mappings' transport subscriptions (e40s01 + e40s06).
+    """Hold the State Mappings' declared interest (e40s01, one lane since e98s05).
 
-    Two lanes, coalesced per (source) — ADR-mapping-model decision 2:
-    - the FAST lane: `/viosc/watch/<source> <cadence_ms> <props...>` (e40s06),
-      answered with targeted `/viosc/reply/<source> <prop> <value>` deltas;
-    - the FALLBACK: the 2 s `/viosc/monitor` subscription (e40s01), kept while
-      the fast lane is unproven (an older daemon ignores the watch address).
-      The first reply proves the lane, then the fallback stops for good.
-    Only re-issues what changed; the tick runs this every frame.
+    One plan, one transport: `POST /interest` per source, re-issued only when the
+    plan changed. The OSC watch/monitor ladder is gone — the daemon pushes the
+    deltas on `/events` regardless of who asked, so the plan is only about WHICH
+    properties stay fresh at which cadence.
     """
     plan = emission.state_watch_plan(state.mapper_mappings)
-    if plan != state.mapping_watch_plan:
-        for target, spec in plan.items():
-            if _post_interest(target, spec):
-                continue
-            osc_client.send_message(
-                f"/viosc/watch/{target}", [int(spec["cadence_ms"]), *spec["props"]]
-            )
-        for target in set(state.mapping_watch_plan) - set(plan):
-            released_over_http = _post_interest(target, {"props": [], "cadence_ms": 1000})
-            if not released_over_http:
-                osc_client.send_message(f"/viosc/watch/{target}", [])
-        state.mapping_watch_plan = plan
-    _refresh_asked_props()
-    desired = (
-        {}
-        if state.osc_watch_supported or state.interest_supported
-        else {target: list(spec["props"]) for target, spec in plan.items()}
-    )
-    if desired == state.mapping_subscriptions:
+    if plan == state.mapping_watch_plan:
+        _refresh_asked_props()
         return
-    for target, props in desired.items():
-        addr = f"/viosc/monitor/{target}"
-        osc_client.send_message(addr, list(props))
-    for target in set(state.mapping_subscriptions) - set(desired):
-        addr = f"/viosc/monitor/{target}"
-        osc_client.send_message(addr, [])
-    state.mapping_subscriptions = desired
+    for target, spec in plan.items():
+        _post_interest(target, spec)
+    for target in set(state.mapping_watch_plan) - set(plan):
+        _post_interest(target, {"props": [], "cadence_ms": 1000})
+    state.mapping_watch_plan = plan
+    _refresh_asked_props()
 
 
 def _apply_watch_reply(name: str, args: list[Any]) -> None:
@@ -9502,9 +9688,6 @@ def _apply_watch_reply(name: str, args: list[Any]) -> None:
         return
     for i in range(0, len(args) - 1, 2):
         props[str(args[i])] = args[i + 1]
-    if state.osc_watch_supported is not True:
-        state.osc_watch_supported = True
-        _sync_mapping_subscriptions()
 
 
 _stream_refresh_at = 0.0
@@ -9545,11 +9728,17 @@ def _refresh_after_stream() -> None:
 
 
 def _emit_mapping(mapping: dict[str, Any], value: float) -> None:
-    """Send one Mapping's Destination value (e40s01 MIDI, e40s03 OSC)."""
+    """Send one Mapping's Destination value (e40s01 MIDI, e40s03 OSC).
+
+    e96: this is the SECOND outbound path (a State/Clock/Constant Origin never
+    touches `mapper._send`), so a real emission pulses the card's TX square
+    here too. Nothing left => no pulse.
+    """
     destination = mapper.destination_of(mapping)
     spec = mapping.get("destination_spec") or {}
     if destination == DEST_OSC:
-        send_mapping_osc(spec, value)
+        if send_mapping_osc(spec, value):
+            mapper.pulse_out(mapping)
         return
     if destination != DEST_MIDI:
         return
@@ -9564,6 +9753,7 @@ def _emit_mapping(mapping: dict[str, Any], value: float) -> None:
         round(value),
         detail=f"mapping #{mapping['id']} {mapping.get('property', '?')}",
     )
+    mapper.pulse_out(mapping)
 
 
 def _mapping_clock_lookup(kind: str) -> float | None:
@@ -11623,22 +11813,24 @@ def _mapper_caption_spacer(label: str, spec: dict[str, Any], has_reset: bool = T
     )
 
 
-def _mapper_caption_budget(has_reset: bool) -> int:
+def _mapper_caption_budget(has_reset: bool, width: int = MAPPER_MINI_W) -> int:
     """How many 6 px chars fit in a caption row once the buttons are reserved.
 
     BUG-2026-10-14T181712b: the spacer used to floor at 2 px without shrinking a
     long label, so the R/enable/X buttons were pushed out of the card. This is the
     SAME arithmetic, exposed as a char budget for the label itself.
     """
-    reserved = (
-        MAPPER_MINI_W - 24 - (MAPPER_RESET_W if has_reset else 0) - MAPPER_CB_W - MAPPER_X_W - 2
-    )
+    reserved = width - 24 - (MAPPER_RESET_W if has_reset else 0) - MAPPER_CB_W - MAPPER_X_W - 2
     return max(1, reserved // MAPPER_SMALL_CHAR_PX)
 
 
-def _fit_mapper_caption(text: str, has_reset: bool) -> str:
-    """Cut a card caption to the room the buttons leave (BUG-2026-10-14T181712b)."""
-    budget = _mapper_caption_budget(has_reset)
+def _fit_mapper_caption(text: str, has_reset: bool, width: int = MAPPER_MINI_W) -> str:
+    """Cut a card caption to the room the buttons leave (BUG-2026-10-14T181712b).
+
+    e97: `width` is the free width left for the label — the half cards pass
+    their own (150 with only the enable box, 75 for a trigger).
+    """
+    budget = _mapper_caption_budget(has_reset, width)
     if len(text) <= budget:
         return text
     keep = max(0, budget - len(MEDIA_TITLE_ELLIPSIS))
@@ -11982,25 +12174,39 @@ def _mapper_row_add(target_id: str, parent: Any, height: int, line_index: int) -
     dpg.bind_item_theme(tip_tag, HELP_THEME_TOOLTIP)
 
 
-def _mapper_marker_slot(mapping: dict[str, Any], parent: Any) -> None:
-    """One card's markers in the under-card strip line (e34s03, answer D).
+def _mapper_marker_slot(mappings: list[dict[str, Any]], parent: Any) -> None:
+    """A CELL's markers in the under-card strip line (e34s03, answer D; e97).
 
-    The enable/reset/value M markers of one mapper card, centred on the card
-    slot (MAPPER_MINI_W wide) so the strip rows stay aligned under the cards;
-    the markers render OUTSIDE the bordered card (the card never hosts them).
-    e34s05: a cue-list card also gets its dedicated window-action marker
-    (mapper_mk_cue_open_<id> — the e33 rule). Captures and tags are unchanged
-    so the learn capture path and existing bindings are untouched.
+    The enable/reset/value M markers of one cell — one mapping for a full card,
+    two for a compact half cell — centred on the 150 px cell so the strip rows
+    stay aligned under the cells; the markers render OUTSIDE the bordered cards
+    (the card never hosts them). e34s05: a cue-list card also gets its dedicated
+    window-action marker (mapper_mk_cue_open_<id> — the e33 rule). Captures and
+    tags are unchanged so the learn capture path and the bindings are untouched.
     """
+    count = 0
+    for mapping in mappings:
+        count += 3
+        if mapping["control"] == "cue list":
+            count += 1
+        if mapper.mapping_has_secondary_output(mapping):
+            count += 1
+    cluster_w = count * MAPPER_MARKER_W  # the M buttons + item gaps
+    indent = max(0, (MAPPER_MINI_W - cluster_w) // 2)
+    first = int(mappings[0]["id"])
+    slot_tag = f"mapper_mk_slot_{first}"
+    dpg.add_group(horizontal=True, parent=parent, tag=slot_tag)
+    dpg.add_spacer(width=indent, parent=slot_tag)
+    for mapping in mappings:
+        _mapper_marker_buttons(mapping, slot_tag)
+    dpg.add_spacer(width=max(0, MAPPER_MINI_W - indent - cluster_w), parent=slot_tag)
+
+
+def _mapper_marker_buttons(mapping: dict[str, Any], slot_tag: Any) -> None:
+    """The three/five learn markers of ONE mapping, into a cell slot (e97)."""
     mid = mapping["id"]
     has_cue_open = mapping["control"] == "cue list"
     has_so = mapper.mapping_has_secondary_output(mapping)
-    marker_count = 3 + (1 if has_cue_open else 0) + (1 if has_so else 0)
-    cluster_w = marker_count * MAPPER_MARKER_W  # the M buttons + item gaps
-    indent = max(0, (MAPPER_MINI_W - cluster_w) // 2)
-    slot_tag = f"mapper_mk_slot_{mid}"
-    dpg.add_group(horizontal=True, parent=parent, tag=slot_tag)
-    dpg.add_spacer(width=indent, parent=slot_tag)
     learn_marker(
         MIDI_ACTION_MAPPER_ENABLE,
         {"mapping_id": mid},
@@ -12033,7 +12239,6 @@ def _mapper_marker_slot(mapping: dict[str, Any], parent: Any) -> None:
             parent=slot_tag,
             tag=f"mapper_mk_so_{mid}",
         )
-    dpg.add_spacer(width=max(0, MAPPER_MINI_W - indent - cluster_w), parent=slot_tag)
 
 
 def _mapper_edit_marker_slot(mapping: dict[str, Any], parent: Any) -> None:
@@ -12090,11 +12295,22 @@ def _mapper_card_has_source(mapping: dict[str, Any]) -> bool:
     )
 
 
-# e92: the SO button geometry. The band column is 44 px tall with the readout
-# rows inside it, so the square there is 10 px (out + inp + 10 = 44 exactly);
-# the slider's readout line has room for a 12 px square at its end.
-MAPPER_SO_SIZE = 12
-MAPPER_SO_BAND = 10
+# e92/e95: the SO corner geometry. The visible box adds its own 1 px window
+# border. e96 (operator amendment 2026-11-07): the box SHRANK to the width of the
+# LED pair (5 + 1 + 5 = 11) so the two elements line up in one column; the label
+# drops to 7 px to keep the two letters legible inside the 9 px hit area.
+MAPPER_SO_CORNER_SIZE = 9
+MAPPER_SO_BOX_SIZE = MAPPER_SO_CORNER_SIZE + 2
+MAPPER_SO_LABEL_PX = 7
+
+# e96: the two I/O squares. They ride the card's bottom-right PADDING (4 px),
+# right-aligned: OUT in the very corner, IN one gap to its left. When the card
+# also carries an SO, the SO box LIFTS by exactly this row (operator amendment
+# 2026-11-07: the squares sit UNDER the SO) — the card height never changes.
+MAPPER_IO_LED_SIZE = 5
+MAPPER_IO_LED_INSET = 1
+MAPPER_IO_LED_GAP = 1
+MAPPER_IO_LED_LIFT = MAPPER_IO_LED_SIZE + MAPPER_IO_LED_GAP + MAPPER_IO_LED_INSET
 
 
 def _mapper_so_capable(mapping: dict[str, Any]) -> bool:
@@ -12106,33 +12322,212 @@ def _mapper_so_capable(mapping: dict[str, Any]) -> bool:
     )
 
 
-def _mapper_so_button(mapping: dict[str, Any], mid: int, *, size: int = MAPPER_SO_SIZE) -> None:
-    """One small SO square: status light + editor opener (e92).
+def _mapper_so_button(
+    mapping: dict[str, Any], mid: int, *, size: int = MAPPER_SO_CORNER_SIZE
+) -> None:
+    """The SO hit area: a flat "S" label inside the corner box (e92/e95/e96).
 
-    Three states: neutral when no SO is stored, AMBER when it is stored but the
-    SO or the Mapping is muted, ACCENT when it is stored + enabled and the
-    Mapping is enabled. The square carries no label (the tooltip names it), so
-    it fits the readout column without changing any row height.
+    The BORDER belongs to the box child (`_mapper_so_corner`) and is the card's
+    border; this button draws nothing but the label and hover, so the square
+    reads as the card's own corner (operator, 2026-11-05). The state is the
+    LABEL colour: neutral when no SO is stored, AMBER when stored but muted,
+    ACCENT when stored + enabled and the Mapping is enabled.
     """
     tag = f"mapper_so_{mid}"
     dpg.add_button(
-        label="",
+        label="S",
         width=size,
         height=size,
+        # e96 (operator 2026-11-07): ONE letter, centred in the 9 px square. (1,1)
+        # puts the 4x5 ink block at 2 px from the left/top and 2-3 px to the
+        # right/bottom (nudge matrix measured on DPG 2.3.1 at 7 px).
+        pos=(1, 1),
         callback=open_mapping_so_editor,
         user_data=mid,
         tag=tag,
     )
-    dpg.bind_item_theme(tag, theme_mapper_micro)
     spec = mapping.get("secondary_output")
     if isinstance(spec, dict):
         if bool(spec.get("enabled", True)) and bool(mapping.get("enabled", False)):
-            _style_trigger_theme(tag, True)
+            dpg.bind_item_theme(tag, theme_so_hit_on)
         else:
-            dpg.bind_item_theme(tag, theme_so_muted)
+            dpg.bind_item_theme(tag, theme_so_hit_muted)
+    else:
+        dpg.bind_item_theme(tag, theme_so_hit)
+    if _so_corner_font is not None and dpg.does_item_exist(tag):
+        dpg.bind_item_font(tag, _so_corner_font)  # e96: 7 px, the "S" fits 9 px
+    transport = (
+        str(spec.get("transport") or MAPPING_SO_DEFAULT_TRANSPORT)
+        if isinstance(spec, dict)
+        else MAPPING_SO_DEFAULT_TRANSPORT
+    )
     with dpg.tooltip(tag, delay=HELP_HOVER_DELAY_S) as tip_tag:
-        dpg.add_text("Secondary OSC output")
+        dpg.add_text("Secondary MIDI output" if transport == "midi" else "Secondary OSC output")
     dpg.bind_item_theme(tip_tag, HELP_THEME_TOOLTIP)
+
+
+def _mapper_so_box(mapping: dict[str, Any], mid: int, pos: tuple[int, int]) -> None:
+    """Create the SO box + its hit button at `pos`, card-local (e97).
+
+    One body for both placements: the bottom-right corner of a full or half
+    trigger card, and the inline slot at the right end of a half slider's
+    control row. Same tags, same state colours, same tooltip.
+    """
+    box = f"mapper_so_box_{mid}"
+    with dpg.child_window(
+        width=MAPPER_SO_BOX_SIZE,
+        height=MAPPER_SO_BOX_SIZE,
+        border=True,
+        no_scrollbar=True,
+        tag=box,
+    ):
+        dpg.bind_item_theme(box, theme_so_box)
+        _mapper_so_button(mapping, mid)
+    dpg.set_item_pos(box, pos)
+
+
+def _mapper_so_corner(
+    mapping: dict[str, Any], mid: int, height: int, *, width: int = MAPPER_MINI_W
+) -> None:
+    """Overlay the SO box on the card's bottom-right corner (e95).
+
+    A bordered child window is POSITIONED at the card's corner: its 1 px border
+    is the same window-border path and palette colour as the card's, so the two
+    coinciding sides read as ONE line (operator, 2026-11-05). Inside it, a flat
+    transparent button carries the "S" label and the click (the tooltip names
+    the transport). The card keeps its
+    height and no other row moves.
+
+    e96 (operator amendment 2026-11-07): while the two I/O squares are drawn,
+    the box LIFTS by the LED row so the squares sit UNDER it; with the switch
+    off it returns to the flush corner.
+    """
+    lift = MAPPER_IO_LED_LIFT if state.mapper_io_leds else 0
+    # e96: with the squares drawn the box aligns with their right edge (same
+    # 1 px inset); with the switch off it keeps the e95 flush corner.
+    inset = MAPPER_IO_LED_INSET if state.mapper_io_leds else 0
+    _mapper_so_box(
+        mapping,
+        mid,
+        (width - inset - MAPPER_SO_BOX_SIZE, height - MAPPER_SO_BOX_SIZE - lift),
+    )
+
+
+# e96: the main-loop mirror of the pulse dicts. One entry per (mapping, direction)
+# says what the square is SHOWING, so a pulse that lasts 30 frames costs one bind.
+_MAPPER_LED_ON: dict[tuple[int, str], bool] = {}
+
+
+def _mapper_io_leds(
+    mapping: dict[str, Any],
+    mid: int,
+    height: int | None = None,
+    *,
+    width: int = MAPPER_MINI_W,
+    y: int | None = None,
+    right: int | None = None,
+) -> None:
+    """Two 5 px pulse squares on the card's bottom-RIGHT (e96, operator 2026-11-07).
+
+    Cyan = a value REACHED this Mapping (even one it held or could not send);
+    accent = this Mapping EMITTED. Right-aligned in the card's bottom padding,
+    OUT in the corner and IN one gap to its left; when an SO box is present it
+    lifts by the LED row so the pair reads as UNDER it (the card height and
+    every existing row are unchanged). No click, no tooltip (a 5 px target; the
+    legend is the toolbar switch's card). The initial theme is the pulse the
+    dicts already hold, so a body rebuild never shows a stale-off square.
+    """
+    now = time.monotonic()
+    led_x = right if right is not None else width - MAPPER_IO_LED_INSET - MAPPER_IO_LED_SIZE
+    led_y = y if y is not None else (height or 0) - MAPPER_IO_LED_SIZE - MAPPER_IO_LED_INSET
+    slots = (
+        (
+            "in",
+            led_x - MAPPER_IO_LED_SIZE - MAPPER_IO_LED_GAP,
+            state.mapping_io_in_until,
+            theme_led_in,
+        ),
+        ("out", led_x, state.mapping_io_out_until, theme_led_out),
+    )
+    for direction, x, store, theme_on in slots:
+        tag = f"mapper_led_{direction}_{mid}"
+        with dpg.child_window(
+            width=MAPPER_IO_LED_SIZE,
+            height=MAPPER_IO_LED_SIZE,
+            border=True,
+            no_scrollbar=True,
+            tag=tag,
+        ):
+            pass
+        lit = now < store.get(int(mid), 0.0)
+        dpg.bind_item_theme(tag, theme_on if lit else theme_led_off)
+        _MAPPER_LED_ON[(int(mid), direction)] = lit
+        dpg.set_item_pos(tag, (x, led_y))
+
+
+def tick_mapper_io_leds(now: float | None = None) -> None:
+    """Paint the card I/O squares, ONE bind per visible transition (e96).
+
+    Idle-cheap: both dicts empty -> return. A continuously driven Mapping (a
+    30 Hz band) binds ONCE, because its desired state never changes; only the
+    press and the release touch a theme. A square whose card no longer exists
+    (body rebuild, project load) is dropped once its deadline expires.
+    """
+    if not state.mapper_io_leds:
+        # OFF means OFF: no squares exist, so no pulse has anywhere to land.
+        state.mapping_io_in_until.clear()
+        state.mapping_io_out_until.clear()
+        return
+    if not state.mapping_io_in_until and not state.mapping_io_out_until:
+        return
+    stamp = time.monotonic() if now is None else now
+    for direction, store, theme_on in (
+        ("in", state.mapping_io_in_until, theme_led_in),
+        ("out", state.mapping_io_out_until, theme_led_out),
+    ):
+        for mid, deadline in list(store.items()):
+            tag = f"mapper_led_{direction}_{mid}"
+            lit = stamp < deadline
+            if not dpg.does_item_exist(tag):
+                if not lit:
+                    store.pop(mid, None)
+                    _MAPPER_LED_ON.pop((mid, direction), None)
+                continue
+            if _MAPPER_LED_ON.get((mid, direction)) is lit:
+                continue  # already showing truth: no bind, no work
+            dpg.bind_item_theme(tag, theme_on if lit else theme_led_off)
+            _MAPPER_LED_ON[(mid, direction)] = lit
+            if not lit:
+                store.pop(mid, None)
+
+
+def mapper_io_leds_enabled(cfg: dict[str, Any]) -> bool:
+    """The persisted I/O-LED switch: ON unless the config says otherwise (e96)."""
+    return bool(cfg.get("ui", {}).get("mapper_io_leds", True))
+
+
+def set_mapper_io_leds(enabled: bool) -> None:
+    """Apply AND persist the I/O-LED display preference (e96).
+
+    One path for the toolbar checkbox and the MIDI action, so mouse and
+    controller can never disagree with the file. Turning it off clears both
+    pulse dicts: a square that does not exist must not keep a deadline alive.
+    """
+    state.mapper_io_leds = bool(enabled)
+    if not state.mapper_io_leds:
+        state.mapping_io_in_until.clear()
+        state.mapping_io_out_until.clear()
+    cfg = load_config()
+    cfg.setdefault("ui", {})["mapper_io_leds"] = state.mapper_io_leds
+    save_config(cfg)
+    if dpg.does_item_exist("mapper_io_leds_cb"):
+        dpg.set_value("mapper_io_leds_cb", state.mapper_io_leds)
+    refresh_mapper_ui()
+
+
+def on_mapper_io_leds(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Mapper toolbar 'I/O LEDs': apply now, persist for the next run (e96)."""
+    set_mapper_io_leds(bool(app_data))
 
 
 def _mapper_readout_line(
@@ -12142,8 +12537,6 @@ def _mapper_readout_line(
     from_value: float,
     to_value: float,
     width: int,
-    *,
-    show_so: dict[str, Any] | None = None,
 ) -> None:
     """One from/to readout row: a short label + two drag boxes (e34s02).
 
@@ -12151,9 +12544,8 @@ def _mapper_readout_line(
     and the compact out/inp column beside the band control (label 'out'/'inp',
     MAPPER_BAND_DRAG_W boxes). Tags and handler wire-up stay the same for both
     so on_mapper_output/input and the card right-click registry keep working.
-    e92: the SO square rides the OUT row at its right end (both the band and the
-    slider), and the DRAGS use the 9 px readout font with 2 px frame padding so
-    the row still fits the 96 px band column.
+    e92: the DRAGS use the 9 px readout font with 2 px frame padding so the row
+    still fits the 96 px band column.
     """
     callback = on_mapper_output if kind == "out" else on_mapper_input
     with dpg.group(horizontal=True):
@@ -12176,8 +12568,6 @@ def _mapper_readout_line(
             user_data=(mid, "to"),
             tag=f"mapper_{kind}_to_{mid}",
         )
-        if show_so is not None and _mapper_so_capable(show_so):
-            _mapper_so_button(show_so, mid)
     _bind_mapper_font(f"mapper_{kind}_lbl_{mid}")
     _bind_mapper_readout_font(f"mapper_{kind}_from_{mid}")
     _bind_mapper_readout_font(f"mapper_{kind}_to_{mid}")
@@ -12254,8 +12644,6 @@ def _mapper_band_control(mapping: dict[str, Any], mid: int, *, compact: bool = F
                 _bind_mapper_font(f"mapper_cue_prog_{mid}")
         elif not compact:
             with dpg.group():
-                # e92: the SO square sits at the RIGHT of the OUT row (the operator's
-                # layout), not in a separate row; the 9 px digits + 28 px boxes make it fit.
                 _mapper_readout_line(
                     "out",
                     mid,
@@ -12263,7 +12651,6 @@ def _mapper_band_control(mapping: dict[str, Any], mid: int, *, compact: bool = F
                     out_from,
                     out_to,
                     MAPPER_BAND_DRAG_W,
-                    show_so=mapping if _mapper_so_capable(mapping) else None,
                 )
                 if _mapper_card_has_source(mapping):
                     in_from = mapping.get("input_from")
@@ -12284,23 +12671,236 @@ def _mapper_band_control(mapping: dict[str, Any], mid: int, *, compact: bool = F
                         ) as tip_tag:
                             dpg.add_text(MAPPER_INPUT_ALT_TOOLTIP)
                         dpg.bind_item_theme(tip_tag, HELP_THEME_TOOLTIP)
-        elif _mapper_so_capable(mapping):  # e92: compact keeps the status square
-            _mapper_band_so(mapping, mid)
 
 
-def _mapper_band_so(mapping: dict[str, Any], mid: int) -> None:
-    """The SO square in a compact band's bottom-right corner (e92).
+# e97: the compact half-cell geometry. Two 75 px halves + the 4 px item spacing
+# reproduce the 154 px cell pitch, so the grid stays aligned with the full cards.
+MAPPER_HALF_W = 75
+# A half slider is 150 x 35: 2 px padding + 14 caption + 2 gap + 14 control + 2.
+MAPPER_HALF_ROW_H = 35
+# Inside its control row the slider SHORTENS to leave the status column:
+# [slider 118][in 5][out 5][SO 11] = 142 px of content.
+MAPPER_HALF_SLIDER_W = 118
+MAPPER_HALF_LED_Y = 22  # card-local top of the two 5 px squares
+MAPPER_HALF_LED_X = 129  # card-local x of the OUT square (IN sits 6 px to its left)
+MAPPER_HALF_CTRL_Y = 20  # card-local top of the 44 px control on a half trigger
+MAPPER_HALF_RESET_X = 57  # card-local x of the R button (right-aligned, 75 - 4 - 14)
+MAPPER_HALF_RESET_Y = 22  # card-local top of R: under the enable box
 
-    In the full band the square rides the OUT row; compact hides the readout, so
-    it is bottom-aligned beside the control. No card row grows.
+
+def _half_caption_buttons(buttons: int) -> int:
+    """Width the caption buttons take, item spacings included (e97)."""
+    return MAPPER_CB_W + ((4 + MAPPER_RESET_W) if buttons >= 2 else 0)
+
+
+def _half_caption(mapping: dict[str, Any], width: int, buttons: int = 1) -> str:
+    """Caption of a half card: the label, sized to what its buttons leave (e97).
+
+    `buttons` = 1 (enable only, 75 px cards) or 2 (enable + R, 150 px sliders).
+    Arithmetic kept exact against the card padding (4+4) and the 4 px item
+    spacing, so a half caption can never push its buttons out of the card.
     """
-    top = MAPPER_KNOB_H - MAPPER_SO_BAND - MAPPER_ROW_GAP
-    spacer_w = MAPPER_MINI_W - 8 - MAPPER_KNOB_H - 2 - MAPPER_SO_BAND
-    with dpg.group():
-        dpg.add_spacer(height=top)
+    full = _mapper_card_caption(mapping)
+    free = width - 8 - 8 - _half_caption_buttons(buttons) - 2
+    budget = max(1, free // MAPPER_SMALL_CHAR_PX)
+    if len(full) <= budget:
+        return full
+    return full[: max(0, budget - len(MEDIA_TITLE_ELLIPSIS))] + MEDIA_TITLE_ELLIPSIS
+
+
+def _half_caption_spacer(label: str, width: int, buttons: int = 1) -> int:
+    """Spacer that right-aligns the caption buttons on a half card (e97).
+
+    `buttons` is the number of 14 px blocks after the label: the enable box
+    alone on a trigger, enable + R on a 150 px slider (operator 2026-11-07: the
+    enable moves LEFT and the reset button fits the row).
+    """
+    return max(
+        0,
+        width - 8 - 8 - MAPPER_SMALL_CHAR_PX * len(label) - _half_caption_buttons(buttons),
+    )
+
+
+MAPPER_HALF_SO_Y = 19  # card-local top of the 11 px SO box
+
+
+def _half_heights(height: int) -> tuple[int, int]:
+    """The two stacked half-slider heights inside one cell (e97)."""
+    top = max(1, (height - MAPPER_ROW_GAP) // 2)
+    return top, max(1, height - MAPPER_ROW_GAP - top)
+
+
+def _half_led_x() -> tuple[int, int]:
+    """Card-local x of the IN and OUT squares in a half slider's control row."""
+    out_x = MAPPER_MINI_W - 4 - MAPPER_SO_BOX_SIZE - 1 - MAPPER_IO_LED_SIZE
+    return out_x - 1 - MAPPER_IO_LED_SIZE, out_x
+
+
+def _render_half_slider(mapping: dict[str, Any], height: int) -> None:
+    """One compact slider at half height: caption + [slider][LEDs][SO] (e97).
+
+    The caption keeps only the label and the enable box (X and E live in the
+    card's context menu, the e97 operator decision). The control row hosts the
+    status column on the right, so the slider shortens to MAPPER_HALF_SLIDER_W.
+    """
+    mid = mapping["id"]
+    full_caption = _mapper_card_caption(mapping)
+    caption = _half_caption(mapping, MAPPER_MINI_W, buttons=2)
+    with dpg.child_window(
+        width=MAPPER_MINI_W,
+        height=height,
+        border=True,
+        no_scrollbar=True,
+        tag=f"mapper_card_{mid}",
+    ):
+        dpg.bind_item_theme(f"mapper_card_{mid}", theme_mapper_half)
         with dpg.group(horizontal=True):
-            dpg.add_spacer(width=spacer_w)
-            _mapper_so_button(mapping, mid, size=MAPPER_SO_BAND)
+            themed_text(caption, slot="text_dim", tag=f"mapper_prop_{mid}")
+            if caption != full_caption:
+                with dpg.tooltip(parent=f"mapper_prop_{mid}", delay=HELP_HOVER_DELAY_S) as tip:
+                    dpg.add_text(full_caption)
+                dpg.bind_item_theme(tip, HELP_THEME_TOOLTIP)
+            dpg.add_spacer(width=_half_caption_spacer(caption, MAPPER_MINI_W, buttons=2))
+            dpg.add_checkbox(
+                default_value=mapping.get("enabled", False),
+                callback=on_mapping_enable,
+                user_data=mid,
+                tag=f"mapper_enable_{mid}",
+            )
+            # e97 (operator 2026-11-07): the R button fits this row, so the half
+            # slider gets it back (the enable moves one slot left).
+            dpg.add_button(
+                label="R",
+                width=MAPPER_RESET_W,
+                height=MAPPER_RESET_H,
+                callback=reset_mapping,
+                user_data=mid,
+                tag=f"mapper_reset_{mid}",
+            )
+            dpg.bind_item_theme(f"mapper_reset_{mid}", theme_mapper_micro)
+        _bind_mapper_font(f"mapper_prop_{mid}")
+        _bind_mapper_font(f"mapper_enable_{mid}")
+        dpg.add_slider_float(
+            min_value=mapping["output_from"],
+            max_value=mapping["output_to"],
+            default_value=mapping["value"],
+            width=MAPPER_HALF_SLIDER_W,
+            callback=on_mapper_control,
+            user_data=mid,
+            tag=f"mapper_slider_{mid}",
+        )
+        _bind_mapper_font(f"mapper_slider_{mid}")
+        if state.mapper_io_leds:  # BUG-2026-11-07: the switch must hide them here too
+            _mapper_io_leds(
+                mapping,
+                mid,
+                width=MAPPER_MINI_W,
+                y=MAPPER_HALF_LED_Y,
+                right=MAPPER_HALF_LED_X,
+            )
+        if _mapper_so_capable(mapping):
+            _mapper_so_box(
+                mapping,
+                mid,
+                (MAPPER_MINI_W - 4 - MAPPER_SO_BOX_SIZE, MAPPER_HALF_SO_Y),
+            )
+        _render_mapper_source_menu(mapping)
+
+
+def _render_half_trigger(mapping: dict[str, Any], height: int) -> None:
+    """One compact knob/button at half WIDTH: 75 x the row height (e97).
+
+    Caption (label + enable), then the SAME 44 px control, with the SO corner
+    and the I/O pair stacked at the right edge — exactly the full-card seams,
+    just narrower.
+    """
+    mid = mapping["id"]
+    full_caption = _mapper_card_caption(mapping)
+    caption = _half_caption(mapping, MAPPER_HALF_W)
+    with dpg.child_window(
+        width=MAPPER_HALF_W,
+        height=height,
+        border=True,
+        no_scrollbar=True,
+        tag=f"mapper_card_{mid}",
+    ):
+        with dpg.group(horizontal=True):
+            themed_text(caption, slot="text_dim", tag=f"mapper_prop_{mid}")
+            if caption != full_caption:
+                with dpg.tooltip(parent=f"mapper_prop_{mid}", delay=HELP_HOVER_DELAY_S) as tip:
+                    dpg.add_text(full_caption)
+                dpg.bind_item_theme(tip, HELP_THEME_TOOLTIP)
+            dpg.add_spacer(width=_half_caption_spacer(caption, MAPPER_HALF_W))
+            dpg.add_checkbox(
+                default_value=mapping.get("enabled", False),
+                callback=on_mapping_enable,
+                user_data=mid,
+                tag=f"mapper_enable_{mid}",
+            )
+        _bind_mapper_font(f"mapper_prop_{mid}")
+        _bind_mapper_font(f"mapper_enable_{mid}")
+        kind = mapper.control_tag_kind(mapping["control"])
+        if mapping["control"] == "knob":
+            dpg.add_knob_float(
+                min_value=mapping["output_from"],
+                max_value=mapping["output_to"],
+                default_value=mapping["value"],
+                width=MAPPER_KNOB_H,
+                callback=on_mapper_control,
+                user_data=mid,
+                tag=f"mapper_{kind}_{mid}",
+            )
+        else:
+            dpg.add_button(
+                label=_trigger_label(mapping),
+                width=MAPPER_KNOB_H,
+                height=MAPPER_KNOB_H,
+                callback=on_mapper_button,
+                user_data=mid,
+                tag=f"mapper_{kind}_{mid}",
+            )
+            _style_trigger_theme(f"mapper_{kind}_{mid}", _trigger_is_on(mapping))
+        _bind_mapper_font(f"mapper_{kind}_{mid}")
+        # e97 follow-up (operator 2026-11-07): the 44 px control parks on the
+        # LEFT (the full card's band anatomy), which frees the right column for
+        # R right under the enable box.
+        dpg.set_item_pos(f"mapper_{kind}_{mid}", (4, MAPPER_HALF_CTRL_Y))
+        if _mapper_so_capable(mapping):
+            _mapper_so_corner(mapping, mid, height, width=MAPPER_HALF_W)
+        if state.mapper_io_leds:
+            _mapper_io_leds(mapping, mid, height, width=MAPPER_HALF_W)
+        # e97 follow-up: R sits UNDER the enable box (the column is free: the
+        # control is 44 px on the left, the SO/LED column starts at y 54).
+        dpg.add_button(
+            label="R",
+            width=MAPPER_RESET_W,
+            height=MAPPER_RESET_H,
+            callback=reset_mapping,
+            user_data=mid,
+            tag=f"mapper_reset_{mid}",
+        )
+        dpg.bind_item_theme(f"mapper_reset_{mid}", theme_mapper_micro)
+        dpg.set_item_pos(f"mapper_reset_{mid}", (MAPPER_HALF_RESET_X, MAPPER_HALF_RESET_Y))
+        _render_mapper_source_menu(mapping)
+
+
+def _render_mapper_cell(cell: list[tuple[dict[str, Any], str]], parent: Any, height: int) -> None:
+    """Render one 150x72 compact cell: stacked sliders or side-by-side triggers (e97)."""
+    slot = cell[0][1]
+    if slot == "full":
+        _render_mapper_card(cell[0][0], parent=parent, height=height)
+        return
+    if slot.startswith("v"):
+        top, bottom = _half_heights(height)
+        with dpg.group(parent=parent):
+            _render_half_slider(cell[0][0], top)
+            if len(cell) > 1:
+                _render_half_slider(cell[1][0], bottom)
+        return
+    with dpg.group(parent=parent, horizontal=True):
+        _render_half_trigger(cell[0][0], height)
+        if len(cell) > 1:
+            _render_half_trigger(cell[1][0], height)
 
 
 def _mapper_effective_compact(mapping: dict[str, Any]) -> bool:
@@ -12390,6 +12990,9 @@ def _render_mapper_card(mapping: dict[str, Any], parent: Any, height: int) -> No
                 user_data=mid,
                 tag=f"mapper_enable_{mid}",
             )
+            # e95: the compact 10 px font makes the checkbox frame 14x14, matching
+            # R and X (the default font draws it 17x17).
+            _bind_mapper_font(f"mapper_enable_{mid}")
             dpg.add_button(
                 label="X",
                 width=MAPPER_X_W,
@@ -12424,7 +13027,6 @@ def _render_mapper_card(mapping: dict[str, Any], parent: Any, height: int) -> No
                     out_from,
                     out_to,
                     MAPPER_DRAG_W,
-                    show_so=mapping if _mapper_so_capable(mapping) else None,
                 )
                 if _mapper_card_has_source(mapping):
                     in_from = mapping.get("input_from")
@@ -12437,21 +13039,119 @@ def _render_mapper_card(mapping: dict[str, Any], parent: Any, height: int) -> No
                         in_to if in_to is not None else 1.0,
                         MAPPER_DRAG_W,
                     )
-            elif _mapper_so_capable(mapping):  # e92: compact slider keeps the square
-                with dpg.group(horizontal=True):
-                    dpg.add_spacer(width=max(0, content_w - MAPPER_SO_SIZE))
-                    _mapper_so_button(mapping, mid)
         else:
             # knob / button: the compact band (e34s02)
             _mapper_band_control(mapping, mid, compact=compact)
+        if _mapper_so_capable(mapping):
+            # e95: the SO corner OVERLAYS the card's bottom-right border, so the
+            # card keeps its height and nothing else moves.
+            _mapper_so_corner(mapping, mid, height)
+        if state.mapper_io_leds:
+            # e96: the two I/O squares overlay the bottom-LEFT padding (same seam).
+            _mapper_io_leds(mapping, mid, height)
         _render_mapper_source_menu(mapping)
 
 
-# e92: the Secondary Output editor. One dialog serves a Mapping (value = the
+# e92/e95: the Secondary Output editor. One dialog serves a Mapping (value = the
 # Mapping's Destination value, with the SO scale) and a step (value = the fixed
-# value it sends). Only one is open at a time.
+# value it sends). Only one is open at a time. The OSC|MIDI tab bar IS the
+# transport selector: the tab's callback records the choice, so Save and Test
+# always act on the tab the operator is looking at.
 SO_EDITOR_TAG = "so_editor"
 SO_ERROR_TAG = "so_error"
+SO_TRANSPORT_TABS_TAG = "so_transport_tabs"
+SO_OSC_TAB_TAG = "so_osc_tab"
+SO_MIDI_TAB_TAG = "so_midi_tab"
+SO_DEVICE_TAG = "so_device"
+SO_DEVICE_REFRESH_TAG = "so_device_refresh"
+SO_CHANNEL_TAG = "so_channel"
+SO_MIDI_MESSAGE_TAG = "so_midi_message"
+SO_MIDI_NUMBER_TAG = "so_midi_number"
+SO_GATE_TAG = "so_gate"
+SO_MIDI_HINT_TAG = "so_midi_hint"
+SO_FROM_TAG = "so_from"
+SO_TO_TAG = "so_to"
+SO_DEVICE_MISSING_SUFFIX = " (not connected)"
+# Dialog-local state (the DPG tab bar does not report its selection reliably):
+# the transport, whether the stored spec has an explicit scale (the seeding rule)
+# and the Mapping's output interval (the OSC scale seed).
+_SO_EDITOR_STATE: dict[str, Any] = {
+    "transport": "osc",
+    "explicit_scale": False,
+    "output_from": 0.0,
+    "output_to": 1.0,
+}
+
+
+def _so_midi_output_names() -> list[str]:
+    """The live MIDI output ports the SO may target (e95); [] when MIDI is broken."""
+    try:
+        import mido
+
+        return list(mido.get_output_names())
+    except Exception:
+        return []
+
+
+def _so_device_choices(stored: str) -> tuple[list[str], str]:
+    """Combo items + default for the SO device (e95).
+
+    A saved device that is NOT live stays selectable, suffixed "(not connected)",
+    instead of being silently replaced by another port.
+    """
+    names = _so_midi_output_names()
+    if stored and stored not in names:
+        marked = f"{stored}{SO_DEVICE_MISSING_SUFFIX}"
+        return [*names, marked], marked
+    return names, (stored or (names[0] if names else ""))
+
+
+def _so_stored_device(value: Any) -> str:
+    """The port name behind a combo value, without the "(not connected)" suffix (e95)."""
+    name = str(value or "").strip()
+    if name.endswith(SO_DEVICE_MISSING_SUFFIX):
+        name = name[: -len(SO_DEVICE_MISSING_SUFFIX)].strip()
+    return name
+
+
+def _so_seed_scale(transport: str) -> None:
+    """Seed the shared scale when the stored spec has no explicit one (e95).
+
+    OSC seeds with the Mapping's output interval (the e92 decision); MIDI seeds
+    with 0..127, the 7-bit range the implicit pipeline targets. An explicit scale
+    is never overwritten.
+    """
+    if _SO_EDITOR_STATE["explicit_scale"] or not dpg.does_item_exist(SO_FROM_TAG):
+        return
+    if transport == "midi":
+        dpg.set_value(SO_FROM_TAG, 0.0)
+        dpg.set_value(SO_TO_TAG, MAPPING_SO_MIDI_SCALE_TO)
+    else:
+        dpg.set_value(SO_FROM_TAG, float(_SO_EDITOR_STATE["output_from"]))
+        dpg.set_value(SO_TO_TAG, float(_SO_EDITOR_STATE["output_to"]))
+
+
+def on_so_transport_change(sender: Any = None, app_data: Any = None) -> None:
+    """Record the selected transport tab and seed its default scale (e95)."""
+    transport = "midi" if "midi" in str(app_data).lower() else "osc"
+    _SO_EDITOR_STATE["transport"] = transport
+    _so_seed_scale(transport)
+
+
+def on_so_midi_message_change(sender: Any = None, app_data: Any = None) -> None:
+    """Gate is only meaningful for a Note (e95)."""
+    if dpg.does_item_exist(SO_GATE_TAG):
+        dpg.configure_item(SO_GATE_TAG, show=str(app_data) == MIDI_KIND_NOTE)
+
+
+def on_so_device_refresh(sender: Any = None, app_data: Any = None) -> None:
+    """Re-read the MIDI output ports into the combo (e95)."""
+    if not dpg.does_item_exist(SO_DEVICE_TAG):
+        return
+    stored = _so_stored_device(dpg.get_value(SO_DEVICE_TAG))
+    items, default = _so_device_choices(stored)
+    dpg.configure_item(SO_DEVICE_TAG, items=items)
+    dpg.set_value(SO_DEVICE_TAG, default)
 
 
 def open_mapping_so_editor(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
@@ -12466,7 +13166,7 @@ def open_step_so_editor(sender: Any = None, app_data: Any = None, user_data: Any
 
 
 def _open_so_editor(owner: tuple[Any, ...]) -> None:
-    """Build the SO dialog for a Mapping or a sequencer step (e92)."""
+    """Build the SO dialog for a Mapping or a sequencer step (e92/e95)."""
     if dpg.does_item_exist(SO_EDITOR_TAG):
         dpg.delete_item(SO_EDITOR_TAG)
     is_step = owner[0] == "step"
@@ -12476,48 +13176,124 @@ def _open_so_editor(owner: tuple[Any, ...]) -> None:
         step = state.sequencer(index)["tracks"][row]["steps"][col]
         spec = step.get("secondary_output") or {}
         value = float(spec.get("fixed", 1.0))
-        title = "Secondary Output — step"
+        title = "Secondary Output - step"
     else:
         mapping = mapper.find_mapping(int(owner[1]))
         if mapping is None:
             return
         spec = mapping.get("secondary_output") or {}
         value = float(mapping["value"])
-        title = f"Secondary Output — {mapping.get('property', '?')}"
+        title = f"Secondary Output - {_mapper_card_caption(mapping)}"
     enabled = bool(spec.get("enabled", True))
+    transport = str(spec.get("transport") or MAPPING_SO_DEFAULT_TRANSPORT)
     host = str(spec.get("host") or MAPPING_SO_DEFAULT_HOST)
     port = int(spec.get("port") or MAPPING_SO_DEFAULT_PORT)
     address = str(spec.get("address") or MAPPING_SO_DEFAULT_ADDRESS)
     arg = str(spec.get("arg") or "float")
+    channel = int(spec.get("channel", MAPPING_SO_MIDI_CHANNEL))
+    msg = str(spec.get("msg") or MIDI_KIND_CC)
+    number = int(spec.get("number", MAPPING_SO_MIDI_NUMBER))
+    gate = int(spec.get("gate", MAPPING_SO_MIDI_GATE_MS))
+    _SO_EDITOR_STATE.update(
+        transport=transport,
+        explicit_scale="from" in spec,
+        output_from=float(mapping["output_from"]) if mapping is not None else 0.0,
+        output_to=float(mapping["output_to"]) if mapping is not None else 1.0,
+    )
+    default_from = float(spec.get("from", _SO_EDITOR_STATE["output_from"]))
+    default_to = float(spec.get("to", _SO_EDITOR_STATE["output_to"]))
     with dpg.window(
-        label=title, tag=SO_EDITOR_TAG, modal=True, width=430, height=400, no_resize=True
+        label=title, tag=SO_EDITOR_TAG, modal=True, width=460, height=430, no_resize=True
     ):
         dpg.add_checkbox(label="Enabled", default_value=enabled, tag="so_enabled")
-        dpg.add_input_text(label="Host", default_value=host, width=280, tag="so_host")
-        dpg.add_input_int(label="Port", default_value=port, width=160, tag="so_port")
-        dpg.add_input_text(label="Address", default_value=address, width=280, tag="so_address")
-        dpg.add_combo(
-            items=list(SECONDARY_OUTPUT_ARGS),
-            default_value=arg,
-            width=140,
-            tag="so_arg",
-        )
+        with dpg.tab_bar(tag=SO_TRANSPORT_TABS_TAG, callback=on_so_transport_change):
+            with dpg.tab(label="OSC", tag=SO_OSC_TAB_TAG):
+                dpg.add_input_text(label="Host", default_value=host, width=280, tag="so_host")
+                dpg.add_input_int(label="Port", default_value=port, width=160, tag="so_port")
+                dpg.add_input_text(
+                    label="Address", default_value=address, width=280, tag="so_address"
+                )
+                help_tooltip("so_host", "mapper.host")
+                help_tooltip("so_port", "mapper.port")
+                help_tooltip("so_address", "mapper.address")
+                dpg.add_combo(
+                    items=list(SECONDARY_OUTPUT_ARGS),
+                    default_value=arg,
+                    width=140,
+                    tag="so_arg",
+                )
+                help_tooltip("so_arg", "mapper.so.message")
+            with dpg.tab(label="MIDI", tag=SO_MIDI_TAB_TAG):
+                items, default_device = _so_device_choices(str(spec.get("device") or ""))
+                help_label("Device", "mapper.so.device", tag="so_device_label")
+                with dpg.group(horizontal=True):
+                    dpg.add_combo(
+                        items=items,
+                        default_value=default_device,
+                        width=280,
+                        tag=SO_DEVICE_TAG,
+                    )
+                    dpg.add_button(
+                        label="Refresh",
+                        width=70,
+                        callback=on_so_device_refresh,
+                        tag=SO_DEVICE_REFRESH_TAG,
+                    )
+                help_tooltip(SO_DEVICE_TAG, "mapper.so.device")
+                with dpg.group(horizontal=True):
+                    help_label("Channel", "mapper.channel", tag="so_channel_label")
+                    dpg.add_drag_int(
+                        default_value=channel,
+                        min_value=0,
+                        max_value=15,
+                        width=70,
+                        tag=SO_CHANNEL_TAG,
+                    )
+                    help_label("Message", "mapper.so.midi_message", tag="so_midi_message_label")
+                    dpg.add_combo(
+                        items=list(SO_MIDI_MESSAGES),
+                        default_value=msg,
+                        width=90,
+                        tag=SO_MIDI_MESSAGE_TAG,
+                        callback=on_so_midi_message_change,
+                    )
+                help_tooltip(SO_CHANNEL_TAG, "mapper.channel")
+                help_tooltip(SO_MIDI_MESSAGE_TAG, "mapper.so.midi_message")
+                with dpg.group(horizontal=True):
+                    help_label("Number", "mapper.so.number", tag="so_midi_number_label")
+                    dpg.add_drag_int(
+                        default_value=number,
+                        min_value=0,
+                        max_value=127,
+                        width=70,
+                        tag=SO_MIDI_NUMBER_TAG,
+                    )
+                    help_label("Gate (ms)", "mapper.so.gate", tag="so_gate_label")
+                    dpg.add_input_int(
+                        default_value=gate,
+                        min_value=MAPPING_SO_MIDI_GATE_MIN_MS,
+                        max_value=MAPPING_SO_MIDI_GATE_MAX_MS,
+                        width=90,
+                        tag=SO_GATE_TAG,
+                        show=msg == MIDI_KIND_NOTE,
+                    )
+                help_tooltip(SO_MIDI_NUMBER_TAG, "mapper.so.number")
+                help_tooltip(SO_GATE_TAG, "mapper.so.gate")
+                dpg.add_text(
+                    "MIDI is disabled - enable it in Settings, or pick MIDI later.",
+                    tag=SO_MIDI_HINT_TAG,
+                    show=not bool(state.midi_enabled),
+                )
         if is_step:
             dpg.add_input_float(label="Value", default_value=value, width=160, tag="so_value")
         else:
             themed_text(f"sends the Mapping value (now {value:.2f})", slot="text_dim")
-            dpg.add_input_float(
-                label="Scale from",
-                default_value=float(spec.get("from", mapping["output_from"] if mapping else 0.0)),
-                width=140,
-                tag="so_from",
-            )
-            dpg.add_input_float(
-                label="Scale to",
-                default_value=float(spec.get("to", mapping["output_to"] if mapping else 1.0)),
-                width=140,
-                tag="so_to",
-            )
+            help_label("Scale from", "mapper.so.scale", tag="so_from_label")
+            dpg.add_input_float(default_value=default_from, width=140, tag=SO_FROM_TAG)
+            help_label("Scale to", "mapper.so.scale", tag="so_to_label")
+            dpg.add_input_float(default_value=default_to, width=140, tag=SO_TO_TAG)
+            help_tooltip(SO_FROM_TAG, "mapper.so.scale")
+            help_tooltip(SO_TO_TAG, "mapper.so.scale")
         dpg.add_text("", tag=SO_ERROR_TAG)
         with dpg.group(horizontal=True):
             dpg.add_button(label="Test", callback=on_so_test, user_data=owner)
@@ -12525,30 +13301,37 @@ def _open_so_editor(owner: tuple[Any, ...]) -> None:
             dpg.add_button(label="Save", callback=on_so_save, user_data=owner)
             dpg.add_button(label="Cancel", callback=on_so_cancel)
         help_tooltip("so_enabled", "mapper.so.enabled")
-        help_tooltip("so_host", "mapper.host")
-        help_tooltip("so_port", "mapper.port")
-        help_tooltip("so_address", "mapper.address")
-        help_tooltip("so_arg", "mapper.so.message")
-        if not is_step:
-            help_tooltip("so_from", "mapper.so.scale")
-            help_tooltip("so_to", "mapper.so.scale")
+        dpg.set_value(
+            SO_TRANSPORT_TABS_TAG, SO_MIDI_TAB_TAG if transport == "midi" else SO_OSC_TAB_TAG
+        )
+    show_centered_window(SO_EDITOR_TAG)  # e55/e95: the dialog opens centered
 
 
 def _so_form_spec(owner: tuple[Any, ...]) -> dict[str, Any]:
-    """Read the dialog's fields into an SO spec (unvalidated, e92)."""
+    """Read the dialog's fields into an SO spec (unvalidated, e92/e95).
+
+    BOTH transport blocks are read, so switching tabs never loses the other
+    side's settings; the active transport comes from the selected tab.
+    """
     spec: dict[str, Any] = {
         "enabled": bool(dpg.get_value("so_enabled")),
+        "transport": str(_SO_EDITOR_STATE["transport"]),
         "host": str(dpg.get_value("so_host")),
         "port": int(dpg.get_value("so_port")),
         "address": str(dpg.get_value("so_address")),
         "arg": str(dpg.get_value("so_arg")),
+        "device": _so_stored_device(dpg.get_value(SO_DEVICE_TAG)),
+        "channel": int(dpg.get_value(SO_CHANNEL_TAG)),
+        "msg": str(dpg.get_value(SO_MIDI_MESSAGE_TAG)),
+        "number": int(dpg.get_value(SO_MIDI_NUMBER_TAG)),
+        "gate": int(dpg.get_value(SO_GATE_TAG)),
         "fixed": 0.0,
     }
     if owner[0] == "step":
         spec["fixed"] = float(dpg.get_value("so_value"))
     else:
-        spec["from"] = float(dpg.get_value("so_from"))
-        spec["to"] = float(dpg.get_value("so_to"))
+        spec["from"] = float(dpg.get_value(SO_FROM_TAG))
+        spec["to"] = float(dpg.get_value(SO_TO_TAG))
     return spec
 
 
@@ -12563,26 +13346,26 @@ def _close_so_editor() -> None:
 
 
 def on_so_test(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
-    """Test-send the form's spec with the current value; never persists (e92)."""
+    """Test-send the form's spec with the current value; never persists (e92/e95)."""
     owner = tuple(user_data)
     spec = _so_form_spec(owner)
     error = validate_secondary_output(spec)
     if error is not None:
         _so_set_error(error)
         return
+    ok = False
     if owner[0] == "step":
-        ok = send_secondary_output(spec, float(spec["fixed"]))
+        ok = send_so(spec, float(spec["fixed"]))
     else:
         mapping = mapper.find_mapping(int(owner[1]))
-        ok = False
         if mapping is not None:
-            ok = send_secondary_output(
+            ok = send_so(
                 spec,
                 float(mapping["value"]),
                 float(mapping["output_from"]),
                 float(mapping["output_to"]),
             )
-    _so_set_error("Sent" if ok else "Not sent — see the Logs window")
+    _so_set_error("Sent" if ok else "Not sent - see the Logs window")
 
 
 def on_so_save(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
@@ -12825,6 +13608,8 @@ def _render_mapper_source_menu(mapping: dict[str, Any]) -> None:
         dpg.add_menu_item(label="Cut mapping", callback=cut_mapper_mapping, user_data=mid)
         dpg.add_menu_item(label="Move left", callback=move_mapper_mapping, user_data=(mid, -1))
         dpg.add_menu_item(label="Move right", callback=move_mapper_mapping, user_data=(mid, 1))
+        # e97: a half card has no X button — Delete lives here (same callback).
+        dpg.add_menu_item(label="Delete mapping", callback=delete_mapping, user_data=mid)
     with dpg.item_handler_registry(tag=reg_tag):
         dpg.add_item_clicked_handler(1, callback=lambda *_, m=mid: _show_mapper_menu(m))
     for tag in (
@@ -13784,7 +14569,12 @@ def on_mapper_compact_all(sender: Any = None, app_data: Any = None, user_data: A
 
 
 def on_mapper_configure(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
-    """Mapper toolbar Configure: force every card full while ON (e86, session)."""
+    """Mapper toolbar EDIT: show every card full while ON (e86, session only).
+
+    Distinct from Expand: this changes NO flag, so unchecking it restores the
+    per-card Compact choices. e97 follow-up: renamed from "Configure" because
+    nobody could tell it apart from Expand (operator 2026-11-07).
+    """
     state.mapper_configure_mode = bool(app_data)
     refresh_mapper_ui()
 
@@ -14630,11 +15420,13 @@ def refresh_mapper_ui() -> None:
             # button, not a card slot — it rides the row's last card line when the
             # pixel room fits it (mapper.add_fits_last_line) and only moves to its
             # own narrow line when a very narrow window leaves no room.
+            compact_ids = {int(m["id"]) for m in control_mappings if _mapper_effective_compact(m)}
+            lines = mapper.compact_lines(control_mappings, compact_ids, per_line)
+            cell_count = sum(len(line) for line in lines)
             add_inline = mapper.add_fits_last_line(
-                len(control_mappings), per_line, card_area, pitch, _mapper_add_slot_width()
+                cell_count, per_line, card_area, pitch, _mapper_add_slot_width()
             )
-            lines = mapper.row_slots(len(control_mappings), per_line)
-            for line_no, slot_line in enumerate(lines):
+            for line_no, cell_line in enumerate(lines):
                 line = dpg.add_group(horizontal=True, parent=block)
                 if line_no == 0:
                     # e32s02: the row number leads the line (1-based window order,
@@ -14655,17 +15447,14 @@ def refresh_mapper_ui() -> None:
                         width=_mapper_row_lead_px(),
                         parent=line,
                     )
-                for slot in slot_line:
-                    if slot < len(control_mappings):
-                        try:
-                            _render_mapper_card(
-                                control_mappings[slot], parent=line, height=row_height
-                            )
-                        except Exception as exc:  # one bad card must not kill the body
-                            log_error(
-                                "Mapper card",
-                                f"mapping {control_mappings[slot].get('id')}: {exc!r}",
-                            )
+                for cell in cell_line:
+                    try:
+                        _render_mapper_cell(cell, parent=line, height=row_height)
+                    except Exception as exc:  # one bad card must not kill the body
+                        log_error(
+                            "Mapper card",
+                            f"mapping {cell[0][0].get('id')}: {exc!r}",
+                        )
                 # e34s01: the small '+' rides the last card line when it fits
                 if add_inline and line_no == len(lines) - 1:
                     _mapper_row_add(
@@ -14675,18 +15464,15 @@ def refresh_mapper_ui() -> None:
                 # marker strip line directly UNDER it — the cards' markers live
                 # outside the bordered cards, aligned under each card slot. The
                 # add-only slot lines carry no markers.
-                if state.midi_learn_mode and any(
-                    slot < len(control_mappings) for slot in slot_line
-                ):
+                if state.midi_learn_mode and cell_line:
                     strip = dpg.add_group(
                         horizontal=True,
                         parent=block,
                         tag=f"mapper_mk_strip_{row_no}_{line_no}",
                     )
                     dpg.add_spacer(width=_mapper_row_lead_px(), parent=strip)
-                    for slot in slot_line:
-                        if slot < len(control_mappings):
-                            _mapper_marker_slot(control_mappings[slot], parent=strip)
+                    for cell in cell_line:
+                        _mapper_marker_slot([m for m, _slot in cell], parent=strip)
                     # e51s02: a SECOND strip line for the clipboard/move markers
                     edit_strip = dpg.add_group(
                         horizontal=True,
@@ -14694,9 +15480,9 @@ def refresh_mapper_ui() -> None:
                         tag=f"mapper_mk_edit_strip_{row_no}_{line_no}",
                     )
                     dpg.add_spacer(width=_mapper_row_lead_px(), parent=edit_strip)
-                    for slot in slot_line:
-                        if slot < len(control_mappings):
-                            _mapper_edit_marker_slot(control_mappings[slot], parent=edit_strip)
+                    for cell in cell_line:
+                        for mapping_in_cell, _slot in cell:
+                            _mapper_edit_marker_slot(mapping_in_cell, parent=edit_strip)
             if not add_inline:
                 # a very narrow window: the '+' gets its own narrow line under the
                 # cards (aligned with them) instead of overflowing the edge
@@ -15746,6 +16532,16 @@ def _reapply_leds_after_controller_connect() -> None:
     refresh_binding_leds()
 
 
+def _after_controller_port_adoption() -> None:
+    """Persist a silent port adoption and repaint the controller list.
+
+    BUG-2026-11-08T183721: the worker adopts a renumbered device so the operator
+    does not have to; the write and the repaint belong on the main thread.
+    """
+    save_midi_controllers()
+    render_controllers_ui()
+
+
 def midi_control_loop() -> None:
     """MIDI control worker (e14s02): poll every controller input port, mapping messages,
     push executions to the main thread via ui_task_queue (HIGH-1 — no direct dpg calls).
@@ -15804,6 +16600,24 @@ def _midi_control_tick(
             live = None
             log_error("MIDI", f"port rescan: {e}")
         if live is not None:
+            # BUG-2026-11-08T183721: ALSA renumbers a device on every replug, so a
+            # stored port can be a name nobody can open. Adopt the live port that
+            # carries the same device stem (silent, one line) and fold the twin the
+            # renumber created; ambiguous stems (two identical devices) are skipped.
+            adopted = adopt_controller_ports(live)
+            for stored, resolved, _reason in adopted:
+                append_log("MIDI", f"{stored} -> {resolved} (same device, new port id)")
+                if state.midi_selected_port == stored:
+                    state.midi_selected_port = resolved
+            if adopted:
+                ui_task(_after_controller_port_adoption)
+            # BUG-2026-11-08T192000: an output that was not enumerated when the
+            # controller connected (an ALSA/rtmidi race at boot) gets another chance
+            # here. The pads are already armed and this never touches them.
+            for open_controller in list(midi_controllers):
+                port = str(open_controller.get("port") or "")
+                if port in open_ports and retry_controller_output(open_controller, mido):
+                    ui_task(_reapply_leds_after_controller_connect)
             for stale in stale_ports(list(open_ports), live):
                 _close_midi_input(open_ports.pop(stale, None))
                 controller = find_controller_by_port(stale)
@@ -18484,8 +19298,11 @@ def _sync_audio_stream() -> bool:
             )
             state.samplerate = rate
             audio_stream.start()
-        except Exception:
+        except Exception as exc:
+            # BUG-2026-11-07T150000: never swallow the reason — "audio does not work"
+            # must be a line in the Logs window, not a silent bounce of the checkbox.
             audio_stream = None
+            log_error("Audio", f"input stream failed on {device_string!r}: {exc}")
             return False
     elif not needs_stream and audio_stream is not None:
         audio_stream.stop()
@@ -18644,6 +19461,16 @@ for _mapper_kind_font_path in _TILE_TITLE_FONT_PATHS:
     if os.path.exists(_mapper_kind_font_path):
         with dpg.font_registry():
             _mapper_kind_font = dpg.add_font(_mapper_kind_font_path, size=MAPPER_KIND_FONT_SIZE)
+        break
+
+# e95/e96: a 7 px ProggyTiny for the SO corner label, so the single "S" sits
+# centred in the 9 px hit area (the 10 px mapper font would overflow it).
+# Missing asset -> None.
+_so_corner_font: Any = None
+for _so_corner_font_path in _TILE_TITLE_FONT_PATHS:
+    if os.path.exists(_so_corner_font_path):
+        with dpg.font_registry():
+            _so_corner_font = dpg.add_font(_so_corner_font_path, size=MAPPER_SO_LABEL_PX)
         break
 
 # e55s02: a LARGE monospace font for the pairing code digits (DejaVuSansMono, or
@@ -18843,6 +19670,58 @@ with dpg.theme() as theme_so_muted, dpg.theme_component(dpg.mvButton):
     dpg.add_theme_color(dpg.mvThemeCol_Text, (255, 240, 200, 255))
     dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 0)
     dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 3)
+
+
+with dpg.theme() as theme_mapper_half, dpg.theme_component(dpg.mvAll):
+    # e97: a compact half slider is 35 px tall (2 + 14 + 2 + 14 + 2), so its card
+    # padding is 2 px vertically instead of 4. Style only: every colour comes from
+    # the card theme it is bound over.
+    dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 4, 2)
+    dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 4, 2)
+
+
+with dpg.theme() as theme_so_box, dpg.theme_component(dpg.mvAll):
+    # e95: the SO corner's border is the CARD's border (same palette slot, same
+    # window-border path), so the coinciding right/bottom sides read as one line.
+    dpg.add_theme_color(dpg.mvThemeCol_ChildBg, (0, 0, 0, 0))
+    theme_color(dpg.mvThemeCol_Border, "border")
+    dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0)
+    dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 0, 0)
+
+
+def _build_led_theme(fill_slot: str) -> Any:
+    """One 5x5 I/O square: a filled, bordered box in a single palette slot (e96)."""
+    with dpg.theme() as theme, dpg.theme_component(dpg.mvAll):
+        theme_color(dpg.mvThemeCol_ChildBg, fill_slot)
+        theme_color(dpg.mvThemeCol_Border, fill_slot)
+        dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0)
+        dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 0, 0)
+    return theme
+
+
+# e96: OFF is the chrome border (a dark square on every palette); RX is the
+# fixed cyan slot, TX the accent — the two states never read as each other.
+theme_led_off = _build_led_theme("border")
+theme_led_in = _build_led_theme("led_in")
+theme_led_out = _build_led_theme("accent")
+
+
+def _build_so_hit_theme(text_slot: str) -> Any:
+    """A flat, borderless SO hit area whose LABEL carries the state (e95)."""
+    with dpg.theme() as theme, dpg.theme_component(dpg.mvButton):
+        dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 0, 0, 0))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (255, 255, 255, 18))
+        dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (255, 255, 255, 36))
+        theme_color(dpg.mvThemeCol_Text, text_slot)
+        dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 0)
+        dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
+        dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 0)
+    return theme
+
+
+theme_so_hit = _build_so_hit_theme("text_dim")
+theme_so_hit_on = _build_so_hit_theme("accent")
+theme_so_hit_muted = _build_so_hit_theme("warning")
 
 with dpg.theme() as theme_learn_marker, dpg.theme_component(dpg.mvButton):
     # e33: the red 'M' learn markers — the red text signals "bind this to MIDI"
@@ -21200,7 +22079,11 @@ with dpg.window(
     show=False,  # e85s07: the bands/mappings run hidden; open from the toolbar
 ):
     dpg.add_combo(
-        items=input_devices_list, default_value=input_devices_list[0], tag="combo_devices", width=-1
+        items=input_devices_list,
+        default_value=input_devices_list[0],
+        tag="combo_devices",
+        width=-1,
+        callback=on_audio_device,  # BUG-2026-11-07T150000: remember the choice
     )
     dpg.add_checkbox(
         label="Enable Level Analysis (Spectrum)",
@@ -21356,21 +22239,15 @@ with (
             )
         with dpg.group(tag="settings_pairing_learn_slot"):
             pass
-    dpg.add_text("client OSC (to viOSC):")
+    dpg.add_text("viOSC HTTP endpoint (host:port):")
     with dpg.group(horizontal=True):
         dpg.add_input_text(default_value="127.0.0.1", tag="viosc_ip", width=120)
-        dpg.add_input_int(default_value=6666, tag="viosc_port", width=80, step=0)
+        dpg.add_input_int(default_value=8686, tag="viosc_port", width=80, step=0)
         help_tooltip(
-            dpg.add_button(label="Connect Client", callback=connect_to_viosc),
+            dpg.add_button(label="Connect", callback=connect_to_viosc),
             "settings.client_connect",
         )
-        themed_text("Client Status: Waiting", slot="text_dim", tag="viosc_status")
-    dpg.add_text("OSC Server (from viOSC):")
-    with dpg.group(horizontal=True):
-        dpg.add_input_text(default_value="127.0.0.1", tag="listen_ip", width=120)
-        dpg.add_input_int(default_value=VIOSC_LISTEN_PORT, tag="listen_port", width=80, step=0)
-        dpg.add_button(label="Start Server", tag="btn_server_toggle", callback=toggle_local_server)
-        themed_text("Server Status: Stopped", slot="text_dim", tag="server_status")
+        themed_text("Link: connecting", slot="text_dim", tag="viosc_status")
 
     # --- viOSC configuration: the remote settings ---
     dpg.add_spacer(height=8)
@@ -22213,24 +23090,50 @@ with (
         dpg.add_spacer(width=MAPPER_FILTER_ADD_GAP)
         dpg.add_button(
             label="+",
-            width=MAPPER_ADD_W,
-            height=MAPPER_ADD_H,
+            width=MAPPER_NEW_W,
+            height=MAPPER_NEW_H,
             callback=open_mapping_creator,
             tag="mapper_filter_add",
         )
+        # e97 follow-up: the micro theme centres the glyph in the small box and
+        # the row font keeps it the same weight as the chips beside it.
+        dpg.bind_item_theme("mapper_filter_add", theme_mapper_micro)
+        _bind_mapper_font("mapper_filter_add")
         themed_text("New mapping", slot="text_dim")
         dpg.add_group(tag="mapper_filter_learn_slot", horizontal=True)
         # e86: view controls — Configure forces full for editing; the bulk
         # buttons set every mapping's persistent compact flag.
         dpg.add_spacer(width=MAPPER_FILTER_ADD_GAP)
+        # e97 follow-up (operator 2026-11-07): the toolbar was overflowing and
+        # the names did not say what they do. "Compact"/"Expand" persist the
+        # per-card flag; "Edit" is the temporary peek (all full, flags intact).
         dpg.add_checkbox(
-            label="Configure",
+            label="Edit",
             tag="mapper_configure_cb",
             default_value=state.mapper_configure_mode,
             callback=on_mapper_configure,
         )
-        dpg.add_button(label="Compact all", callback=on_mapper_compact_all, user_data=True)
-        dpg.add_button(label="Expand all", callback=on_mapper_compact_all, user_data=False)
+        # e96: the two card I/O squares are silenceable for a performance; the
+        # learn slot beside it makes the switch MIDI-mappable (e33 rule).
+        dpg.add_checkbox(
+            label="I/O LEDs",
+            tag="mapper_io_leds_cb",
+            default_value=state.mapper_io_leds,
+            callback=on_mapper_io_leds,
+        )
+        dpg.add_group(tag="mapper_leds_learn_slot", horizontal=True)
+        dpg.add_button(
+            label="Compact",
+            tag="mapper_compact_all",
+            callback=on_mapper_compact_all,
+            user_data=True,
+        )
+        dpg.add_button(
+            label="Expand",
+            tag="mapper_expand_all",
+            callback=on_mapper_compact_all,
+            user_data=False,
+        )
     # NOTE: a bare dpg.group(...) call does NOT create the item — the context
     # manager must be entered (dearpygui 2.x), same as the original tuple-with.
     with dpg.group(tag="mapper_mappings_group"):
@@ -22895,6 +23798,7 @@ try:
         tick_io_monitor()  # e39s01: I/O Monitor panes (idle-cheap, revision-gated)
 
         tick_raw_flash()  # e82s08: return the changed raw cells to the normal colour
+        tick_mapper_io_leds()  # e96: the card I/O squares (change-gated, idle-cheap)
         tick_tile_status()  # e83: the seek bars between UI passes
 
         tick_mappings()  # e40s01: state Origin -> MIDI/OSC Destination emissions
@@ -22934,7 +23838,4 @@ finally:
         with contextlib.suppress(Exception):
             audio_stream.stop()
             audio_stream.close()
-    if state.local_osc_server is not None:
-        with contextlib.suppress(Exception):
-            state.local_osc_server.shutdown()
     dpg.destroy_context()
