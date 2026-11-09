@@ -12,42 +12,41 @@ import contextlib
 import contextvars
 import io
 import math
-import socket
 import time
 from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
 from PIL import Image
-from pythonosc import osc_server, udp_client
+from pythonosc import udp_client
 
-from vjmixapp import dataplane, iomonitor, state
+from vjmixapp import cmdlink, dataplane, iomonitor, state
 from vjmixapp.constants import (
-    IO_MONITOR_DIRECTION_IN,
     IO_MONITOR_DIRECTION_OUT,
     IO_MONITOR_KIND_DESTINATION,
     IO_MONITOR_KIND_MONITOR,
     IO_MONITOR_KIND_OSC,
     IO_MONITOR_KIND_OSC_SO,
-    IO_MONITOR_KIND_STATE,
     IO_MONITOR_KIND_STATE_PULL,
     IO_MONITOR_KIND_SYNC,
-    IO_MONITOR_KIND_THUMBNAIL,
     IO_MONITOR_KIND_VIMIX,
     IO_MONITOR_KIND_VIOSC,
     IO_MONITOR_KIND_WATCH,
-    IO_MONITOR_KIND_WATCH_REPLY,
     MAPPING_OSC_MAX_PORT,
-    MAX_STATE_JSON_BYTES,
-    MAX_THUMBNAIL_BLOB_BYTES,
+    MAPPING_SO_DEFAULT_TRANSPORT,
+    MAPPING_SO_MIDI_CHANNEL,
+    MAPPING_SO_MIDI_GATE_MAX_MS,
+    MAPPING_SO_MIDI_GATE_MIN_MS,
+    MAPPING_SO_MIDI_GATE_MS,
+    MAPPING_SO_MIDI_NUMBER,
     MAX_THUMBNAIL_PIXELS,
-    RECV_BUFFER_BYTES,
+    MIDI_KIND_CC,
     SECONDARY_OUTPUT_ARGS,
+    SECONDARY_OUTPUT_TRANSPORTS,
+    SO_MIDI_MESSAGES,
     STATE_PATH,
-    STATE_PULL_INTERVAL,
     STATE_PULL_MAX_FAILURES,
     STATE_PULL_STREAM_INTERVAL,
-    THUMB_HTTP_MAX_FAILURES,
     THUMB_REQUESTS_PER_SOURCE,
     VIOSC_IP,
     VIOSC_PORT,
@@ -123,45 +122,21 @@ def thumbnail_decoder_worker() -> None:
         state.blob_queue.task_done()
 
 
-def request_thumbnail_over_osc(name: str, index: int) -> None:
-    """Ask the daemon for one frame on the ORIGINAL OSC lane (e41s03 fallback)."""
-    client = state.viosc_client or osc_client
-    client.send_message(f"/viosc/thumb/{name}", [int(index)])
-
-
 def fetch_one_thumbnail(name: str, index: int) -> bool:
-    """Fetch one frame over the data plane, falling back to OSC (e41s03).
+    """Fetch one frame over the HTTP plane (e41s03, HTTP-only since e98s05).
 
-    Returns True when the data plane produced the blob. On ANY failure the
-    request is re-issued on the OSC lane, so a mixed-version rig keeps working:
-    an older daemon has no ``/thumb`` route at all, and a down server is
-    indistinguishable from that.
-
-    The lane is given up ONLY after THUMB_HTTP_MAX_FAILURES consecutive fetches
-    with NO ANSWER. A 404 answers — the endpoint is alive and has no such frame
-    (an out-of-range index on the e41s02 stall path) — and must not cost the
-    fast lane for the rest of the session.
+    There is no second lane to fall back to: a daemon that does not answer is a
+    daemon that is down (or too old, which the version gate refuses first). The
+    tile shows "no thumbnail" and the next cycle retries — the honest behaviour,
+    and the reason the failure counter and its demotion are gone.
     """
     host = state.dataplane_host
     port = state.dataplane_port
-    blob, answered = dataplane.fetch_thumbnail(host, port, name, index)
-    if blob is not None:
-        state.thumb_http_supported = True
-        state.thumb_http_failures = 0
-        state.blob_queue.put((name, str(index), blob))
-        return True
-    if answered:
-        state.thumb_http_failures = 0
-    else:
-        state.thumb_http_failures += 1
-        if state.thumb_http_failures >= THUMB_HTTP_MAX_FAILURES:
-            state.thumb_http_supported = False
-            log_error(
-                "Thumbnail data plane",
-                f"{host}:{port} not answering — falling back to the OSC thumbnail lane",
-            )
-    request_thumbnail_over_osc(name, index)
-    return False
+    blob, _answered = dataplane.fetch_thumbnail(host, port, name, index)
+    if blob is None:
+        return False
+    state.blob_queue.put((name, str(index), blob))
+    return True
 
 
 def thumbnail_fetch_worker() -> None:
@@ -206,37 +181,27 @@ def poll_state_once() -> bool:
     if answered and status == 304:
         # e82s04: the table did not change since the last revision: the answer IS
         # the freshness, and the round trip cost headers only.
-        state.state_pull_supported = True
         state.state_pull_failures = 0
         state.last_viosc_state_ts = time.monotonic()
         return True
     if text is not None:
-        state.state_pull_supported = True
         state.state_pull_failures = 0
         state.last_viosc_state_ts = time.monotonic()
         state.ui_state_queue.put(text)
         return True
     if answered and status == 401:
         # BUG-2026-09-13T231500: before the pairing prompt is answered the data
-        # plane answers 401. That is "pair first", NOT "older daemon without
-        # /state": keep the lane available so the poll succeeds as soon as the
-        # token exists (the worker retries every interval).
-        state.state_pull_supported = None
+        # plane answers 401 — "pair first", not "broken": the worker retries every
+        # interval and the poll succeeds as soon as the token exists.
         return False
     if answered:
-        state.state_pull_supported = False
-        log_error(
-            "State data plane",
-            "the endpoint answered without /state (older viOSC) — using the OSC push lane",
-        )
+        log_error("State data plane", "the endpoint answered without /state — update viOSC")
         return False
     state.state_pull_failures += 1
     if state.state_pull_failures >= STATE_PULL_MAX_FAILURES:
-        state.state_pull_supported = False
         log_error(
             "State data plane",
-            f"{state.dataplane_host}:{state.dataplane_port} not answering — "
-            "using the OSC push lane",
+            f"{state.dataplane_host}:{state.dataplane_port} not answering",
         )
     return False
 
@@ -250,16 +215,12 @@ def state_poll_worker() -> None:
     """
     while True:
         try:
-            if state.state_pull_supported is not False:
-                poll_state_once()
+            poll_state_once()
         except Exception as e:  # a worker thread must never die (Defensive Code)
             log_error("State data plane", str(e))
-        # e82s04: the 1 Hz pull is the FALLBACK cadence; while the delta stream is
-        # live the snapshot only reconciles (churn, drift) and steps back.
-        interval = (
-            STATE_PULL_STREAM_INTERVAL if state.event_stream_supported else STATE_PULL_INTERVAL
-        )
-        time.sleep(interval)
+        # e82s04/e98s05: the snapshot only reconciles (churn, drift) — /events is
+        # the live lane — so it steps back to the slow cadence, unconditionally.
+        time.sleep(STATE_PULL_STREAM_INTERVAL)
 
 
 def get_current_target_id() -> str | None:
@@ -287,97 +248,6 @@ def find_source_by_name(name: str) -> Any:
     return None, None
 
 
-def _reply_detail(address: str, args: Any) -> str:
-    """The DETAIL of one incoming OSC entry (e39s05).
-
-    The ADDRESS decides, not the payload shape: the state table and a thumbnail
-    are reported by SIZE whatever their length (a short JSON is still a payload
-    the Monitor must not retain), while the watch lane keeps its values because
-    they are exactly what you debug when a LED stutters.
-    """
-    if address == "/viosc/replydata" and args:
-        return f"state table {len(args[0])} B"
-    if address.startswith("/viosc/replythumb/") and args:
-        return f"thumb {len(args[0])} B"
-    if isinstance(args, (list, tuple)) and len(args) >= 2:
-        pairs = [
-            f"{args[i]}={float(args[i + 1]):.2f}"
-            for i in range(0, len(args) - 1, 2)
-            if isinstance(args[i + 1], (int, float))
-        ]
-        if pairs:
-            return " ".join(pairs[:6])
-    return iomonitor.summarize_osc_args(args)
-
-
-def _incoming_kind(address: str) -> str:
-    """The monitor kind of an incoming OSC address (e39s05)."""
-    if address == "/viosc/replydata":
-        return IO_MONITOR_KIND_STATE
-    if address.startswith("/viosc/replythumb/"):
-        return IO_MONITOR_KIND_THUMBNAIL
-    if address.startswith("/viosc/reply/"):
-        return IO_MONITOR_KIND_WATCH_REPLY
-    return IO_MONITOR_KIND_OSC
-
-
-def listen_peer() -> str:
-    """The 'host:port' the local OSC server listens on (the Monitor's Peer column)."""
-    server = state.local_osc_server
-    address = getattr(server, "server_address", None)
-    if isinstance(address, tuple) and len(address) == 2:
-        return f"{address[0]}:{address[1]}"
-    return "osc-in"
-
-
-def incoming_osc_handler(address: str, *args: Any) -> None:
-    try:
-        iomonitor.record_osc(
-            IO_MONITOR_DIRECTION_IN,
-            _incoming_kind(address),
-            address,
-            _reply_detail(address, args),
-            listen_peer(),
-        )
-    except Exception as e:  # observation must never break the receive path
-        log_error("OSC monitor", str(e))
-    try:
-        if address == "/viosc/replydata" and args and len(args[0]) <= MAX_STATE_JSON_BYTES:
-            # e41s04: while the HTTP pull is the live lane, the push must be
-            # DROPPED — ingesting both would double the state work in the UI (and
-            # the pushed table is no fresher). The I/O Monitor still records it:
-            # observation is not ingestion.
-            if state.state_pull_supported is not True:
-                state.last_viosc_state_ts = time.monotonic()
-                state.ui_state_queue.put(args[0])
-        elif address.startswith("/viosc/reply/") and args:
-            # e40s06: a targeted watch delta (prop, value, ...) for one source
-            state.watch_state_queue.put((address[len("/viosc/reply/") :], list(args)))
-        elif (
-            address.startswith("/viosc/replythumb/")
-            and args
-            and len(args[0]) <= MAX_THUMBNAIL_BLOB_BYTES
-        ):
-            parts = address.split("/")
-            state.blob_queue.put((parts[-2], parts[-1], args[0]))
-    except Exception as e:
-        log_error("OSC input", str(e))
-
-
-def size_receive_buffer(sock: Any) -> None:
-    """Give a UDP receive socket an explicit kernel buffer (e41s02).
-
-    socketserver inherits the kernel default, which is small for a burst of
-    datagrams — a state broadcast arriving together with a burst of monitor and
-    watch replies. Best-effort on purpose: a kernel cap or a platform refusing
-    the option must never stop the receiver (Defensive Code).
-    """
-    if sock is None:
-        return
-    with contextlib.suppress(OSError):
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RECV_BUFFER_BYTES)
-
-
 def next_thumb_frame_index(received: int, frames_at_last_request: int) -> int | None:
     """The next thumbnail frame index to ask for, or None to stop (e41s02).
 
@@ -399,18 +269,6 @@ def next_thumb_frame_index(received: int, frames_at_last_request: int) -> int | 
     if received == frames_at_last_request:
         return None
     return received
-
-
-class VjmixOSCUDPServer(osc_server.ThreadingOSCUDPServer):
-    """OSC receiver with a recv buffer large enough for full thumbnail blobs.
-
-    socketserver.UDPServer defaults max_packet_size to 8192, which truncates
-    thumbnail datagrams larger than 8 KB before python-osc can parse them
-    (BUG-2026-08-27T201742); the buffer must fit the largest accepted blob plus
-    the OSC header (address + typetag + size + padding) margin.
-    """
-
-    max_packet_size = MAX_THUMBNAIL_BLOB_BYTES + 4096
 
 
 # e40s03: OSC OUTPUT DESTINATIONS — an opt-in third-party egress.
@@ -550,9 +408,9 @@ class VioscClientRouter:
 
 # The module client: a constant-endpoint default for the case where the
 # composition root has not connected a configured one yet.
-osc_client = VioscClientRouter(
-    observe_client(udp_client.SimpleUDPClient(VIOSC_IP, VIOSC_PORT), f"{VIOSC_IP}:{VIOSC_PORT}")
-)
+# e98s04: with no link up, a send is absorbed and counted — there is no UDP lane
+# to fall back to, and a lost command must never raise into a fade or the grid.
+osc_client = VioscClientRouter(observe_client(cmdlink.OfflineLink(), f"{VIOSC_IP}:{VIOSC_PORT}"))
 
 
 def validate_destination(spec: Any) -> str | None:
@@ -637,20 +495,70 @@ def _secondary_output_scale(raw: dict[str, Any]) -> tuple[float, float] | None:
     return (start, end)
 
 
-def sanitize_secondary_output(raw: Any) -> dict[str, Any] | None:
-    """Heal one stored SO spec, or None when it cannot be a valid egress (e92).
-
-    The normalized form is ``{enabled, host, port, address, arg, fixed}`` plus
-    ``from``/``to`` when the scale is present. Unknown keys are dropped; an
-    invalid host/port/address/argument/scale/number yields None, so a project
-    load drops the SO rather than the Mapping or the cell that carries it.
-    """
-    if not isinstance(raw, dict):
+def _int_in_range(value: Any, low: int, high: int) -> int | None:
+    """An int (or an integral float from JSON) inside [low, high], else None (e95)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
+    number = int(value)
+    if number != value or not low <= number <= high:
+        return None
+    return number
+
+
+def _sanitize_osc_block(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """The OSC half of an SO spec, or None when it cannot be a valid egress (e95)."""
     if validate_destination(raw) is not None:
         return None
     arg = str(raw.get("arg") or "float")
     if arg not in SECONDARY_OUTPUT_ARGS:
+        return None
+    return {
+        "host": str(raw["host"]).strip(),
+        "port": int(raw["port"]),
+        "address": str(raw["address"]).strip(),
+        "arg": arg,
+    }
+
+
+def _sanitize_midi_block(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """The MIDI half of an SO spec, or None when it cannot address a device (e95)."""
+    device = str(raw.get("device") or "").strip()
+    if not device:
+        return None
+    channel = _int_in_range(raw.get("channel", MAPPING_SO_MIDI_CHANNEL), 0, 15)
+    number = _int_in_range(raw.get("number", MAPPING_SO_MIDI_NUMBER), 0, 127)
+    gate = _int_in_range(
+        raw.get("gate", MAPPING_SO_MIDI_GATE_MS),
+        MAPPING_SO_MIDI_GATE_MIN_MS,
+        MAPPING_SO_MIDI_GATE_MAX_MS,
+    )
+    msg = str(raw.get("msg") or MIDI_KIND_CC)
+    if channel is None or number is None or gate is None or msg not in SO_MIDI_MESSAGES:
+        return None
+    return {
+        "device": device,
+        "channel": channel,
+        "msg": msg,
+        "number": number,
+        "gate": gate,
+    }
+
+
+def sanitize_secondary_output(raw: Any) -> dict[str, Any] | None:
+    """Heal one stored SO spec, or None when it cannot be a valid egress (e92/e95).
+
+    The normalized form is ``{enabled, transport, fixed}`` plus the blocks that
+    validate: `host/port/address/arg` (OSC) and `device/channel/msg/number/gate`
+    (MIDI), plus ``from``/``to`` when the scale is present. Only the ACTIVE
+    transport's block must be valid; the inactive one is kept when it is valid so
+    that switching tabs never loses the other side's settings. An invalid active
+    block yields None, so a project load drops the SO rather than the Mapping or
+    the cell that carries it.
+    """
+    if not isinstance(raw, dict):
+        return None
+    transport = str(raw.get("transport") or MAPPING_SO_DEFAULT_TRANSPORT).strip()
+    if transport not in SECONDARY_OUTPUT_TRANSPORTS:
         return None
     fixed = _finite_number(raw.get("fixed", 0.0))
     if fixed is None:
@@ -659,34 +567,77 @@ def sanitize_secondary_output(raw: Any) -> dict[str, Any] | None:
         scale = _secondary_output_scale(raw)
     except ValueError:
         return None
+    osc_block = _sanitize_osc_block(raw)
+    midi_block = _sanitize_midi_block(raw)
+    if transport == "osc" and osc_block is None:
+        return None
+    if transport == "midi" and midi_block is None:
+        return None
     spec: dict[str, Any] = {
         "enabled": bool(raw.get("enabled", True)),
-        "host": str(raw["host"]).strip(),
-        "port": int(raw["port"]),
-        "address": str(raw["address"]).strip(),
-        "arg": arg,
-        "fixed": fixed,
+        "transport": transport,
     }
+    if osc_block is not None:
+        spec.update(osc_block)
+    if midi_block is not None:
+        spec.update(midi_block)
+    spec["fixed"] = fixed
     if scale is not None:
         spec["from"], spec["to"] = scale
     return spec
 
 
+def _validate_midi_block(spec: dict[str, Any]) -> str | None:
+    """The problem with the MIDI half of an SO spec, or None (e95)."""
+    if not str(spec.get("device") or "").strip():
+        return "MIDI device is required"
+    if _int_in_range(spec.get("channel", MAPPING_SO_MIDI_CHANNEL), 0, 15) is None:
+        return f"MIDI channel must be 0..15, got {spec.get('channel')!r}"
+    msg = str(spec.get("msg") or MIDI_KIND_CC)
+    if msg not in SO_MIDI_MESSAGES:
+        return f"MIDI message {msg!r} must be one of {SO_MIDI_MESSAGES}"
+    if _int_in_range(spec.get("number", MAPPING_SO_MIDI_NUMBER), 0, 127) is None:
+        return f"MIDI number must be 0..127, got {spec.get('number')!r}"
+    if (
+        _int_in_range(
+            spec.get("gate", MAPPING_SO_MIDI_GATE_MS),
+            MAPPING_SO_MIDI_GATE_MIN_MS,
+            MAPPING_SO_MIDI_GATE_MAX_MS,
+        )
+        is None
+    ):
+        return (
+            f"MIDI gate must be {MAPPING_SO_MIDI_GATE_MIN_MS}.."
+            f"{MAPPING_SO_MIDI_GATE_MAX_MS} ms, got {spec.get('gate')!r}"
+        )
+    return None
+
+
 def validate_secondary_output(spec: Any) -> str | None:
-    """The problem with an SO spec, or None when it is usable (e92, UI-facing)."""
-    error = validate_destination(spec)
-    if error is not None:
-        return error
-    arg = str(spec.get("arg") or "float")
-    if arg not in SECONDARY_OUTPUT_ARGS:
-        return f"OSC argument {arg!r} must be one of {SECONDARY_OUTPUT_ARGS}"
+    """The problem with an SO spec, or None when it is usable (e92/e95, UI-facing)."""
+    if not isinstance(spec, dict):
+        return "secondary output must be an object"
+    transport = str(spec.get("transport") or MAPPING_SO_DEFAULT_TRANSPORT)
+    if transport not in SECONDARY_OUTPUT_TRANSPORTS:
+        return f"transport {transport!r} must be one of {SECONDARY_OUTPUT_TRANSPORTS}"
+    if transport == "midi":
+        midi_error = _validate_midi_block(spec)
+        if midi_error is not None:
+            return midi_error
+    else:
+        error = validate_destination(spec)
+        if error is not None:
+            return error
+        arg = str(spec.get("arg") or "float")
+        if arg not in SECONDARY_OUTPUT_ARGS:
+            return f"OSC argument {arg!r} must be one of {SECONDARY_OUTPUT_ARGS}"
     fixed = spec.get("fixed")
     if fixed is not None and _finite_number(fixed) is None:
-        return "OSC value must be a finite number"
+        return "SO value must be a finite number"
     try:
         _secondary_output_scale(spec)
     except ValueError:
-        return "OSC scale must give both 'from' and 'to' as finite numbers"
+        return "SO scale must give both 'from' and 'to' as finite numbers"
     return None
 
 

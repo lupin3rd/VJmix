@@ -310,19 +310,19 @@ MAPPER_SMALL_CHAR_PX = 6  # px advance of the 10 px ProggyTiny mapper font (meas
 MAPPER_MINI_W = 150  # px width of one mapping mini-card (caption + output line fit)
 
 
-MAPPER_X_W = 16  # px width of the X delete button on a mini-card caption row
+MAPPER_X_W = 14  # px width of the X delete button on a mini-card caption row
 
 
-MAPPER_X_H = 16  # px height of the X delete button
+MAPPER_X_H = 14  # px height of the X delete button
 
 
-MAPPER_RESET_W = 16  # px width of the reset button on a mini-card caption row (e27s01)
+MAPPER_RESET_W = 14  # px width of the reset button on a mini-card caption row (e27s01)
 
 
-MAPPER_RESET_H = 16  # px height of the reset button
+MAPPER_RESET_H = 14  # px height of the reset button
 
 
-MAPPER_CB_W = 16  # px width of the enable checkbox on a caption row (measured, compact theme)
+MAPPER_CB_W = 14  # px width of the enable checkbox on a caption row (measured, compact theme)
 
 
 # e77: a MOMENTARY GUI button sends its ON value and lights up, then returns OFF on its
@@ -331,10 +331,28 @@ MAPPER_CB_W = 16  # px width of the enable checkbox on a caption row (measured, 
 MAPPER_MOMENTARY_FLASH_S = 0.15
 
 
+# e96: how long the two I/O squares of a Mapping card stay lit after a pulse
+# (cyan = a value reached the Mapping, accent = it emitted). One fixed value:
+# at the 30 Hz band cadence a longer hold would look permanently lit.
+MAPPER_IO_LED_S = 0.15
+
+# e96 (operator report 2026-11-07): RX means "NEW data", not "the source re-read
+# the same number". A band drives its Mapping ~30x/s even in silence, so the
+# pulse is gated on a material change: this fraction of the input window (0.2 %)
+# is the smallest movement that lights the square. 0..1 bands: 0.002; 0..127
+# MIDI: a quarter of one step, so every real CC/note change shows.
+MAPPER_IO_RX_EPSILON = 0.002
+
+
 # e34s01: per-row '+' add button — a NARROW trailing slot (2026-09-05 rework:
 # it used to span the full card pitch and wrapped like a 150 px card on resize).
-MAPPER_ADD_W = 24  # the '+' button width
+MAPPER_ADD_W = 24  # the '+' button width (row '+' — it rides 150 px cards)
 MAPPER_ADD_H = 22  # the '+' button height
+# e97 follow-up (operator 2026-11-07): the TOOLBAR's general creator sits among
+# 14-16 px chips and labels, so it uses its own smaller box (the 24x22 row '+'
+# read as oversized there).
+MAPPER_NEW_W = 16
+MAPPER_NEW_H = 16
 MAPPER_ADD_SLOT_W = 36  # the slot child + its spacing (small, NOT the card pitch)
 # e51s02 follow-up (rig report): the Paste button needs to read its label —
 # wider than the '+' and wide enough for 5 compact-font characters plus the
@@ -396,12 +414,14 @@ MARKER_GROUP_GAP = 18
 
 
 VIOSC_IP = "127.0.0.1"
-
-
-VIOSC_PORT = 6666
-
-
-VIOSC_LISTEN_PORT = 6667  # the port viOSC sends replies to; VJmix's own server listens here
+# e98s03: ONE endpoint. The command stream, the state snapshot, the delta stream,
+# the thumbnails and the config all live on the same HTTP port, so this is the
+# only address the operator types.
+VIOSC_PORT = 8686  # the single HTTP endpoint (e98s03)
+PREVIEW_PORT = VIOSC_PORT  # e98s05: the preview rides the same port (was its own)
+# e98s03: the pre-1.0 endpoints (6666 commands, 6667 replies). They exist ONLY so
+# an upgraded config can be migrated to the single HTTP port; nothing listens here.
+LEGACY_LINK_PORTS = (6666, 6667)
 
 
 # e38: source video preview (SOURCE_PREVIEW_LATEST.md) — the HTTP file
@@ -409,24 +429,25 @@ VIOSC_LISTEN_PORT = 6667  # the port viOSC sends replies to; VJmix's own server 
 # decode/display caps on machine B. Frames are decoded at <= the texture cap
 # (DPG stretches the small texture to the panel) and pushed at most
 # PREVIEW_MAX_FPS — one raw-texture set_value per frame on the main thread.
-PREVIEW_PORT = 8686  # matches the viOSC HTTP preview server default
+
 PREVIEW_PATH_PREFIX = "/preview/"  # served as /preview/<source-name>/file|meta
 THUMB_PATH_PREFIX = "/thumb/"  # e41s03: served as /thumb/<source-name>/<index>
+THUMB_REGEN_PATH = "/thumb/regen"  # e98s05: the HTTP regen (was /viosc/regen_thumb)
 STATE_PATH = "/state"  # e41s04: the state table as a pull resource
 INTEREST_PATH = "/interest"  # e82s05: what a consumer needs, at its cadence
 # e82s05: the properties viOSC keeps synchronised at 1 s (the mirror's state
 # tier). The app must know them to tell "never asked" from "asked, no value".
+# e99s01: MIRROR of viOSC's list (tests/test_e99_tier_mirror.py compares them).
+# Only properties a screen renders at 1 Hz belong here: every name costs Vimix one
+# OSC message per source per second (specs/verifications/AUDIT-viosc-osc-traffic.md).
+# `position`/`size`/`angle`/`id`/`index` left the tier — the raw table shows them
+# as "never asked" and `Refresh all` sweeps them once.
 STATE_TIER_PROPS = (
-    "id",
-    "index",
-    "name",
+    "name",  # the addressing key: a rename must reach a tile within one tick
     "alpha",
     "blending",
     "correction",
     "depth",
-    "position",
-    "size",
-    "angle",
     # e82s08 (user request): the transport/visibility state a tile or a lever may
     # want to show without declaring an interest for it.
     "play",
@@ -448,6 +469,18 @@ STATE_PULL_MAX_FAILURES = 3
 # daemon's 15 s heartbeat detects a dead peer without racing the heartbeat; a
 # revision gap or a reconnect means the client missed a change, so it refetches.
 EVENTS_PATH = "/events"
+# e98s01: the command stream. One frame per chunk; the keepalive is a frame too.
+LINK_PATH = "/link"
+LINK_CONTENT_TYPE = "application/x-viosc-command"
+# A ping every 2 s keeps a NAT mapping alive and lets either side notice a dead
+# peer; the write timeout is what turns a half-open socket into a reconnect.
+LINK_PING_S = 2.0
+LINK_WRITE_TIMEOUT_S = 5.0
+LINK_BACKOFF_MIN_S = 0.5
+LINK_BACKOFF_MAX_S = 5.0
+# A performance is ~10^3 messages/s; 4096 frames is several seconds of show, and
+# past it the value sets coalesce (a set's last value IS the message).
+LINK_QUEUE_MAX = 4096
 STREAM_READ_TIMEOUT = 60.0  # s
 STREAM_BACKOFF_MAX = 30.0  # s: the reconnect ceiling
 # While the stream is live the snapshot survives as a slow reconciliation (source
@@ -493,6 +526,7 @@ PALETTE_SLOTS: list[str] = [
     "play_bg",
     "play_on_bg",
     "spectrum",
+    "led_in",
 ]
 
 
@@ -531,6 +565,9 @@ DEFAULT_PALETTE: dict[str, list[int]] = {
     "play_bg": [80, 80, 80],
     "play_on_bg": [80, 220, 80],
     "spectrum": [80, 255, 120],
+    # e96: the Mapper card RX square (a value reached the Mapping). Fixed cyan,
+    # like `warning`: the five editable primaries must not have to carry it.
+    "led_in": [90, 220, 210],
 }
 
 
@@ -550,6 +587,7 @@ LIGHT_PALETTE: dict[str, list[int]] = {
     "play_bg": [185, 185, 185],
     "play_on_bg": [140, 210, 140],
     "spectrum": [30, 150, 60],
+    "led_in": [20, 150, 145],  # e96: darker cyan, readable on a light panel
 }
 
 
@@ -919,6 +957,8 @@ MIDI_ACTION_MAPPER_RESET = "mapper_reset"  # return the control to its neutral d
 # e33s03: marker-based learn targets on the Mapper rows and the card source menu
 MIDI_ACTION_MAPPER_LINE = "mapper_line"  # variant B: selected media -> the mapper row (line)
 MIDI_ACTION_MAPPER_BAND = "mapper_band"  # bind the mapping to an audio band (2..5)
+# e96: the card I/O squares switch (a display preference, mappable per e33).
+MIDI_ACTION_MAPPER_IO_LEDS = "mapper_io_leds"  # toggle the two card pulse squares
 
 # e33s04: source browsing + selection-relative actions (Mediagrid learn bar).
 # Rule (user, 2026-09-05): bindings never anchor to a volatile source — the
@@ -1047,6 +1087,9 @@ IO_MONITOR_KIND_STATE_PULL = "state"
 IO_MONITOR_KIND_EVENT_STREAM = "stream"
 IO_MONITOR_KIND_INTEREST = "interest"
 IO_MONITOR_KIND_THUMB_HTTP = "thumb"
+# e98s02: the command stream — one long-lived chunked POST /link. The label must
+# fit the Monitor's 8-char KIND column.
+IO_MONITOR_KIND_COMMAND_STREAM = "command"
 IO_MONITOR_OUTCOME_RECV = "RECV"
 # e39s05: a SHORT text/byte arg is summarised by size only beyond this many chars.
 IO_MONITOR_SUMMARY_TEXT_MAX = 48
@@ -1150,16 +1193,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "osc": {
         "client_ip": VIOSC_IP,
         "client_port": VIOSC_PORT,
-        "listen_ip": VIOSC_IP,
-        "listen_port": VIOSC_LISTEN_PORT,
     },
-    # e38: source video preview — the viOSC HTTP file-server port (same host as
-    # the OSC client, machine A). Only the port is tunable; the host always
-    # follows the configured osc client_ip.
-    "preview": {"port": PREVIEW_PORT},
     # e76: display preferences that are not project content. Hover help is ON by
     # default; a VJ switches it off while performing.
-    "ui": {"hover_help": True},
+    # e96: `mapper_io_leds` = the two card pulse squares (a display preference).
+    # BUG-2026-11-07T150000: `audio_device` is the remembered analyzer input
+    # (a rig setting: the machine's device, never the show's content).
+    "ui": {"hover_help": True, "mapper_io_leds": True, "audio_device": ""},
     # e87: the webcam hand engine (opt-in, OFF by default). `provider` says which
     # engine is active (one at a time); the webcam block is the camera setup.
     # The render/CPU budget only pays while `enabled` is true and the provider is
@@ -1339,6 +1379,20 @@ MAPPING_OSC_EMIT_EPSILON = 1e-4  # a float OSC argument needs a real change
 # MIDI Destination kinds (destination_spec['type'])
 MIDI_KIND_NOTE = "note"
 MIDI_KIND_CC = "cc"
+
+# e95: the SO chooses its transport. The SO MIDI block reuses the Mapping
+# Destination's vocabulary (cc|note) but targets an ARBITRARY output port by
+# name, and a Note carries a gate so the release is never forgotten.
+SECONDARY_OUTPUT_TRANSPORTS: tuple[str, ...] = ("osc", "midi")
+MAPPING_SO_DEFAULT_TRANSPORT = "osc"
+SO_MIDI_MESSAGES: tuple[str, ...] = (MIDI_KIND_CC, MIDI_KIND_NOTE)
+MAPPING_SO_MIDI_CHANNEL = 0
+MAPPING_SO_MIDI_NUMBER = 0
+MAPPING_SO_MIDI_GATE_MS = 60
+MAPPING_SO_MIDI_GATE_MIN_MS = 5
+MAPPING_SO_MIDI_GATE_MAX_MS = 2000
+MAPPING_SO_MIDI_SCALE_TO = 127.0  # the implicit MIDI scale target (7-bit)
+SO_IO_DETAIL = "so"  # I/O Monitor detail of an SO MIDI send
 MAPPING_STEPS_CONTINUOUS = 1  # quantisation steps <= 1 means no quantisation
 # e66s01: the sequencer-column Clock Origin. Named because the geometry seed reads it.
 CLOCK_STEP = "step"

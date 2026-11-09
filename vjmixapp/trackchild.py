@@ -51,6 +51,22 @@ CONNECT_TIMEOUT_S = 5.0
 READ_TIMEOUT_S = 0.5
 SUPERVISE_SLEEP_S = 0.2
 SOCKET_PREFIX = "vjmix-track"
+# BUG-2026-11-05T230841: the spawn polls the listener in short slices so a
+# confirmed Exit can CANCEL an accept in flight instead of waiting it out.
+SPAWN_POLL_S = 0.1
+
+
+class SpawnCancelled(Exception):
+    """The supervisor was stopped while spawn was still waiting for the child.
+
+    Carries the process it already started, so the caller can make sure it is
+    dead: the whole point of the fix is that a stopped app never leaks a child.
+    """
+
+    def __init__(self, process: Any = None) -> None:
+        super().__init__("tracker spawn cancelled")
+        self.process = process
+
 
 HANDSHAKE_OK = "ok"
 HANDSHAKE_TIMEOUT = "timeout"
@@ -89,12 +105,19 @@ def forward_child_stderr(stream: Any) -> None:
 
 
 def spawn_child(
-    socket_path: str, token: str, argv: list[str] | None = None
+    socket_path: str,
+    token: str,
+    argv: list[str] | None = None,
+    cancel: threading.Event | None = None,
 ) -> tuple[Any, socket.socket]:
     """Start the child and return ``(process, connected_socket)``.
 
     The socket is created and listened on BEFORE the spawn, so the child can
-    connect immediately and a crash cannot leave a stale path behind.
+    connect immediately and a crash cannot leave a stale path behind. The accept
+    is polled in short slices: when ``cancel`` is set (a confirmed Exit, a host
+    change, a restart) the process is killed and ``SpawnCancelled`` is raised,
+    so a stop can never leave a freshly spawned child behind
+    (BUG-2026-11-05T230841).
     """
     with contextlib.suppress(FileNotFoundError):
         os.unlink(socket_path)
@@ -102,7 +125,7 @@ def spawn_child(
     server.bind(socket_path)
     os.chmod(socket_path, 0o600)
     server.listen(1)
-    server.settimeout(CONNECT_TIMEOUT_S)
+    server.settimeout(SPAWN_POLL_S)
     env = os.environ.copy()
     env[ENV_SOCKET] = socket_path
     env[ENV_TOKEN] = token
@@ -119,11 +142,22 @@ def spawn_child(
     threading.Thread(
         target=forward_child_stderr, args=(process.stderr,), daemon=True, name="trackchild-log"
     ).start()
+    conn: socket.socket | None = None
+    deadline = time.monotonic() + CONNECT_TIMEOUT_S
     try:
-        conn, _ = server.accept()
-    except OSError:
-        process.kill()
-        process.wait(timeout=2.0)
+        while conn is None:
+            if cancel is not None and cancel.is_set():
+                raise SpawnCancelled(process)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("tracker child did not connect")
+            try:
+                conn, _ = server.accept()
+            except TimeoutError:
+                continue
+    except BaseException:
+        # Any failure (cancel, timeout, a cancelled accept) owns the process we
+        # just started: kill it here, the supervisor never sees a handle.
+        _kill_quietly(process)
         raise
     finally:
         server.close()
@@ -131,6 +165,29 @@ def spawn_child(
             os.unlink(socket_path)
     conn.settimeout(HANDSHAKE_TIMEOUT_S)
     return process, conn
+
+
+def _wait_quietly(process: Any, timeout: float = 2.0) -> bool:
+    """True when the process was reaped; False on a timeout (never raises)."""
+    try:
+        process.wait(timeout=timeout)
+        return True
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _kill_quietly(process: Any, timeout: float = 2.0) -> None:
+    """terminate -> kill -> give up, never raising (BUG-2026-11-05T230841)."""
+    if process is None or process.poll() is not None:
+        return
+    with contextlib.suppress(Exception):
+        process.terminate()
+    with contextlib.suppress(Exception):
+        process.wait(timeout=timeout)
+        return
+    with contextlib.suppress(Exception):
+        process.kill()
+        process.wait(timeout=timeout)
 
 
 def _process_dead(process: Any) -> bool:
@@ -142,10 +199,12 @@ class TrackerChild:
 
     def __init__(
         self,
-        spawn: Callable[[str, str], tuple[Any, socket.socket]] = spawn_child,
+        spawn: Callable[[str, str], tuple[Any, socket.socket]] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._spawn = spawn
+        # The default spawner takes the supervisor's stop flag, so a confirmed
+        # Exit (or a host change) cancels an accept already in flight.
+        self._spawn = spawn if spawn is not None else self._default_spawn
         self._clock = clock
         self._lock = threading.RLock()
         self._frame_ready = threading.Condition(self._lock)
@@ -303,20 +362,46 @@ class TrackerChild:
             self._status = STATUS_LIVE
         state.tracking_restarts = 0
 
+    def _default_spawn(self, socket_path: str, token: str) -> tuple[Any, socket.socket]:
+        """The real spawner, wired to this supervisor's stop flag (e95 bugfix)."""
+        return spawn_child(socket_path, token, cancel=self._stop)
+
     def _connect(self) -> None:
         with self._lock:
             self._status = STATUS_STARTING
             token = os.urandom(16).hex()
+            generation = self._generation
         try:
             process, conn = self._spawn(socket_path_for(os.getpid()), token)
+        except SpawnCancelled:
+            return  # a stop cancelled the spawn; spawn_child killed the child
         except (OSError, subprocess.SubprocessError) as exc:
             self._fail(STATUS_OFFLINE, f"spawn failed: {exc}")
             return
+        # BUG-2026-11-05T230841: publish the handle BEFORE the handshake (which
+        # can take 10 s), so a stop() in that window can terminate it. The old
+        # order left _process None and leaked the child.
+        with self._lock:
+            self._process = process
         reason = self._handshake(conn, token)
+        with self._lock:
+            stopped = self._stop.is_set() or generation != self._generation
+        if stopped:
+            # stop() may already have killed it; this is the belt-and-braces.
+            _kill_quietly(process)
+            with contextlib.suppress(OSError):
+                conn.close()
+            with self._lock:
+                if self._process is process:
+                    self._process = None
+            return
         if reason != HANDSHAKE_OK:
-            process.kill()
-            process.wait(timeout=2.0)
-            conn.close()
+            _kill_quietly(process)
+            with contextlib.suppress(OSError):
+                conn.close()
+            with self._lock:
+                if self._process is process:
+                    self._process = None
             self._handshake_failed(reason)
             return
         conn.settimeout(READ_TIMEOUT_S)
@@ -447,11 +532,16 @@ class TrackerChild:
             conn.close()
         if process is not None and process.poll() is None:
             process.terminate()
-            try:
-                process.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
+            if not _wait_quietly(process):
                 process.kill()
-                process.wait(timeout=2.0)
+                if not _wait_quietly(process):
+                    # A D-state camera open cannot be interrupted; say so instead
+                    # of hiding the failure (shutdown used to swallow it).
+                    log_warn(
+                        "Tracking",
+                        "tracker child survived SIGKILL - the camera may stay busy "
+                        "until the device call returns",
+                    )
 
 
 def host_from_config(cfg: dict[str, Any]) -> str:

@@ -143,14 +143,16 @@ def has_problems(report: dict) -> bool:
     return bool(report.get("invalid") or report.get("unknown") or report.get("local_only"))
 
 
-def link_fields(listen_ip: str, listen_port: int) -> dict:
-    """viOSC's push destination, derived from VJmix's listen endpoint (e58s03).
+def link_fields(http_ip: str, http_port: int) -> dict:
+    """The one endpoint both sides share (e58s03, collapsed in e98s05).
 
-    ``ui_ip``/``reply_port`` are where viOSC sends state back; they MUST match
-    VJmix's listening endpoint, so VJmix derives them instead of letting them be
-    set independently on viOSC (the collapsed link config).
+    Before 1.0 this derived viOSC's UDP push destination from VJmix's listening
+    endpoint — two fields that had to agree. There is one HTTP endpoint now, and
+    it is machine-A-local (`local_only`), so the page does not push it: it only
+    records what the operator sees. Kept as a helper so the config diff still
+    shows the value the daemon will use.
     """
-    return {"ui_ip": str(listen_ip), "reply_port": int(listen_port)}
+    return {"http_ip": str(http_ip), "http_port": int(http_port)}
 
 
 def format_value(value: Any) -> str:

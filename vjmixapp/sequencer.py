@@ -9,7 +9,7 @@ import random
 import time
 from typing import Any
 
-from vjmixapp import catalog, osc, shadercode, sourcekind, state, textplay
+from vjmixapp import catalog, osc, secondary, shadercode, sourcekind, state, textplay
 from vjmixapp.colorscale import dpg_color_rgba  # e61: never the GUI module (HIGH-1)
 from vjmixapp.constants import (
     BEAT_SOURCE_BAND1,
@@ -170,7 +170,7 @@ def _send_step_secondary_output(step_data: dict[str, Any]) -> None:
     if not isinstance(spec, dict) or not spec.get("enabled", True):
         return
     try:
-        osc.send_secondary_output(spec, float(spec.get("fixed", 0.0)))
+        secondary.send_so(spec, float(spec.get("fixed", 0.0)))
     except Exception as e:  # defensive: the sender already logs its own failures
         print(f"[VJmix OSC Error] {e}")
 

@@ -1,0 +1,89 @@
+VJmix — third-party notices
+===========================
+
+VJmix itself is Copyright (C) 2026 lupin3rd and licensed under the GNU General
+Public License v3.0 (see ../LICENSE). The components listed here are NOT part of
+that work: they are compiled into, linked with, or shipped next to the binary.
+Each entry names the copyright holder, the licence and the upstream source; the
+licence texts sit in this directory.
+
+The pip dependencies of requirements.txt (Dear PyGui, essentia, numpy,
+python-osc, sounddevice, Pillow, PyAV, onnxruntime, mido, python-rtmidi,
+aalink) keep their own licence files verbatim under distributions/<name>/,
+copied from the wheel by scripts/collect_licenses.py. The inventory that maps
+each one to a licence is ../THIRD_PARTY_LICENSES.md.
+
+Compiled into or shipped with the application
+---------------------------------------------
+
+1. FFmpeg (inside the PyAV wheel)
+   Copyright (c) the FFmpeg developers.
+   Licence: LGPL-2.1-or-later — the upstream default; the wheel does not expose
+   its configure flags, and a build with --enable-gpl would add
+   GPL-2.0-or-later, which is compatible with VJmix's GPL-3.0 either way.
+   Text: LGPL-2.1.txt
+   Source: https://ffmpeg.org/download.html
+
+2. PortAudio v19.7.0 (built from source, shipped as usr/lib/libportaudio.so.2,
+   ALSA only)
+   Copyright (c) 1999-2006 Ross Bencina and Phil Burk.
+   Licence: MIT
+   Text: PortAudio-MIT.txt
+   Source: https://github.com/PortAudio/portaudio
+
+3. RtMidi (inside python-rtmidi)
+   Copyright (c) 2003-2023 Gary P. Scavone, McGill University.
+   Licence: modified MIT
+   Text: distributions/python_rtmidi/LICENSE.md
+   Source: https://github.com/thestk/rtmidi
+
+4. Ableton Link (inside aalink)
+   Copyright (c) Ableton AG.
+   Licence: GPL-3.0; Ableton also sells a proprietary licence for closed
+   products, which VJmix does not need because it is GPL-3.0 itself.
+   Text: GPL-3.0.txt (also distributions/aalink/LICENSE)
+   Source: https://github.com/Ableton/link
+
+5. The two ONNX hand-tracking models
+   (vjmixapp/assets/handtrack/palm_detection_mediapipe_2023feb.onnx,
+   vjmixapp/assets/handtrack/handpose_estimation_mediapipe_2023feb.onnx)
+   Copyright 2023 OpenCV, converted from the MediaPipe Hands model bundle
+   (Copyright Google LLC).
+   Licence: Apache-2.0
+   Text: Apache-2.0.txt; the notice required by §4(a)/(b) also ships next to
+   the models in vjmixapp/assets/handtrack/NOTICE.md
+   Sources: https://huggingface.co/opencv/palm_detection_mediapipe ,
+   https://huggingface.co/opencv/handpose_estimation_mediapipe ,
+   https://github.com/opencv/opencv_zoo
+
+6. ProggyTiny font (vjmixapp/assets/ProggyTiny.ttf)
+   Copyright (c) 2004, 2005 Tristan Grimmer.
+   Licence: MIT
+   Text: ProggyTiny-MIT.txt
+   Source: https://github.com/bluescan/proggyfonts
+
+7. Font Awesome 4.7.0 webfont (vjmixapp/assets/fontawesome-webfont.ttf)
+   Copyright Dave Gandy 2016.
+   Licence: the font is SIL OFL 1.1; Font Awesome's code and documentation are
+   MIT (none of that code ships here).
+   Text: OFL-1.1.txt
+   Source: https://fontawesome.com/v4/
+
+8. Vimix blending icons (vjmixapp/assets/blending_icons.png)
+   Copyright (C) Bruno Herbelin.
+   Licence: GPL-3.0, the same as VJmix; extracted from vimix's icon atlas by
+   scripts/extract_blending_icons.py.
+   Text: GPL-3.0.txt
+   Source: https://github.com/brunoherbelin/vimix
+
+9. CPython 3.13 runtime (inside the AppImage base)
+   Copyright (c) 2001-2024 Python Software Foundation.
+   Licence: PSF-2.0, together with the historical CWI/CNRI/BeOpen terms and the
+   0BSD licence for documentation code.
+   Text: Python-2.0.txt
+   Source: https://www.python.org/
+
+10. The shared libraries of the manylinux_2_28 base image (glibc, libstdc++,
+    the X11/OpenGL client libraries, ALSA, ...) are redistributed by that base
+    under their own licences and are not enumerated here one by one. The base
+    is https://github.com/niess/python-appimage (manylinux_2_28 image).

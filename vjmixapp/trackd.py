@@ -25,6 +25,7 @@ import socket
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -52,6 +53,12 @@ RETRY_BEAT_S = 0.4
 # already knows how to recover: kill -> restart a clean child. Measured on the
 # rig: after a SIGKILL the UVC node can deliver one frame and then stall.
 STUCK_ITERATION_S = 10.0
+# BUG-2026-11-05T230841: a child must not outlive its parent. The control loop
+# notices the socket EOF, but a thread blocked in a camera call cannot; this
+# guard exits the process even then.
+PARENT_GUARD_POLL_S = 1.0
+EXIT_PARENT_GONE = 3
+PR_SET_PDEATHSIG = 1
 WATCHDOG_POLL_S = 1.0
 EXIT_STUCK = 3
 JPEG_QUALITY = 70
@@ -762,6 +769,56 @@ class ChildRuntime:
             time.sleep(0.5)
 
 
+def _prctl_parent_death_signal() -> bool:
+    """Best-effort Linux PR_SET_PDEATHSIG(SIGKILL); False elsewhere, never raises."""
+    if sys.platform != "linux":
+        return False
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        return libc.prctl(PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0) == 0
+    except Exception:
+        return False
+
+
+def install_parent_death_guard(
+    parent_pid: int | None = None,
+    *,
+    poll: float = PARENT_GUARD_POLL_S,
+    getppid: Callable[[], int] = os.getppid,
+    exit_process: Callable[[int], None] = os._exit,
+    stop: threading.Event | None = None,
+) -> threading.Thread | None:
+    """Exit this child when its parent dies (BUG-2026-11-05T230841).
+
+    Two belts: the kernel's ``PR_SET_PDEATHSIG`` (Linux) and a polling thread
+    that compares ``getppid()`` with the pid captured at startup — the portable
+    path, and the one that fires even if the parent dies while no thread can
+    read the socket. A parent already gone at install time exits immediately.
+    Returns the guard thread, or None when the parent was already gone.
+    """
+    expected = int(os.getppid() if parent_pid is None else parent_pid)
+    _prctl_parent_death_signal()
+    if getppid() != expected:
+        exit_process(EXIT_PARENT_GONE)
+        return None
+
+    def _watch() -> None:
+        while stop is None or not stop.is_set():
+            if stop is not None:
+                stop.wait(poll)
+            else:
+                time.sleep(poll)
+            if getppid() != expected:
+                exit_process(EXIT_PARENT_GONE)
+                return
+
+    thread = threading.Thread(target=_watch, daemon=True, name="trackd-parent-guard")
+    thread.start()
+    return thread
+
+
 def _install_signal_handlers(runtime: ChildRuntime) -> None:
     for signal_name in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signal_name, lambda *_: runtime.stopping.set())
@@ -769,6 +826,8 @@ def _install_signal_handlers(runtime: ChildRuntime) -> None:
 
 def main() -> int:
     """Entry point: connect to the parent, handshake, then serve until told to stop."""
+    parent_pid = os.getppid()
+    install_parent_death_guard(parent_pid)
     socket_path = os.environ.get(ENV_SOCKET, "")
     token = os.environ.get(ENV_TOKEN, "")
     if not socket_path or not token:

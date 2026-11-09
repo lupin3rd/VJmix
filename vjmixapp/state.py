@@ -35,15 +35,11 @@ from vjmixapp.constants import (
 from vjmixapp.textplay import DEFAULT_REVEAL_MODE
 
 viosc_client: Any = None
-
-
-local_osc_server: Any = None
-
-
-local_server_thread: threading.Thread | None = None
-
-
-is_server_running: bool = False
+# e98s01: the command link (a CommandLink instance while one exists). Read by the
+# viOSC panel and the I/O Monitor header for the four link states.
+command_link: Any = None
+# e98s03: the daemon's `app_version` from GET /config. "<1.0.0" is refused.
+viosc_app_version: str = ""
 
 
 midi_enabled: bool = False
@@ -117,8 +113,6 @@ blob_queue: queue.Queue[Any] = queue.Queue()
 # thumb_http_failures counts consecutive fetches with NO answer at all.
 # dataplane_host/port are the machine-A HTTP endpoint, set with the OSC client.
 thumb_fetch_queue: queue.Queue[Any] = queue.Queue()
-thumb_http_supported: bool | None = None
-thumb_http_failures: int = 0
 dataplane_host: str = ""
 dataplane_port: int = 0
 
@@ -182,11 +176,8 @@ send_remap_armed_at: float = 0.0
 # reassignment panel consumes it, e45s02).
 drafts_sources: dict[int, list[dict[str, Any]]] = {}
 
-# e41s04: the state pull lane. state_pull_supported is the runtime lane probe
-# (None = not yet tried, True = proven, False = given up for the session); while
-# it is True the OSC /viosc/replydata push is DROPPED so the state is never
-# ingested twice. state_pull_failures counts consecutive unanswered pulls.
-state_pull_supported: bool | None = None
+# state_pull_failures counts consecutive unanswered pulls (the reconciliation
+# snapshot is the only state source since e98s05: /events pushes the deltas).
 state_pull_failures: int = 0
 
 
@@ -865,6 +856,20 @@ mapper_counter: int = 0
 # FULL; OFF honours each mapping's `compact` flag (performance).
 mapper_configure_mode: bool = False
 
+# e96: the two I/O squares of a Mapping card. Per mapping id, the monotonic
+# deadline until which the square stays lit: `in` = a value reached the Mapping
+# (cyan), `out` = it emitted to its Destination/SO (accent). Written from the
+# drive threads (plain dict assignment, the _RAW_FLASH_UNTIL pattern), read by
+# the main-loop tick; no dpg here, no Timer per event.
+mapping_io_in_until: dict[int, float] = {}
+mapping_io_out_until: dict[int, float] = {}
+# e96: the last inbound value per mapping, so RX pulses on MOVEMENT (a band that
+# repeats 0.0 in silence must leave the square dark), not on every re-read.
+mapping_io_last_in: dict[int, float] = {}
+# e96: the persisted display preference (`ui.mapper_io_leds`): OFF draws no
+# squares and clears both dicts.
+mapper_io_leds: bool = True
+
 
 # e51s02: the Mapper clipboard — a captured Mapping snapshot (MAPPER_PERSISTED_KEYS
 # minus the id) awaiting a Paste, mirroring `copied_step_data` for the sequencer.
@@ -975,7 +980,6 @@ mapping_book: dict[int, dict[str, Any]] = {}
 mapping_values: dict[int, float] = {}
 # e40s01: the /viosc/monitor subscriptions the live mappings currently hold, so the
 # tick only re-issues them when the desired set changes.
-mapping_subscriptions: dict[str, list[str]] = {}
 # e40s02: Mappings the orphan policy disabled (their source is gone); they are
 # re-enabled automatically when the source comes back.
 mapping_orphans: set[int] = set()
@@ -999,7 +1003,6 @@ watch_state_queue: queue.Queue[tuple[str, list[Any]]] = queue.Queue()
 # here; the MAIN thread applies them to the table (worker modules never touch dpg).
 event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
 # None = not probed yet, True = live, False = this daemon has no /events.
-event_stream_supported: bool | None = None
 # The last revision this app has applied (snapshot or event); it is the ETag of
 # the snapshot and the gap detector of the stream.
 event_rev: int = 0
@@ -1013,9 +1016,7 @@ media_cell_w: float = 0.0
 last_current_source: Any = None
 # e82s05: POST /interest lane. None = not probed, True = the daemon accepts it,
 # False = an older daemon (fall back to /viosc/watch).
-interest_supported: bool | None = None
 # e82s05: the properties some consumer has asked for, so the raw table can render
 # "never asked" differently from "asked, no value".
 asked_props: set[str] = set()
 mapping_watch_plan: dict[str, dict[str, Any]] = {}
-osc_watch_supported: bool | None = None

@@ -147,7 +147,6 @@ def read_stream(host: str, port: int) -> None:
     with urllib.request.urlopen(request, timeout=STREAM_READ_TIMEOUT) as response:
         if response.status != 200:
             raise ConnectionError(f"/events answered HTTP {response.status}")
-        state.event_stream_supported = True
         iomonitor.record_http(
             IO_MONITOR_KIND_EVENT_STREAM, EVENTS_PATH, "open", f"{host}:{port}", 200
         )
@@ -188,11 +187,7 @@ def stream_worker(host: str = "", port: int = 0) -> None:
             backoff = 1.0
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                state.event_stream_supported = False
-                log_error(
-                    "State stream",
-                    "the endpoint has no /events (older viOSC) — using the /state pull lane",
-                )
+                log_error("State stream", "the endpoint has no /events — update viOSC")
                 return
             log_error("State stream", f"HTTP {e.code}")
         except Exception as e:  # a worker thread must never die (Defensive Code)
