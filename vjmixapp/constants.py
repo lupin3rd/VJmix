@@ -1660,5 +1660,12 @@ MIDI_ACTION_DRAFT_SAVE = "draft_save"
 # Manager selection through `state.fs_entries`.
 MIDI_ACTION_DRAFT_STEP = "draft_step"
 MIDI_ACTION_FILE_STEP = "file_step"
+
+# e100: the folder-session wizard (a themed folder becomes a session). The
+# wizard's own choices stay local to its window; this action only opens it, so
+# it is momentary like every other dialog opener.
+MIDI_ACTION_FOLDER_SESSION = "folder_session"
 MIDI_ACTION_FILE_NEXT = "file_next"
 MIDI_ACTION_FILE_PREV = "file_prev"
+# BUG-2026-11-14T210000 follow-up: fetch the next page of a large directory.
+MIDI_ACTION_FILE_MORE = "file_more"

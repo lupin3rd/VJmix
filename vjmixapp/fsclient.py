@@ -26,6 +26,7 @@ FS_THUMB_PATH = "/fs/thumb"
 FS_RAW_PATH = "/fs/raw"
 FS_SESSIONS_PATH = "/fs/sessions"
 FS_SESSION_PATH = "/fs/session"
+FS_SCAN_PATH = "/fs/scan"
 
 
 def roots_url(host: str, port: int) -> str:
@@ -104,9 +105,31 @@ def raw_url(host: str, port: int, path: str) -> str:
     return f"http://{host}:{port}{FS_RAW_PATH}?{query}"
 
 
-def sessions_url(host: str, port: int) -> str:
-    """URL of the written Session Drafts (e43s06)."""
-    return f"http://{host}:{port}{FS_SESSIONS_PATH}"
+def sessions_url(host: str, port: int, directory: str | None = None) -> str:
+    """URL of the written sessions (e43s06), possibly inside one folder (e100)."""
+    if not directory:
+        return f"http://{host}:{port}{FS_SESSIONS_PATH}"
+    query = urllib.parse.urlencode({"dir": str(directory)})
+    return f"http://{host}:{port}{FS_SESSIONS_PATH}?{query}"
+
+
+def scan_url(host: str, port: int, path: str, recursive: bool = False) -> str:
+    """URL of one folder scan (the wizard's count, e100s01)."""
+    query = urllib.parse.urlencode({"path": str(path), "recursive": "1" if recursive else "0"})
+    return f"http://{host}:{port}{FS_SCAN_PATH}?{query}"
+
+
+def scan_folder(
+    host: str, port: int, path: str, recursive: bool = False
+) -> tuple[dict | None, int | None]:
+    """The video files of a folder tree, or ``(None, status|None)`` (e100s01)."""
+    if not host or not port or not path:
+        return None, None
+    body, status = _get(scan_url(host, port, path, recursive))
+    if body is None:
+        return None, status
+    data = _decode(body)
+    return (data if isinstance(data, dict) else None), status
 
 
 def session_url(host: str, port: int) -> str:
@@ -138,11 +161,17 @@ def _post_json(url: str, payload: dict) -> tuple[bytes | None, int | None]:
         return None, None
 
 
-def fetch_sessions(host: str, port: int) -> tuple[list | None, int | None]:
-    """The Session Drafts already written on machine A, or ``(None, status)``."""
+def fetch_sessions(
+    host: str, port: int, directory: str | None = None
+) -> tuple[list | None, int | None]:
+    """The sessions already written on machine A, or ``(None, status)``.
+
+    ``directory`` (e100) lists one Media Roots folder instead of the configured
+    sessions directory, and each entry then carries its recipe sidecar.
+    """
     if not host or not port:
         return None, None
-    body, status = _get(sessions_url(host, port))
+    body, status = _get(sessions_url(host, port, directory))
     if body is None:
         return None, status
     data = _decode(body)
@@ -157,6 +186,8 @@ def write_session(
     *,
     overwrite: bool = False,
     alphas: dict[str, float] | None = None,
+    directory: str | None = None,
+    recipe: dict | None = None,
 ) -> tuple[dict | None, int | None]:
     """Write one Session Draft on machine A; ``(payload, status)``.
 
@@ -175,6 +206,10 @@ def write_session(
         payload["overwrite"] = True
     if alphas:
         payload["alphas"] = {str(k): float(v) for k, v in alphas.items()}
+    if directory:
+        payload["dir"] = str(directory)
+    if recipe is not None:
+        payload["recipe"] = recipe
     body, status = _post_json(session_url(host, port), payload)
     if body is None:
         return None, status

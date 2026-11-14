@@ -143,18 +143,6 @@ def has_problems(report: dict) -> bool:
     return bool(report.get("invalid") or report.get("unknown") or report.get("local_only"))
 
 
-def link_fields(http_ip: str, http_port: int) -> dict:
-    """The one endpoint both sides share (e58s03, collapsed in e98s05).
-
-    Before 1.0 this derived viOSC's UDP push destination from VJmix's listening
-    endpoint — two fields that had to agree. There is one HTTP endpoint now, and
-    it is machine-A-local (`local_only`), so the page does not push it: it only
-    records what the operator sees. Kept as a helper so the config diff still
-    shows the value the daemon will use.
-    """
-    return {"http_ip": str(http_ip), "http_port": int(http_port)}
-
-
 def format_value(value: Any) -> str:
     """The UI text for a config value (list fields join with commas) (e58s03)."""
     if isinstance(value, list):

@@ -31,6 +31,7 @@ from vjmixapp import (
     dataplane,
     drafts,
     emission,
+    foldersession,
     fsclient,
     handio,
     handtrack,
@@ -243,9 +244,11 @@ from vjmixapp.constants import (
     MIDI_ACTION_DRAFT_STEP,
     MIDI_ACTION_ENABLE_CORRECTION,
     MIDI_ACTION_FILE_MANAGER_TOGGLE,
+    MIDI_ACTION_FILE_MORE,
     MIDI_ACTION_FILE_NEXT,
     MIDI_ACTION_FILE_PREV,
     MIDI_ACTION_FILE_STEP,
+    MIDI_ACTION_FOLDER_SESSION,
     MIDI_ACTION_HANDTRACK_RESTART,
     MIDI_ACTION_HANDTRACK_TOGGLE,
     MIDI_ACTION_IO_MONITOR_TOGGLE,
@@ -664,7 +667,7 @@ Image.MAX_IMAGE_PIXELS = 25_000_000  # PIL's hard ceiling (~25 MP)
 # 0.4.0 — Leap Motion mapper source, per-mapping reset, project save + OSC config persist,
 # Mapper tile/row workflows (thumb assign, Add-to-Mapper submenu, line numbers).
 # 0.3.0 — Mapper family (rows/rescale/enable/cycle), compact Vimix-sources grid, windows, XDG.
-APP_VERSION: str = "1.3.0"
+APP_VERSION: str = "1.3.1"
 
 # The VJmix project repository, shown as a link in the Info window (e08s01; retargeted from the
 # author's profile to the project by e08s03, user request).
@@ -4928,14 +4931,18 @@ def _rebuild_viosc_config_fields(payload: dict[str, Any]) -> None:
     else:
         dpg.add_group(tag=VIOSC_CFG_FIELDS_TAG, parent="settings_window")
     values = payload.get("values") or {}
-    for key in payload.get("editable") or []:
+    for raw_key in payload.get("editable") or []:
+        key = str(raw_key)
+        value = values.get(key)
+        tag = f"{VIOSC_CFG_INPUT_PREFIX}{key}"
         with dpg.group(horizontal=True, parent=VIOSC_CFG_FIELDS_TAG):
-            dpg.add_text(key)
-            dpg.add_input_text(
-                default_value=viosccfg.format_value(values.get(key)),
-                tag=f"{VIOSC_CFG_INPUT_PREFIX}{key}",
-                width=220,
-            )
+            # BUG-2026-11-14T190000: a human label + a hover card, not a raw key.
+            dpg.add_text(helpprose.viosc_config_label(key))
+            if isinstance(value, bool):
+                dpg.add_checkbox(default_value=value, tag=tag)
+            else:
+                dpg.add_input_text(default_value=viosccfg.format_value(value), tag=tag, width=220)
+            help_tooltip(tag, f"viosc.{key}", card=helpprose.viosc_config_entry(key))
 
 
 def _set_viosc_cfg_status(message: str = "") -> None:
@@ -4978,8 +4985,9 @@ def save_viosc_config() -> None:
             except (ValueError, TypeError):
                 _set_viosc_cfg_status(f"{key}: invalid input")
                 return
-    endpoints = _osc_endpoints_from_config(load_config())
-    edited.update(viosccfg.link_fields(endpoints["client_ip"], endpoints["client_port"]))
+    # BUG-2026-11-14T210000 follow-up: http_ip/http_port are local_only on the
+    # daemon (viOSC window only). Posting them produced a 400 + "local-only"
+    # line on every save, so the page sends ONLY the remote-editable diff.
     report, err = viosccfg.apply_config(host, port, viosccfg.config_diff(original, edited))
     if err or report is None:
         _set_viosc_cfg_status(f"viOSC error: {err or 'no report'}")
@@ -5218,6 +5226,16 @@ FILE_MANAGER_LEARN_SLOT = "fs_learn_slot"
 FILE_MANAGER_WIDTH = 660
 FILE_MANAGER_HEIGHT = 640
 FILE_MANAGER_LIST_HEIGHT = 300
+# BUG-2026-11-14T190000: the window itself never scrolls. The folder list is the
+# ONE scroll region and fills the space the fixed top/bottom blocks leave.
+FS_TOP_GROUP = "fs_top_group"
+FS_BOTTOM_GROUP = "fs_bottom_group"
+FS_SCROLL_TAG = "fs_scroll"
+FS_LOAD_MORE_TAG = "fs_load_more"
+FS_LIST_MIN_HEIGHT = 100
+FS_LAYOUT_GAP = 4  # the default ItemSpacing.y between the three blocks
+FS_WINDOW_BOTTOM_PAD = 12  # window padding + border kept below the fixed block
+_fs_list_height: int | None = None
 FS_ENTRIES_COLUMNS = 2
 FS_ENTRY_LABEL_WIDTH = 220
 # e46s01: the compact toolbar strip at the top of the viewport; the workspace
@@ -5230,8 +5248,9 @@ def show_file_manager_window(*_args: Any) -> None:
     """Windows menu / e33 action: show the File Manager (load the roots once)."""
     dpg.show_item(FILE_MANAGER_TAG)
     dpg.focus_item(FILE_MANAGER_TAG)
-    if not state.fs_roots and not state.fs_busy:
-        fs_refresh()
+    # BUG-2026-11-14T210000: always re-read the roots, so a fs_roots change made
+    # in Settings while the window was closed appears on the next open.
+    fs_refresh()
 
 
 def toggle_file_manager_window(*_args: Any) -> None:
@@ -5242,6 +5261,83 @@ def toggle_file_manager_window(*_args: Any) -> None:
         dpg.hide_item(FILE_MANAGER_TAG)
         return
     show_file_manager_window()
+
+
+def fs_list_height(
+    content_height: float, top_height: float, bottom_height: float, gap: float = FS_LAYOUT_GAP
+) -> int:
+    """The folder list's height: what the fixed blocks leave inside the window.
+
+    All three inputs are independent of the list itself, so re-running the layout
+    cannot feed back into its own measurement.
+    """
+    usable = content_height - top_height - bottom_height - 2 * gap
+    return max(FS_LIST_MIN_HEIGHT, int(usable))
+
+
+def _fs_rect_min(tag: str) -> tuple[float, float]:
+    """An item's rect min, or (0, 0) while DearPyGui has no state for it yet.
+
+    DPG 2.3.1 raises KeyError('rect_min') for an item shown in the SAME frame
+    (the state is filled when the frame is drawn), and for a window item it
+    never carries rect_min at all. Neither may escape the main loop: an
+    uncaught exception there reaches `destroy_context()` and closes the app
+    (BUG-2026-11-14T230000).
+    """
+    try:
+        x, y = dpg.get_item_rect_min(tag)
+    except KeyError:
+        return 0.0, 0.0
+    return float(x), float(y)
+
+
+def _fs_rect_size(tag: str) -> tuple[float, float]:
+    """An item's rect size, or (0, 0) while DearPyGui has no state for it yet."""
+    try:
+        width, height = dpg.get_item_rect_size(tag)
+    except KeyError:
+        return 0.0, 0.0
+    return float(width), float(height)
+
+
+def _layout_file_manager() -> None:
+    """Make the folder list fill the space the fixed chrome leaves.
+
+    The window height gives the available content height (minus the title bar and
+    a conservative bottom pad, where the title offset is the top group's y minus
+    the WINDOW POSITION: get_item_rect_min on a window raises KeyError in DPG
+    2.3.1). The two fixed blocks contribute their own HEIGHT only: they flow
+    after the list, so reading their y would just echo the current list height.
+    Until the window has been drawn once every measurement is zero, so the
+    build-time height stands and the next tick settles it.
+    """
+    global _fs_list_height
+    if not (
+        dpg.does_item_exist(FILE_MANAGER_TAG)
+        and dpg.does_item_exist(FS_SCROLL_TAG)
+        and dpg.does_item_exist(FS_TOP_GROUP)
+        and dpg.does_item_exist(FS_BOTTOM_GROUP)
+    ):
+        return
+    window_height = int(dpg.get_item_height(FILE_MANAGER_TAG) or 0)
+    window_pos = dpg.get_item_pos(FILE_MANAGER_TAG)
+    top_min = _fs_rect_min(FS_TOP_GROUP)
+    top_size = _fs_rect_size(FS_TOP_GROUP)
+    bottom_size = _fs_rect_size(FS_BOTTOM_GROUP)
+    if window_height <= 0 or top_size[1] <= 0 or bottom_size[1] <= 0:
+        return
+    content_height = window_height - (top_min[1] - window_pos[1]) - FS_WINDOW_BOTTOM_PAD
+    height = fs_list_height(content_height, top_size[1], bottom_size[1])
+    if height == _fs_list_height:
+        return
+    _fs_list_height = height
+    dpg.configure_item(FS_SCROLL_TAG, height=height)
+
+
+def tick_file_manager_layout() -> None:
+    """Main-loop tick: settle the folder list after a show, resize or rebuild."""
+    if dpg.does_item_exist(FILE_MANAGER_TAG) and dpg.is_item_shown(FILE_MANAGER_TAG):
+        _layout_file_manager()
 
 
 def _fs_endpoint() -> tuple[str, int]:
@@ -5260,12 +5356,39 @@ def _fs_error_text(status: int | None) -> str:
     return f"Error ({status})."
 
 
+def fs_path_in_roots(path: str, roots: list[str]) -> bool:
+    """True when ``path`` is one of the roots or lives inside one."""
+    if not path:
+        return False
+    clean = str(path).rstrip("/") or "/"
+    for root in roots:
+        base = str(root).rstrip("/") or "/"
+        if clean == base or clean.startswith(base + "/"):
+            return True
+    return False
+
+
+def fs_root_for(path: str, roots: list[str]) -> str:
+    """The DEEPEST configured root containing ``path`` ('' when none does)."""
+    if not path:
+        return ""
+    clean = str(path).rstrip("/") or "/"
+    matches = []
+    for root in roots:
+        base = str(root).rstrip("/") or "/"
+        if clean == base or clean.startswith(base + "/"):
+            matches.append(base)
+    return max(matches, key=len, default="")
+
+
 def fs_refresh(*_args: Any) -> None:
-    """Reload the roots (first time) and the current directory."""
-    if not state.fs_roots:
-        _fs_request_roots()
-    if state.fs_current_path:
-        fs_navigate(state.fs_current_path)
+    """Re-read the Media Roots and the current directory (first open + Refresh).
+
+    BUG-2026-11-14T210000: the roots are fetched EVERY time. The old guard
+    (only when the list was empty) hid a live ``fs_roots`` change until VJmix
+    restarted, so a second Media Root never reached the combo.
+    """
+    _fs_request_roots()
 
 
 def _fs_request_roots() -> None:
@@ -5285,7 +5408,13 @@ def _fs_roots_worker(host: str, port: int) -> None:
 
 
 def _fs_apply_roots(roots: list | None, status: int | None) -> None:
-    """Main thread: fill the roots combo (and open the first root)."""
+    """Main thread: fill the roots combo and open a folder inside them.
+
+    The current folder wins while it is still inside a root (a Refresh must not
+    yank the operator out of the folder they are browsing); a removed root falls
+    back to the first one. The roots request is also what reloads the listing,
+    because the follow-up navigate carries the current path.
+    """
     state.fs_busy = False
     if not roots:
         state.fs_status = _fs_error_text(status)
@@ -5294,7 +5423,8 @@ def _fs_apply_roots(roots: list | None, status: int | None) -> None:
     state.fs_roots = roots
     paths = [str(r.get("path")) for r in roots]
     dpg.configure_item(FILE_MANAGER_ROOTS_TAG, items=paths)
-    fs_navigate(paths[0])
+    target = state.fs_current_path if fs_path_in_roots(state.fs_current_path, paths) else paths[0]
+    fs_navigate(target)
 
 
 def fs_navigate(path: str, *_args: Any) -> None:
@@ -5309,31 +5439,89 @@ def fs_navigate(path: str, *_args: Any) -> None:
     state.fs_busy = True
     state.fs_status = "Loading..."
     dpg.set_value(FILE_MANAGER_STATUS_TAG, state.fs_status)
-    threading.Thread(target=_fs_list_worker, args=(host, port, str(path)), daemon=True).start()
+    threading.Thread(
+        target=_fs_list_worker, args=(host, port, str(path), 0, False), daemon=True
+    ).start()
 
 
-def _fs_list_worker(host: str, port: int, path: str) -> None:
+def _fs_list_worker(host: str, port: int, path: str, offset: int, append: bool) -> None:
     """Worker: fetch one directory page, report on the main thread (HIGH-1)."""
-    payload, status = fsclient.fetch_listing(host, port, path)
-    state.ui_task_queue.put(lambda: _fs_apply_listing(path, payload, status))
+    payload, status = fsclient.fetch_listing(host, port, path, offset)
+    state.ui_task_queue.put(lambda: _fs_apply_listing(path, payload, status, append))
 
 
-def _fs_apply_listing(path: str, payload: dict | None, status: int | None) -> None:
-    """Main thread: store the page, update the chrome and rebuild the list."""
+def _fs_apply_listing(
+    path: str, payload: dict | None, status: int | None, append: bool = False
+) -> None:
+    """Main thread: store the page, update the chrome and rebuild the list.
+
+    ``append`` (Load more) keeps the already listed entries and the selection;
+    a fresh page replaces both. Older daemons cap at one page, so the button
+    simply never appears.
+    """
     state.fs_busy = False
     if payload is None:
         state.fs_status = _fs_error_text(status)
         dpg.set_value(FILE_MANAGER_STATUS_TAG, state.fs_status)
         return
+    page = [entry for entry in payload.get("entries") or [] if isinstance(entry, dict)]
+    if append:
+        known = {str(entry.get("name") or "") for entry in state.fs_entries}
+        state.fs_entries.extend(
+            entry for entry in page if str(entry.get("name") or "") not in known
+        )
+    else:
+        state.fs_entries = page
+        state.fs_selected = None
     state.fs_current_path = str(payload.get("path") or path)
-    state.fs_entries = list(payload.get("entries") or [])
     state.fs_total = int(payload.get("total") or len(state.fs_entries))
-    state.fs_selected = None
-    state.fs_status = f"{state.fs_total} entries"
+    shown = len(state.fs_entries)
+    state.fs_status = (
+        f"{shown} of {state.fs_total} entries"
+        if shown < state.fs_total
+        else f"{state.fs_total} entries"
+    )
+    root = fs_root_for(state.fs_current_path, [str(r.get("path")) for r in state.fs_roots])
+    if root:
+        dpg.set_value(FILE_MANAGER_ROOTS_TAG, root)
     dpg.set_value(FILE_MANAGER_BREADCRUMB_TAG, state.fs_current_path)
     dpg.set_value(FILE_MANAGER_STATUS_TAG, state.fs_status)
     _fs_render_entries()
-    _fs_request_thumbnails(state.fs_entries)
+    _fs_update_load_more()
+    _fs_request_thumbnails(page)
+
+
+def fs_load_more(*_args: Any) -> None:
+    """Fetch the next page of the current directory (Load more, BUG-2026-11-14T210000)."""
+    if state.fs_busy or not state.fs_current_path:
+        return
+    if len(state.fs_entries) >= state.fs_total:
+        _fs_update_load_more()
+        return
+    host, port = _fs_endpoint()
+    if not host or not port:
+        state.fs_status = "viOSC endpoint not configured."
+        dpg.set_value(FILE_MANAGER_STATUS_TAG, state.fs_status)
+        return
+    state.fs_busy = True
+    state.fs_status = "Loading more..."
+    dpg.set_value(FILE_MANAGER_STATUS_TAG, state.fs_status)
+    threading.Thread(
+        target=_fs_list_worker,
+        args=(host, port, state.fs_current_path, len(state.fs_entries), True),
+        daemon=True,
+    ).start()
+
+
+def _fs_update_load_more() -> None:
+    """Show how many entries remain, or hide the button on the last page."""
+    if not dpg.does_item_exist(FS_LOAD_MORE_TAG):
+        return
+    pending = max(0, state.fs_total - len(state.fs_entries))
+    if pending:
+        dpg.configure_item(FS_LOAD_MORE_TAG, show=True, label=f"Load more ({pending} left)")
+        return
+    dpg.configure_item(FS_LOAD_MORE_TAG, show=False)
 
 
 def _fs_entry_label(entry: dict[str, Any]) -> str:
@@ -5359,7 +5547,7 @@ def _fs_render_entries() -> None:
         row = dpg.add_group(horizontal=True, parent=FILE_MANAGER_ENTRIES_TAG)
         for index in range(start, min(start + FS_ENTRIES_COLUMNS, total)):
             entry = state.fs_entries[index]
-            cell = dpg.add_group(horizontal=True, parent=row)
+            cell = dpg.add_group(horizontal=True, parent=row, tag=f"fs_cell_{index}")
             thumb_tag = f"fs_thumb_{index}"
             _fs_entry_thumb(entry, parent=cell, thumb_tag=thumb_tag)
             item_tag = f"fs_entry_{index}"
@@ -5385,15 +5573,20 @@ def _fs_bind_row_menu(item_tag: str, thumb_tag: str, entry: dict[str, Any]) -> N
     with dpg.item_handler_registry(tag=registry):
         dpg.add_item_clicked_handler(button=1, callback=_on_fs_entry_right_click, user_data=entry)
     dpg.bind_item_handler_registry(item_tag, registry)
-    dpg.bind_item_handler_registry(thumb_tag, registry)
+    for target in (thumb_tag, _fs_thumb_image_tag(thumb_tag)):
+        if dpg.does_item_exist(target):
+            dpg.bind_item_handler_registry(target, registry)
 
 
 def _on_fs_entry_right_click(
     sender: Any = None, app_data: Any = None, user_data: Any = None
 ) -> None:
-    """Right-click a file row: Add to session, plus Preview... for videos (e44s05)."""
+    """Right-click a row: media actions, or folder actions (e44s05, e100s03)."""
     entry = user_data if isinstance(user_data, dict) else {}
-    if entry.get("kind") != "file" or entry.get("media_kind") not in ("video", "image"):
+    kind = entry.get("kind")
+    is_folder = kind == "dir"
+    is_media = kind == "file" and entry.get("media_kind") in ("video", "image")
+    if not is_folder and not is_media:
         return
     path = os.path.join(state.fs_current_path, str(entry.get("name") or ""))
     if dpg.does_item_exist(FS_ROW_POPUP_TAG):
@@ -5407,10 +5600,38 @@ def _on_fs_entry_right_click(
         min_size=(200, 10),
     ):
         dpg.add_text(os.path.basename(path))
-        dpg.add_button(label="Add to session", user_data=path, callback=_on_fs_add_to_session_click)
-        if entry.get("media_kind") == "video":
-            dpg.add_button(label="Preview...", user_data=path, callback=_on_fs_preview_click)
+        if is_folder:
+            dpg.add_button(label="Open", user_data=path, callback=_on_fs_open_folder_click)
+            dpg.add_button(
+                label="New session from this folder",
+                user_data=path,
+                callback=_on_fs_folder_session_click,
+            )
+        else:
+            dpg.add_button(
+                label="Add to session", user_data=path, callback=_on_fs_add_to_session_click
+            )
+            if entry.get("media_kind") == "video":
+                dpg.add_button(label="Preview...", user_data=path, callback=_on_fs_preview_click)
     dpg.show_item(FS_ROW_POPUP_TAG)
+
+
+def _on_fs_open_folder_click(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    """The folder row's popup: navigate into the clicked folder."""
+    if dpg.does_item_exist(FS_ROW_POPUP_TAG):
+        dpg.delete_item(FS_ROW_POPUP_TAG)
+    fs_navigate(str(user_data or ""))
+
+
+def _on_fs_folder_session_click(
+    sender: Any = None, app_data: Any = None, user_data: Any = None
+) -> None:
+    """The folder row's popup: start a session from that folder (e100s03)."""
+    if dpg.does_item_exist(FS_ROW_POPUP_TAG):
+        dpg.delete_item(FS_ROW_POPUP_TAG)
+    folder_session_open_at(str(user_data or ""))
 
 
 def _on_fs_add_to_session_click(
@@ -5465,23 +5686,36 @@ def _fs_media_path(entry: dict[str, Any]) -> str | None:
     return os.path.join(state.fs_current_path, str(entry.get("name") or ""))
 
 
-def _fs_entry_thumb(entry: dict[str, Any], parent: Any, thumb_tag: str) -> None:
-    """The row's 64x36 preview when its texture exists, else a placeholder.
+def _fs_thumb_image_tag(thumb_tag: str) -> str:
+    """The tag of the real texture image beside a row's text placeholder."""
+    return f"{thumb_tag}_img"
+
+
+def _fs_entry_thumb(entry: dict[str, Any], parent: Any, thumb_tag: str, before: Any = None) -> None:
+    """The row's 64x36 preview when its texture exists, else a text placeholder.
 
     ``thumb_tag`` is the widget tag the row menu binds to (e44s05), so a
-    right-click on the thumbnail opens the same menu as the name.
+    right-click on the thumbnail opens the same menu as the name. When the
+    texture arrives AFTER the row was built, the placeholder is hidden and the
+    image is inserted BEFORE the name (BUG-2026-11-14T210000): the page is never
+    rebuilt for one thumbnail.
     """
     path = _fs_media_path(entry)
+    place = {"before": before} if before is not None else {}
+    image_tag = _fs_thumb_image_tag(thumb_tag)
     if path is not None and dpg.does_item_exist(_fs_thumb_texture_tag(path)):
         dpg.add_image(
             _fs_thumb_texture_tag(path),
             parent=parent,
-            tag=thumb_tag,
+            tag=image_tag,
             width=FS_THUMB_W,
             height=FS_THUMB_H,
+            **place,
         )
+        if dpg.does_item_exist(thumb_tag):
+            dpg.configure_item(thumb_tag, show=False)
         return
-    dpg.add_text("  ", parent=parent, tag=thumb_tag)
+    dpg.add_text("  ", parent=parent, tag=thumb_tag, **place)
 
 
 def _fs_request_thumbnails(entries: list[dict[str, Any]]) -> None:
@@ -5510,12 +5744,39 @@ def _fs_request_thumbnails(entries: list[dict[str, Any]]) -> None:
 
 
 def _fs_on_thumb_texture(name: str) -> None:
-    """Repaint the browser when one of ITS thumbnails lands (e43s03)."""
+    """Repaint the ONE row whose thumbnail landed (e43s03).
+
+    BUG-2026-11-14T210000: this used to rebuild the whole page. A page asks for
+    up to FS_THUMB_MAX_REQUESTS thumbnails and the main loop drains the texture
+    queue in one pass, so one frame could rebuild a 500-entry page 60 times —
+    the freeze/crash the operator hit with a second (large) Media Root.
+    """
     if not name.startswith(FS_THUMB_PREFIX):
         return
     path = name[len(FS_THUMB_PREFIX) :]
-    if state.fs_current_path and os.path.dirname(path) == state.fs_current_path:
-        _fs_render_entries()
+    if not state.fs_current_path or os.path.dirname(path) != state.fs_current_path:
+        return
+    _fs_refresh_entry_thumb(path)
+
+
+def _fs_refresh_entry_thumb(path: str) -> None:
+    """Swap one row's placeholder for its texture, leaving every other row alone."""
+    for index, entry in enumerate(state.fs_entries):
+        if _fs_media_path(entry) != path:
+            continue
+        item_tag = f"fs_entry_{index}"
+        thumb_tag = f"fs_thumb_{index}"
+        cell_tag = f"fs_cell_{index}"
+        image_tag = _fs_thumb_image_tag(thumb_tag)
+        if not (dpg.does_item_exist(cell_tag) and dpg.does_item_exist(item_tag)):
+            return
+        if dpg.does_item_exist(image_tag):
+            return  # the texture already shows; a later frame must not stack it
+        _fs_entry_thumb(entry, parent=cell_tag, thumb_tag=thumb_tag, before=item_tag)
+        registry = f"fs_row_reg_{item_tag}"
+        if dpg.does_item_exist(image_tag) and dpg.does_item_exist(registry):
+            dpg.bind_item_handler_registry(image_tag, registry)
+        return
 
 
 def _on_fs_entry_click(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
@@ -5562,8 +5823,7 @@ def fs_go_up(*_args: Any) -> None:
         return
     roots = [str(r.get("path")) for r in state.fs_roots]
     parent = os.path.dirname(current.rstrip("/")) or "/"
-    inside = any(parent == r or parent.startswith(r.rstrip("/") + "/") for r in roots)
-    if current in roots or not inside:
+    if current in roots or not fs_path_in_roots(parent, roots):
         return
     fs_navigate(parent)
 
@@ -5781,6 +6041,13 @@ FS_SESSION_DETAIL_TAG = "fs_session_detail"
 FS_SESSION_STATUS_TAG = "fs_session_status"
 DRAFT_CONFIRM_WIDTH = 560
 DRAFT_CONFIRM_HEIGHT = 200
+# BUG-2026-11-14T190000: the fixed 200 px assumed ONE summary line, so a folder
+# session whose "On load" panel resolves several assignments overflowed and got
+# a scrollbar. The window now grows by one line per wrapped summary/warning line
+# (cap keeps a pathological plan inside the viewport).
+DRAFT_CONFIRM_LINE_H = 20
+DRAFT_CONFIRM_WRAP_CHARS = 68  # DRAFT_CONFIRM_WIDTH - 40 at the default font
+DRAFT_CONFIRM_MAX_HEIGHT = 640
 DRAFT_CONFIRM_MIN_WIDTH = 420
 DRAFT_CONFIRM_MIN_HEIGHT = 170
 DRAFT_RENAME_WIDTH = 380
@@ -6025,6 +6292,14 @@ def _draft_error_text(status: int | None, tag: str | None) -> str:
         return "That draft name cannot be used as a file name."
     if tag == "unwritable":
         return "viOSC could not write the session file."
+    if tag == "forbidden":
+        return "That folder is outside the allowed roots: check fs_roots in viOSC."
+    if tag == "not_found":
+        return "That folder no longer exists on machine A."
+    if tag == "not_dir":
+        return "That path is not a folder."
+    if tag == "bad_recipe":
+        return "The session recipe could not be written."
     return f"Write failed ({status})."
 
 
@@ -6298,22 +6573,71 @@ def _apply_pending_remap(live_ids: set[str]) -> None:
     _drafts_status(f"Reassigned {moved} bindings to the new session.")
 
 
-def _show_draft_load_confirm(path: str) -> None:
-    """Open the Load confirmation (replaces the live session, always asked).
-
-    The window is sized from its content (the e45s02 panel follows the number of
-    bound rows) and stays resizable (BUG-2026-09-15T201625).
-    """
-    state.drafts_pending_path = str(path)
-    if dpg.does_item_exist(FS_DRAFT_CONFIRM_TAG):
-        dpg.delete_item(FS_DRAFT_CONFIRM_TAG)
+def _draft_plan(path: str) -> dict[str, Any]:
+    """The Send plan of the SELECTED DRAFT (the e43/e45 flow, unchanged)."""
     draft = _selected_draft()
     sources = list(state.drafts_sources.get(int(draft["id"])) or []) if draft else []
-    bindings = remap_bindings()
+    return {
+        "name": os.path.basename(str(path)),
+        "path": str(path),
+        "files": [str(item) for item in (draft or {}).get("files", [])],
+        "sources": sources,
+        "assignments": [],
+        "transition": 0.0,
+        "warning": draft_visibility_warning(draft),
+        "editable": True,
+        "summary": [],
+    }
+
+
+def _show_draft_load_confirm(path: str) -> None:
+    """Open the Load confirmation for the selected draft (always asked)."""
+    state.drafts_pending_path = str(path)
+    _show_plan_confirm(_draft_plan(path))
+
+
+def wrapped_line_count(text: str, chars: int = DRAFT_CONFIRM_WRAP_CHARS) -> int:
+    """How many rendered lines a wrapped text occupies (0 for empty text)."""
+    if not text:
+        return 0
+    return (len(text) + chars - 1) // chars
+
+
+def draft_confirm_height(summary: list[str], warning: str, panel_height: int = 0) -> int:
+    """The Send modal's height for its content (BUG-2026-11-14T190000).
+
+    The base covers the fixed chrome (the REPLACES line, the name, the transition
+    field and the buttons); every wrapped summary/warning line adds one line, and
+    the editable-plan reassignment panel adds its own height.
+    """
+    lines = sum(wrapped_line_count(line) for line in summary)
+    extra = (lines + wrapped_line_count(warning)) * DRAFT_CONFIRM_LINE_H
+    if panel_height > 0:
+        extra += panel_height + REMAP_PANEL_CHROME
+    return min(DRAFT_CONFIRM_MAX_HEIGHT, DRAFT_CONFIRM_HEIGHT + extra)
+
+
+def _show_plan_confirm(plan: dict[str, Any]) -> None:
+    """Open the Load confirmation for a PLAN (a draft or a folder session).
+
+    The window is sized from its content: the e45s02 panel follows the number of
+    bound rows and the read-only summary follows its wrapped lines
+    (BUG-2026-11-14T190000), and it stays resizable (BUG-2026-09-15T201625). A folder
+    plan is not editable here: its choices were made (and saved) in the wizard, and
+    this is the same mandatory gate the drafts flow uses.
+    """
+    state.pending_plan = dict(plan)
+    if dpg.does_item_exist(FS_DRAFT_CONFIRM_TAG):
+        dpg.delete_item(FS_DRAFT_CONFIRM_TAG)
+    sources = list(plan.get("sources") or [])
+    editable = bool(plan.get("editable"))
+    bindings = remap_bindings() if editable else []
     show_panel = bool(sources and bindings)
     panel_height = remap_panel_height(len(bindings)) if show_panel else 0
-    height = DRAFT_CONFIRM_HEIGHT + (panel_height + REMAP_PANEL_CHROME if show_panel else 0)
-    warning = draft_visibility_warning(draft)
+    summary = [str(line) for line in plan.get("summary") or []]
+    height = draft_confirm_height(
+        summary, str(plan.get("warning") or ""), panel_height if show_panel else 0
+    )
     with dpg.window(
         label="Send session to vimix",
         tag=FS_DRAFT_CONFIRM_TAG,
@@ -6324,15 +6648,18 @@ def _show_draft_load_confirm(path: str) -> None:
         min_size=(DRAFT_CONFIRM_MIN_WIDTH, DRAFT_CONFIRM_MIN_HEIGHT),
     ):
         dpg.add_text("This REPLACES the live vimix session.", wrap=DRAFT_CONFIRM_WIDTH - 40)
-        dpg.add_text(os.path.basename(str(path)), wrap=DRAFT_CONFIRM_WIDTH - 40)
+        dpg.add_text(str(plan.get("name") or ""), wrap=DRAFT_CONFIRM_WIDTH - 40)
+        warning = str(plan.get("warning") or "")
         if warning:
             dpg.add_text(warning, wrap=DRAFT_CONFIRM_WIDTH - 40)
         if show_panel:
             _build_remap_panel(bindings, sources, panel_height)
+        for line in summary:
+            dpg.add_text(line, wrap=DRAFT_CONFIRM_WIDTH - 40)
         dpg.add_input_float(
             label="Transition (s)",
             tag=FS_DRAFT_TRANSITION_TAG,
-            default_value=0.0,
+            default_value=float(plan.get("transition") or 0.0),
             width=120,
             step=0,
             format="%.1f",
@@ -6347,6 +6674,8 @@ def _show_draft_load_confirm(path: str) -> None:
 def cancel_draft_load(*_args: Any) -> None:
     """Confirmation Cancel: nothing is sent."""
     state.drafts_pending_path = None
+    state.pending_plan = None
+    state.remap_bindings_cache = []
     if dpg.does_item_exist(FS_DRAFT_CONFIRM_TAG):
         dpg.delete_item(FS_DRAFT_CONFIRM_TAG)
 
@@ -6360,24 +6689,31 @@ def _draft_transition_seconds() -> float:
 
 
 def confirm_draft_load(*_args: Any) -> None:
-    """Confirmation Load: `/vimix/session/open s <path> [f <seconds>]`."""
-    path = str(state.drafts_pending_path or "")
+    """Confirmation Load: `/vimix/session/open s <path> [f <seconds>]`.
+
+    Reads a PLAN when one is open (draft or folder session) and falls back to the
+    bare pending path, so a caller that only set the path keeps working.
+    """
+    plan = state.pending_plan if isinstance(state.pending_plan, dict) else {}
+    path = str(plan.get("path") or state.drafts_pending_path or "")
     # Read the transition while the modal still owns its input: on a deleted
     # item DearPyGui returns None, so reading after the close silently dropped
     # the crossfade argument (BUG-2026-09-15T162441).
     seconds = _draft_transition_seconds()
-    assignments = _collect_remap_assignments()
+    assignments = _collect_remap_assignments() if plan.get("editable", True) else []
+    plan_assignments = [item for item in plan.get("assignments") or [] if isinstance(item, dict)]
     state.remap_bindings_cache = []
     if dpg.does_item_exist(FS_DRAFT_CONFIRM_TAG):
         dpg.delete_item(FS_DRAFT_CONFIRM_TAG)
     state.drafts_pending_path = None
+    state.pending_plan = None
     if not path:
         return
     args: list[Any] = [path]
     if seconds > 0:
         args.append(seconds)
     osc_client.send_message("/vimix/session/open", args)
-    state.send_remap_pending = assignments or None
+    state.send_remap_pending = (assignments or plan_assignments) or None
     state.send_remap_armed_at = time.monotonic()
     _drafts_status(f"Sent to vimix: {os.path.basename(path)}")
 
@@ -6464,6 +6800,7 @@ def _sync_file_manager_learn_marker() -> None:
             (MIDI_ACTION_FILE_STEP, "fs_mk_file_step"),
             (MIDI_ACTION_FILE_NEXT, "fs_mk_file_next"),
             (MIDI_ACTION_FILE_PREV, "fs_mk_file_prev"),
+            (MIDI_ACTION_FILE_MORE, "fs_mk_file_more"),
         ):
             learn_marker(
                 action_id,
@@ -6472,6 +6809,612 @@ def _sync_file_manager_learn_marker() -> None:
                 tag=tag,
                 tooltip=f"Map: {actions.action_label(action_id)}",
             )
+
+
+# --- e100: session from folder -------------------------------------------------
+# A themed folder becomes a session: scan with a count, choose the opening clip,
+# choose what the new session drives, and keep the recipe beside the `.mix`.
+# Everything here is main-thread UI; the scan, the write and the sessions fetch
+# run in workers and come back through ui_task_queue (HIGH-1).
+FOLDER_SESSION_TAG = "folder_session_window"
+FS_FOLDER_PATH_TAG = "fs_folder_path"
+FS_FOLDER_RECURSIVE_TAG = "fs_folder_recursive"
+FS_FOLDER_STATUS_TAG = "fs_folder_status"
+FS_FOLDER_LIST_TAG = "fs_folder_list"
+FS_FOLDER_PICK_TAG = "fs_folder_pick"
+FS_FOLDER_NAME_TAG = "fs_folder_name"
+FS_FOLDER_FIRST_TAG = "fs_folder_first"
+FS_FOLDER_WARN_TAG = "fs_folder_warn"
+FS_FOLDER_ASSIGN_GROUP = "fs_folder_assign_group"
+FS_FOLDER_ASSIGN_TAG = "fs_folder_assign"
+FS_FOLDER_LEARN_SLOT = "fs_folder_learn_slot"
+FS_FOLDER_TRANSITION_TAG = "fs_folder_transition"
+FOLDER_SESSION_WIDTH = 780
+FOLDER_SESSION_HEIGHT = 640
+FOLDER_SESSION_MIN_WIDTH = 620
+FOLDER_SESSION_MIN_HEIGHT = 520
+FS_FOLDER_LIST_HEIGHT = 150
+# A folder can hold more clips than a dialog can usefully render: everything above
+# the cap is still INCLUDED, is not listed, and the status line says so.
+FS_FOLDER_RENDER_MAX = 200
+# The daemon's own scan bound (viOSC fs_api.MAX_SCAN_FILES): when the walk stopped
+# there, the count is a lower bound and the wizard refuses to create on it.
+FS_FOLDER_SCAN_CAP = 2000
+
+
+def _folder_widget(tag: str, default: Any = "") -> Any:
+    """One widget's value, or ``default`` when it is closed/gone."""
+    if not dpg.does_item_exist(tag):
+        return default
+    value = dpg.get_value(tag)
+    return default if value is None else value
+
+
+def _folder_included() -> list[str]:
+    """The scanned files the operator kept checked (the session's files)."""
+    excluded = state.folder_session.get("excluded") or set()
+    return [str(path) for path in state.folder_session.get("files") or [] if path not in excluded]
+
+
+def _folder_label(path: str, index: int) -> str:
+    """``N. name`` — the one label shape the list, the combos and the recipe share."""
+    return f"{index + 1}. {os.path.basename(str(path))}"
+
+
+def _folder_options() -> tuple[list[str], list[str]]:
+    """The rendered (capped) included files: ``(labels, paths)``."""
+    files = _folder_included()[:FS_FOLDER_RENDER_MAX]
+    return [_folder_label(path, index) for index, path in enumerate(files)], files
+
+
+def _folder_status(text: str) -> None:
+    """Write the wizard's status line (and keep it in the state)."""
+    state.folder_session["status"] = str(text)
+    if dpg.does_item_exist(FS_FOLDER_STATUS_TAG):
+        dpg.set_value(FS_FOLDER_STATUS_TAG, str(text))
+
+
+def folder_session_open(*_args: Any) -> None:
+    """Open the wizard on the browser's folder (the toolbar action, e100)."""
+    folder_session_open_at(state.fs_current_path)
+
+
+def folder_session_open_at(folder: Any) -> None:
+    """Open the wizard on ``folder`` with a clean slate (one wizard at a time)."""
+    folder_path = str(folder or "")
+    state.folder_session = {
+        "folder": folder_path,
+        "busy": False,
+        "status": "",
+        "name": foldersession.default_name(folder_path),
+        "files": [],
+        "total": 0,
+        "ignored": 0,
+        "truncated": False,
+        "excluded": set(),
+        "first": "",
+        "recipe": None,
+        "prefilled": False,
+        "recursive": False,
+        "diff": {"added": [], "vanished": []},
+        "assign_options": [],
+        "assign_cache": [],
+        "sessions": [],
+        "sources": [],
+        "written": "",
+    }
+    _build_folder_session_window()
+    if folder_path:
+        folder_session_scan()
+
+
+def folder_session_close(*_args: Any) -> None:
+    """Close the wizard: its choices are kept only by the recipe on disk."""
+    state.folder_session = {}
+    if dpg.does_item_exist(FOLDER_SESSION_TAG):
+        dpg.delete_item(FOLDER_SESSION_TAG)
+
+
+def _build_folder_session_window() -> None:
+    """Build the wizard's widgets (values live in ``state.folder_session``)."""
+    session = state.folder_session
+    if dpg.does_item_exist(FOLDER_SESSION_TAG):
+        dpg.delete_item(FOLDER_SESSION_TAG)
+    with dpg.window(
+        label="New session from folder",
+        tag=FOLDER_SESSION_TAG,
+        width=FOLDER_SESSION_WIDTH,
+        height=FOLDER_SESSION_HEIGHT,
+        no_resize=False,
+        min_size=(FOLDER_SESSION_MIN_WIDTH, FOLDER_SESSION_MIN_HEIGHT),
+    ):
+        with dpg.group(horizontal=True):
+            dpg.add_input_text(
+                tag=FS_FOLDER_PATH_TAG,
+                default_value=session["folder"],
+                width=520,
+                callback=_on_folder_path_changed,
+            )
+            dpg.add_button(label="Scan", width=90, callback=folder_session_scan)
+        dpg.add_checkbox(
+            label="Include subfolders",
+            tag=FS_FOLDER_RECURSIVE_TAG,
+            default_value=False,
+            callback=folder_session_scan,
+        )
+        themed_text("", slot="text_dim", tag=FS_FOLDER_STATUS_TAG)
+        with dpg.child_window(height=FS_FOLDER_LIST_HEIGHT, border=True, tag="fs_folder_scroll"):
+            dpg.add_group(tag=FS_FOLDER_LIST_TAG)
+        with dpg.group(horizontal=True):
+            dpg.add_text("Session name")
+            dpg.add_input_text(
+                tag=FS_FOLDER_NAME_TAG,
+                default_value=session["name"],
+                width=300,
+                callback=_on_folder_name_changed,
+            )
+        with dpg.group(horizontal=True):
+            dpg.add_combo(
+                label="Opening clip",
+                items=[],
+                tag=FS_FOLDER_FIRST_TAG,
+                width=360,
+                callback=_on_folder_first_changed,
+            )
+        themed_text("", slot="text_dim", tag=FS_FOLDER_WARN_TAG)
+        themed_text("On load", slot="text")
+        with dpg.child_window(
+            height=FS_FOLDER_LIST_HEIGHT, border=False, tag="fs_folder_assign_scroll"
+        ):
+            dpg.add_group(tag=FS_FOLDER_ASSIGN_GROUP)
+        dpg.add_input_float(
+            label="Transition (s)",
+            tag=FS_FOLDER_TRANSITION_TAG,
+            default_value=0.0,
+            width=120,
+            step=0,
+            format="%.1f",
+        )
+        dpg.add_separator()
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Cancel", width=130, callback=folder_session_close)
+            dpg.add_button(label="Create session", width=170, callback=folder_session_create)
+    show_centered_window(FOLDER_SESSION_TAG)
+
+
+def folder_session_scan(*_args: Any) -> None:
+    """Scan the wizard's folder in a worker (never on the UI thread)."""
+    session = state.folder_session
+    if not session or session.get("busy"):
+        return
+    folder = str(_folder_widget(FS_FOLDER_PATH_TAG, session.get("folder") or "")).strip()
+    recursive = bool(_folder_widget(FS_FOLDER_RECURSIVE_TAG, False))
+    host, port = _fs_endpoint()
+    session.update(folder=folder, recursive=recursive, busy=True)
+    _folder_status("Scanning...")
+    if not host or not port:
+        session["busy"] = False
+        _folder_status("viOSC endpoint not configured.")
+        return
+    threading.Thread(
+        target=_folder_scan_worker, args=(host, port, folder, recursive), daemon=True
+    ).start()
+
+
+def _folder_scan_worker(host: str, port: int, folder: str, recursive: bool) -> None:
+    """Worker: scan the folder, then fetch the sessions already inside it."""
+    payload, status = fsclient.scan_folder(host, port, folder, recursive)
+    sessions: list | None = []
+    if isinstance(payload, dict):
+        directory = str(payload.get("path") or folder)
+        sessions, _ = fsclient.fetch_sessions(host, port, directory=directory)
+    state.ui_task_queue.put(lambda: _apply_folder_scan(payload, status, sessions))
+
+
+def _apply_folder_scan(payload: dict | None, status: int | None, sessions: list | None) -> None:
+    """Main thread: store the scan, pre-fill from a recipe, render."""
+    session = state.folder_session
+    if not session:
+        return
+    session["busy"] = False
+    if not isinstance(payload, dict):
+        _folder_status(_fs_error_text(status))
+        return
+    files = [
+        str(entry.get("path")) for entry in payload.get("files") or [] if isinstance(entry, dict)
+    ]
+    session.update(
+        folder=str(payload.get("path") or session.get("folder") or ""),
+        files=files,
+        total=int(payload.get("total") or len(files)),
+        ignored=int(payload.get("ignored") or 0),
+        truncated=bool(payload.get("truncated")),
+        sessions=[item for item in sessions or [] if isinstance(item, dict)],
+    )
+    session["excluded"] = {path for path in session.get("excluded") or set() if path in files}
+    _folder_prefill(files)
+    _render_folder_session()
+    _folder_status(_folder_summary(session))
+
+
+def _folder_prefill(files: list[str]) -> None:
+    """Pre-fill from the folder's recipe the FIRST time, then keep the choices."""
+    session = state.folder_session
+    first_scan = not session.get("prefilled")
+    session["prefilled"] = True
+    if not first_scan:
+        if str(session.get("first") or "") not in files:
+            session["first"] = files[0] if files else ""
+        return
+    name = foldersession.default_name(str(session.get("folder") or ""))
+    recipe = _folder_existing_recipe(session, name)
+    if recipe is None:
+        session["recipe"] = None
+        session["diff"] = {"added": [], "vanished": []}
+        if not str(session.get("name") or ""):
+            session["name"] = name
+        session["first"] = files[0] if files else ""
+        return
+    merged = foldersession.merge_recipe(recipe, files)
+    session["recipe"] = recipe
+    session["name"] = merged["name"] or name
+    session["excluded"] = {path for path in files if path not in merged["files"]}
+    session["first"] = merged["first"]
+    session["diff"] = {"added": merged["added"], "vanished": merged["vanished"]}
+
+
+def _folder_existing_recipe(session: dict[str, Any], name: str) -> dict[str, Any] | None:
+    """The healed recipe of this folder's session, if there is one.
+
+    The session named after the folder wins (one session per folder); when the
+    operator renamed it, a folder holding exactly ONE recipe is still that
+    session, so it pre-fills instead of being silently forgotten.
+    """
+    items = [item for item in session.get("sessions") or [] if isinstance(item, dict)]
+    named = [item for item in items if str(item.get("name")) == name]
+    for item in named:
+        raw = item.get("recipe")
+        return foldersession.sanitize_recipe(raw) if isinstance(raw, dict) else None
+    healing = [
+        foldersession.sanitize_recipe(item.get("recipe"))
+        for item in items
+        if isinstance(item.get("recipe"), dict)
+    ]
+    healed = [recipe for recipe in healing if recipe is not None]
+    return healed[0] if len(healed) == 1 else None
+
+
+def _folder_summary(session: dict[str, Any]) -> str:
+    """The count line: what was found, what was left out, what stopped the walk."""
+    files = len(session.get("files") or [])
+    parts = [f"{files} videos found"]
+    ignored = int(session.get("ignored") or 0)
+    if ignored:
+        parts.append(f"({ignored} other entries ignored)")
+    if session.get("truncated"):
+        parts.append(f"- scan stopped at {FS_FOLDER_SCAN_CAP}, narrow the folder")
+    if len(session.get("files") or []) > FS_FOLDER_RENDER_MAX:
+        parts.append(f"- only the first {FS_FOLDER_RENDER_MAX} are listed (all are included)")
+    return " ".join(parts)
+
+
+def _folder_warning_text(session: dict[str, Any]) -> str:
+    """The wizard's warning line: what changed in the folder since the recipe."""
+    diff = session.get("diff") or {}
+    vanished = len(diff.get("vanished") or [])
+    added = len(diff.get("added") or [])
+    lines = []
+    if vanished:
+        lines.append(f"{vanished} file(s) are no longer in the folder and were dropped.")
+    if added:
+        lines.append(f"{added} new file(s) appeared (included, parked).")
+    return " ".join(lines)
+
+
+def _render_folder_session() -> None:
+    """Rebuild the list, the opening-clip combo and the assignment panel."""
+    if not state.folder_session or not dpg.does_item_exist(FOLDER_SESSION_TAG):
+        return
+    _render_folder_files()
+    _render_folder_first()
+    _render_folder_assignments()
+    if dpg.does_item_exist(FS_FOLDER_NAME_TAG):
+        dpg.set_value(FS_FOLDER_NAME_TAG, state.folder_session.get("name") or "")
+    if dpg.does_item_exist(FS_FOLDER_WARN_TAG):
+        dpg.set_value(FS_FOLDER_WARN_TAG, _folder_warning_text(state.folder_session))
+
+
+def _render_folder_files() -> None:
+    """One inclusion checkbox per scanned file (capped, with a worded remainder)."""
+    if not dpg.does_item_exist(FS_FOLDER_LIST_TAG):
+        return
+    dpg.delete_item(FS_FOLDER_LIST_TAG, children_only=True)
+    session = state.folder_session
+    excluded = session.get("excluded") or set()
+    files = session.get("files") or []
+    for index, path in enumerate(files[:FS_FOLDER_RENDER_MAX]):
+        dpg.add_checkbox(
+            label=_folder_label(path, index),
+            parent=FS_FOLDER_LIST_TAG,
+            tag=f"{FS_FOLDER_PICK_TAG}_{index}",
+            default_value=path not in excluded,
+            callback=_on_folder_pick,
+            user_data=str(path),
+        )
+    more = len(files) - min(len(files), FS_FOLDER_RENDER_MAX)
+    if more > 0:
+        themed_text(
+            f"... and {more} more (all included)",
+            slot="text_dim",
+            parent=FS_FOLDER_LIST_TAG,
+        )
+
+
+def _render_folder_first() -> None:
+    """The opening-clip combo over the included files."""
+    if not dpg.does_item_exist(FS_FOLDER_FIRST_TAG):
+        return
+    options, paths = _folder_options()
+    session = state.folder_session
+    first = str(session.get("first") or "")
+    if first not in paths:
+        first = paths[0] if paths else ""
+        session["first"] = first
+    dpg.configure_item(FS_FOLDER_FIRST_TAG, items=options)
+    dpg.set_value(FS_FOLDER_FIRST_TAG, _folder_label(first, paths.index(first)) if first else "")
+
+
+def _folder_assign_rows() -> list[dict[str, Any]]:
+    """One row per existing Mapper line and per Sequencer track."""
+    rows: list[dict[str, Any]] = [
+        {"kind": "mapper", "key": str(target), "label": f"Mapper {position + 1}"}
+        for position, target in enumerate(mapper.row_targets())
+    ]
+    rows += [
+        {"kind": "seq", "key": row, "label": f"Seq {row + 1}"}
+        for row in range(len(state.tracks_data))
+    ]
+    return rows
+
+
+def _render_folder_assignments() -> None:
+    """Render the on-load assignment selects, pre-filled from the recipe."""
+    if not dpg.does_item_exist(FS_FOLDER_ASSIGN_GROUP):
+        return
+    dpg.delete_item(FS_FOLDER_ASSIGN_GROUP, children_only=True)
+    options, paths = _folder_options()
+    labels = [REMAP_NONE, *options]
+    recipe = state.folder_session.get("recipe") or {}
+    chosen = foldersession.assignments_for_panel(recipe.get("assignments") or [], paths)
+    cache: list[dict[str, Any]] = []
+    for index, row in enumerate(_folder_assign_rows()):
+        wanted = chosen.get((row["kind"], row["key"]))
+        preselected = REMAP_NONE if not wanted else _folder_label(wanted, paths.index(wanted))
+        tag = f"{FS_FOLDER_ASSIGN_TAG}_{index}"
+        dpg.add_combo(
+            label=row["label"],
+            items=labels,
+            default_value=preselected,
+            width=300,
+            tag=tag,
+            parent=FS_FOLDER_ASSIGN_GROUP,
+        )
+        cache.append({**row, "tag": tag, "options": labels, "paths": paths})
+    state.folder_session["assign_cache"] = cache
+    if not cache:
+        themed_text(
+            "No Mapper lines or Sequencer tracks to assign yet.",
+            slot="text_dim",
+            parent=FS_FOLDER_ASSIGN_GROUP,
+        )
+
+
+def _on_folder_path_changed(sender: Any = None, app_data: Any = None, *_args: Any) -> None:
+    """A new folder invalidates the pre-fill (a Scan will read that folder alone)."""
+    state.folder_session.update(
+        folder=str(app_data or "").strip(), prefilled=False, recipe=None, sessions=[]
+    )
+
+
+def _on_folder_name_changed(sender: Any = None, app_data: Any = None, *_args: Any) -> None:
+    """The session name is free text (the folder's basename is only a default)."""
+    state.folder_session["name"] = str(app_data or "").strip()
+
+
+def _on_folder_pick(sender: Any = None, app_data: Any = None, user_data: Any = None) -> None:
+    """Include/exclude one file; excluding the opening clip moves it."""
+    path = str(user_data or "")
+    session = state.folder_session
+    excluded = session.setdefault("excluded", set())
+    if app_data:
+        excluded.discard(path)
+    else:
+        excluded.add(path)
+    if path == str(session.get("first") or "") and path in excluded:
+        included = _folder_included()
+        session["first"] = included[0] if included else ""
+    _render_folder_first()
+    _render_folder_assignments()
+
+
+def _on_folder_first_changed(sender: Any = None, app_data: Any = None, *_args: Any) -> None:
+    """Store the opening clip chosen in the combo."""
+    options, paths = _folder_options()
+    label = str(app_data or "")
+    if label in options:
+        state.folder_session["first"] = paths[options.index(label)]
+
+
+def _folder_transition() -> float:
+    """The crossfade duration typed in the wizard (clamped, never negative)."""
+    try:
+        return max(0.0, float(_folder_widget(FS_FOLDER_TRANSITION_TAG, 0.0) or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _collect_folder_assignments() -> list[dict[str, Any]]:
+    """Read the assignment selects into recipe entries (paths, not names)."""
+    assignments: list[dict[str, Any]] = []
+    for row in state.folder_session.get("assign_cache") or []:
+        tag = str(row.get("tag") or "")
+        label = _folder_widget(tag, REMAP_NONE)
+        options = row.get("options") or []
+        paths = row.get("paths") or []
+        if not isinstance(label, str) or label == REMAP_NONE or label not in options:
+            continue
+        position = options.index(label) - 1
+        if 0 <= position < len(paths):
+            assignments.append({"kind": row["kind"], "key": row["key"], "target": paths[position]})
+    return assignments
+
+
+def _folder_recipe_for_create() -> tuple[dict[str, Any], list[str]] | None:
+    """The recipe and the files to write, or None with a worded reason."""
+    session = state.folder_session
+    included = _folder_included()
+    if session.get("truncated"):
+        _folder_status("The scan stopped at its cap - narrow the folder or turn subfolders off.")
+        return None
+    if not included:
+        _folder_status("Include at least one video.")
+        return None
+    name = str(session.get("name") or "").strip()
+    if not name:
+        _folder_status("Give the session a name.")
+        return None
+    first = str(session.get("first") or "")
+    if first not in included:
+        first = included[0]
+    excluded = [path for path in session.get("files") or [] if path not in included]
+    recipe = foldersession.build_recipe(
+        str(session.get("folder") or ""),
+        name,
+        included,
+        first,
+        excluded=excluded,
+        assignments=_collect_folder_assignments(),
+        transition=_folder_transition(),
+        updated=time.strftime("%Y-%m-%dT%H:%M:%S"),
+    )
+    return recipe, list(recipe["files"])
+
+
+def folder_session_create(*_args: Any) -> None:
+    """Write `.mix` + recipe INTO the folder, then ask for the Send confirmation."""
+    session = state.folder_session
+    if not session or session.get("busy"):
+        return
+    built = _folder_recipe_for_create()
+    if built is None:
+        return
+    recipe, files = built
+    host, port = _fs_endpoint()
+    if not host or not port:
+        _folder_status("viOSC endpoint not configured.")
+        return
+    session["busy"] = True
+    _folder_status("Creating...")
+    threading.Thread(
+        target=_folder_create_worker, args=(host, port, recipe, files), daemon=True
+    ).start()
+
+
+def _folder_create_worker(host: str, port: int, recipe: dict[str, Any], files: list[str]) -> None:
+    """Worker: POST the session + recipe into the folder (HIGH-1)."""
+    result, status = fsclient.write_session(
+        host,
+        port,
+        str(recipe.get("session") or ""),
+        files,
+        overwrite=True,
+        alphas=recipe.get("alphas"),
+        directory=str(recipe.get("folder") or ""),
+        recipe=recipe,
+    )
+    state.ui_task_queue.put(lambda: _apply_folder_create(recipe, result, status))
+
+
+def _apply_folder_create(recipe: dict[str, Any], result: dict | None, status: int | None) -> None:
+    """Main thread: confirm the write, then open the Send confirmation."""
+    session = state.folder_session
+    if not session:
+        return
+    session["busy"] = False
+    if not isinstance(result, dict) or status != 200:
+        tag = result.get("error") if isinstance(result, dict) else None
+        _folder_status(_draft_error_text(status, tag))
+        return
+    sources = [item for item in result.get("sources") or [] if isinstance(item, dict)]
+    path = str(result.get("file") or "")
+    session["sources"] = sources
+    session["written"] = path
+    _folder_status(f"Created: {os.path.basename(path)}")
+    plan = _folder_send_plan(recipe, path, sources)
+    folder_session_close()
+    _show_plan_confirm(plan)
+
+
+def _assignment_label(item: dict[str, Any]) -> str:
+    """One readable assignment line (the Send modal's read-only summary)."""
+    target = str(item.get("target") or "")
+    if item.get("kind") == "mapper":
+        targets = mapper.row_targets()
+        key = str(item.get("key") or "")
+        line = targets.index(key) + 1 if key in targets else "?"
+        return f"Mapper {line} -> {target}"
+    return f"Seq {int(item.get('key') or 0) + 1} -> {target}"
+
+
+def _folder_send_plan(
+    recipe: dict[str, Any], path: str, sources: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """The Send plan of a folder session (read-only here: saved in the wizard)."""
+    assignments = foldersession.resolve_assignments(recipe.get("assignments") or [], sources)
+    dropped = len(recipe.get("assignments") or []) - len(assignments)
+    summary = [_assignment_label(item) for item in assignments]
+    if not summary:
+        summary = ["No Mapper line or Sequencer track is assigned on load."]
+    if dropped:
+        summary.append(f"{dropped} assignment(s) had no source in the new session: skipped.")
+    alphas = recipe.get("alphas") or {}
+    warning = ""
+    if not any(float(value) > 0 for value in alphas.values()):
+        warning = "Warning: no source has alpha > 0 - the session will load with nothing visible."
+    return {
+        "name": os.path.basename(path),
+        "path": path,
+        "files": list(recipe.get("files") or []),
+        "sources": sources,
+        "assignments": assignments,
+        "transition": float(recipe.get("transition") or 0.0),
+        "warning": warning,
+        "editable": False,
+        "summary": summary,
+    }
+
+
+def _sync_folder_session_learn_marker() -> None:
+    """(Re)render the wizard's learn marker (e33 rule)."""
+    if not dpg.does_item_exist(FS_FOLDER_LEARN_SLOT):
+        return
+    dpg.delete_item(FS_FOLDER_LEARN_SLOT, children_only=True)
+    if not state.midi_learn_mode:
+        return
+    learn_marker(
+        MIDI_ACTION_FOLDER_SESSION,
+        {},
+        parent=FS_FOLDER_LEARN_SLOT,
+        tag="fs_mk_folder_session",
+        tooltip=f"Map: {actions.action_label(MIDI_ACTION_FOLDER_SESSION)}",
+    )
+
+
+def _exec_folder_session(params: dict[str, Any], value: int) -> None:
+    """e100: a momentary press opens the folder-session wizard."""
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    folder_session_open()
 
 
 def midi_action_beat_source(mode: str) -> None:
@@ -6913,6 +7856,13 @@ def _exec_file_step(params: dict[str, Any], value: int, delta: int) -> None:
     fs_file_step(delta)
 
 
+def _exec_file_more(params: dict[str, Any], value: int) -> None:
+    """A momentary press fetches the next directory page (threshold-gated)."""
+    if value < MIDI_CC_TRIGGER_THRESHOLD:
+        return
+    fs_load_more()
+
+
 def _cycle_media_selection(direction: int) -> None:
     """Step the Mediagrid selection by one in the grid order (e33s04).
 
@@ -7199,6 +8149,7 @@ _MIDI_EXECUTORS: dict[str, Callable[[dict[str, Any], int], None]] = {
     MIDI_ACTION_PROJECT_OPEN: lambda p, v: _exec_project_open(p, v),
     MIDI_ACTION_PROJECT_SAVE: lambda p, v: _exec_project_save(p, v),
     # e43s07: Session Draft actions (Load always asks for the confirmation)
+    MIDI_ACTION_FOLDER_SESSION: _exec_folder_session,
     MIDI_ACTION_DRAFT_LOAD: lambda p, v: _exec_draft_load(p, v),
     MIDI_ACTION_DRAFT_SAVE: _exec_draft_save,
     MIDI_ACTION_DRAFT_NEXT: _exec_draft_step(1),
@@ -7206,6 +8157,7 @@ _MIDI_EXECUTORS: dict[str, Callable[[dict[str, Any], int], None]] = {
     # e54s02: the File Manager selection by rotation or by a button
     MIDI_ACTION_FILE_NEXT: lambda p, v: _exec_file_step(p, v, 1),
     MIDI_ACTION_FILE_PREV: lambda p, v: _exec_file_step(p, v, -1),
+    MIDI_ACTION_FILE_MORE: lambda p, v: _exec_file_more(p, v),
 }
 
 _last_unknown_action_log: dict[str, float] = {}  # action id -> last log time (throttle)
@@ -7416,6 +8368,7 @@ def _refresh_learn_surfaces() -> None:
     _sync_mapper_leds_learn_marker()  # e96: the I/O-LED switch
     _sync_settings_pairing_learn_marker()
     _sync_file_manager_learn_marker()
+    _sync_folder_session_learn_marker()  # e100: the folder-session wizard
     _sync_drafts_learn_markers()
     _sync_text_learn_markers()  # e59s02
     _sync_shader_learn_markers()  # e61s03
@@ -11280,10 +12233,12 @@ def _build_zones_tab() -> None:
             )
         with dpg.group(horizontal=True):
             help_tooltip(
-                dpg.add_slider_float(
+                dpg.add_drag_float(
                     label="Min area",
                     tag="zones_min_area",
                     width=120,
+                    speed=0.001,
+                    format="%.4f",
                     min_value=zonetrack.MIN_AREA_MIN,
                     max_value=zonetrack.MIN_AREA_MAX,
                     default_value=state.zones_min_area,
@@ -23146,6 +24101,8 @@ dpg.bind_item_handler_registry("mapper_window", "mapper_resize_reg")
 
 # WINDOW: FILE MANAGER (e43s02) — browse machine A's Media Roots over the /fs
 # data plane. A workspace window: LAYOUT_WINDOW_TAGS persists its pos/size/open.
+# BUG-2026-11-14T190000: the window itself never scrolls; only the central
+# folder list does, and it fills the space the fixed blocks leave.
 with dpg.window(
     label="Sessions Manager",
     width=FILE_MANAGER_WIDTH,
@@ -23153,40 +24110,60 @@ with dpg.window(
     pos=(30, 840),
     tag=FILE_MANAGER_TAG,
     show=False,
+    no_scrollbar=True,
 ):
-    with dpg.group(horizontal=True):
-        dpg.add_combo(
-            items=[],
-            width=360,
-            tag=FILE_MANAGER_ROOTS_TAG,
-            callback=_on_fs_root_selected,
-        )
-        dpg.add_button(label="Up", callback=fs_go_up)
-        dpg.add_button(label="Refresh", callback=fs_refresh)
-        with dpg.group(tag=FILE_MANAGER_LEARN_SLOT, horizontal=True):
+    with dpg.group(tag=FS_TOP_GROUP):
+        with dpg.group(horizontal=True):
+            dpg.add_combo(
+                items=[],
+                width=360,
+                tag=FILE_MANAGER_ROOTS_TAG,
+                callback=_on_fs_root_selected,
+            )
+            dpg.add_button(label="Up", callback=fs_go_up)
+            dpg.add_button(label="Refresh", callback=fs_refresh)
+            with dpg.group(tag=FILE_MANAGER_LEARN_SLOT, horizontal=True):
+                pass
+        themed_text("", slot="text_dim", tag=FILE_MANAGER_BREADCRUMB_TAG)
+    with dpg.child_window(height=FILE_MANAGER_LIST_HEIGHT, border=False, tag=FS_SCROLL_TAG):
+        pass
+    with dpg.group(parent=FS_SCROLL_TAG, tag=FILE_MANAGER_ENTRIES_TAG):
+        pass
+    # BUG-2026-11-14T210000 follow-up: a directory larger than one page gets a
+    # Load more row INSIDE the scroll region (it scrolls with the entries).
+    help_tooltip(
+        dpg.add_button(
+            parent=FS_SCROLL_TAG,
+            tag=FS_LOAD_MORE_TAG,
+            label="Load more",
+            show=False,
+            callback=fs_load_more,
+        ),
+        "sessions.load_more",
+    )
+    with dpg.group(tag=FS_BOTTOM_GROUP):
+        themed_text("", slot="text_dim", tag=FILE_MANAGER_STATUS_TAG)
+        dpg.add_separator(tag=FS_DRAFTS_SEPARATOR_TAG)
+        themed_text("Session Drafts", slot="text")
+        with dpg.group(horizontal=True):
+            help_tooltip(dpg.add_button(label="New", callback=fs_new_draft), "sessions.new")
+            dpg.add_button(label="Open...", callback=fs_open_sessions)
+            dpg.add_button(label="New from folder...", callback=folder_session_open)
+            with dpg.group(tag=FS_FOLDER_LEARN_SLOT, horizontal=True):
+                pass
+            dpg.add_button(label="Delete", callback=fs_delete_selected_draft)
+            dpg.add_button(label="Rename", callback=fs_open_rename_draft)
+            help_tooltip(dpg.add_button(label="Save", callback=fs_write_draft), "sessions.save")
+            help_tooltip(
+                dpg.add_button(label="Send to Vimix", callback=fs_load_draft), "sessions.send"
+            )
+            with dpg.group(tag=FS_DRAFT_LEARN_SLOT, horizontal=True):
+                pass
+        themed_text("", slot="text_dim", tag=FS_DRAFT_STATUS_TAG)
+        with dpg.group(tag=FS_DRAFTS_GROUP):
             pass
-    themed_text("", slot="text_dim", tag=FILE_MANAGER_BREADCRUMB_TAG)
-    with dpg.child_window(height=FILE_MANAGER_LIST_HEIGHT, border=False, tag="fs_scroll"):
-        pass
-    with dpg.group(parent="fs_scroll", tag=FILE_MANAGER_ENTRIES_TAG):
-        pass
-    themed_text("", slot="text_dim", tag=FILE_MANAGER_STATUS_TAG)
-    dpg.add_separator(tag=FS_DRAFTS_SEPARATOR_TAG)
-    themed_text("Session Drafts", slot="text")
-    with dpg.group(horizontal=True):
-        help_tooltip(dpg.add_button(label="New", callback=fs_new_draft), "sessions.new")
-        dpg.add_button(label="Open...", callback=fs_open_sessions)
-        dpg.add_button(label="Delete", callback=fs_delete_selected_draft)
-        dpg.add_button(label="Rename", callback=fs_open_rename_draft)
-        help_tooltip(dpg.add_button(label="Save", callback=fs_write_draft), "sessions.save")
-        help_tooltip(dpg.add_button(label="Send to Vimix", callback=fs_load_draft), "sessions.send")
-        with dpg.group(tag=FS_DRAFT_LEARN_SLOT, horizontal=True):
+        with dpg.group(tag=FS_DRAFT_FILES_GROUP):
             pass
-    themed_text("", slot="text_dim", tag=FS_DRAFT_STATUS_TAG)
-    with dpg.group(tag=FS_DRAFTS_GROUP):
-        pass
-    with dpg.group(tag=FS_DRAFT_FILES_GROUP):
-        pass
 
 # NEW THREAD FOR HIGH-FREQUENCY FADES
 threading.Thread(target=fade_tick_loop, daemon=True).start()
@@ -23774,8 +24751,14 @@ try:
 
         while not texture_queue.empty():
             name, idx, img_data, w, h = texture_queue.get()
-            apply_thumbnail_texture(name, idx, img_data, w, h)
-            _fs_on_thumb_texture(name)
+            # A bad/malformed texture must never escape the loop: an uncaught
+            # exception here reaches the `finally: destroy_context()` and closes
+            # the app (BUG-2026-11-14T210000).
+            try:
+                apply_thumbnail_texture(name, idx, img_data, w, h)
+                _fs_on_thumb_texture(name)
+            except Exception as e:
+                log_error("Thumbnail texture", str(e))
 
         tick_thumb_cycle(time.time())
         tick_link_readout()  # e75: the Link tempo readout follows the worker
@@ -23789,6 +24772,12 @@ try:
         tick_project_dirty(time.time())  # e37s03: unsaved-changes marker cadence
 
         tick_drafts(time.time())  # e43s05: persist the draft library (debounced)
+        # BUG-2026-11-14T230000: a toolkit quirk in this layout must never reach
+        # `finally: destroy_context()`, which would close the app.
+        try:
+            tick_file_manager_layout()  # one scroll region, sized to fit
+        except Exception as e:
+            log_error("Sessions Manager layout", str(e))
         tick_send_remap(time.monotonic())  # e45s02: expire an unreached reassignment
 
         tick_cue_triggers()  # e35s03: cue-list card running labels (idle-cheap)

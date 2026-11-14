@@ -176,6 +176,12 @@ send_remap_armed_at: float = 0.0
 # reassignment panel consumes it, e45s02).
 drafts_sources: dict[int, list[dict[str, Any]]] = {}
 
+# e100: the Send confirmation renders a PLAN (draft or folder session), and the
+# folder wizard keeps its choices here, one dict rebuilt on every open so a
+# wizard never leaks into the next one.
+pending_plan: dict[str, Any] | None = None
+folder_session: dict[str, Any] = {}
+
 # state_pull_failures counts consecutive unanswered pulls (the reconciliation
 # snapshot is the only state source since e98s05: /events pushes the deltas).
 state_pull_failures: int = 0

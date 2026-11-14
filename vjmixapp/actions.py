@@ -25,9 +25,11 @@ from vjmixapp.constants import (
     MIDI_ACTION_DRAFT_STEP,
     MIDI_ACTION_ENABLE_CORRECTION,
     MIDI_ACTION_FILE_MANAGER_TOGGLE,
+    MIDI_ACTION_FILE_MORE,
     MIDI_ACTION_FILE_NEXT,
     MIDI_ACTION_FILE_PREV,
     MIDI_ACTION_FILE_STEP,
+    MIDI_ACTION_FOLDER_SESSION,
     MIDI_ACTION_HANDTRACK_RESTART,
     MIDI_ACTION_HANDTRACK_TOGGLE,
     MIDI_ACTION_IO_MONITOR_TOGGLE,
@@ -390,6 +392,9 @@ ACTION_SPECS: dict[str, ActionSpec] = {
     MIDI_ACTION_FILE_PREV: ActionSpec(
         MIDI_ACTION_FILE_PREV, "Previous file", CATEGORY_FILES, KIND_MOMENTARY
     ),
+    MIDI_ACTION_FILE_MORE: ActionSpec(
+        MIDI_ACTION_FILE_MORE, "Load more files", CATEGORY_FILES, KIND_MOMENTARY
+    ),
     # e59s02: the Text window (e33 rule) — toggle the window, send the document.
     MIDI_ACTION_TEXT_WINDOW_TOGGLE: ActionSpec(
         MIDI_ACTION_TEXT_WINDOW_TOGGLE, "Text window", CATEGORY_TEXT, KIND_MOMENTARY
@@ -439,6 +444,10 @@ ACTION_SPECS: dict[str, ActionSpec] = {
     ),
     MIDI_ACTION_PROJECT_SAVE: ActionSpec(
         MIDI_ACTION_PROJECT_SAVE, "Save project", CATEGORY_GLOBAL, KIND_MOMENTARY
+    ),
+    # e100: the folder-session wizard (a themed folder becomes a session).
+    MIDI_ACTION_FOLDER_SESSION: ActionSpec(
+        MIDI_ACTION_FOLDER_SESSION, "Open session from folder", CATEGORY_FILES, KIND_MOMENTARY
     ),
 }
 

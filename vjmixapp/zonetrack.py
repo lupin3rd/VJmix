@@ -12,7 +12,8 @@ Coordinate conventions (shared with the hand engine):
     y  -1..+1, +1 = up
     zone x/y are relative to the zone bounding box: 0 = centre, +/-1 = edge
 
-The model is deliberately small: background EMA, 3x3 open, minimum area,
+The model is deliberately small: a background that learns only the pixels with
+no motion (plus a global illumination shift), a 3x3 open, a minimum area,
 per-zone mass/centroid/energy/velocity, occupancy hysteresis and enter/exit
 pulses. A zone with no motion HOLDS its last position; it never snaps to zero,
 because a position mapping must not jump when a performer stops moving.
@@ -42,7 +43,7 @@ THRESHOLD_MIN = 4.0
 THRESHOLD_MAX = 60.0
 MIN_AREA_DEFAULT = 0.004
 MIN_AREA_MIN = 0.0005
-MIN_AREA_MAX = 0.10
+MIN_AREA_MAX = 1.0
 BG_TAU_DEFAULT = 2.0
 BG_TAU_MIN = 0.2
 BG_TAU_MAX = 10.0
@@ -58,10 +59,27 @@ PREVIEW_HZ = 20.0
 
 # Energy: the fraction of a zone that reads as "full" motion. A performer
 # crossing a zone rarely fills it; 35 % is a useful ceiling for the Mapper.
+# The fall is faster than the rise: the value has to read "empty" as soon as a
+# performer leaves, without making a single noisy frame spike it.
 ENERGY_FULL = 0.35
 ENERGY_TAU_S = 0.30
+ENERGY_FALL_TAU_S = 0.12
 VEL_TAU_S = 0.20
 VEL_CLAMP = 4.0
+
+# Background learning. Only pixels with NO motion are learned. A running average
+# that also learns a present object has two defects: presence drops while a
+# performer stands still, and the learned object is left as a full-contrast
+# "ghost" that keeps a zone ON for seconds after the exit. A light or exposure
+# change is not motion: the frame is shifted by the global luma median (a
+# performer covers a minority of the frame), so lighting never needs a re-learn
+# that could bake an object into the background.
+# A covered pixel that never uncovers is, by definition, the scene: after
+# BG_HOLD_S it is learned like everything else, so nothing (a moved lamp, an
+# engine started on a busy stage) can stay stuck forever. Every second of that
+# hold is also how long a perfectly still performer keeps a zone ON.
+ILLUMINATION_SAMPLE = 4
+BG_HOLD_S = 15.0
 
 # Occupancy hysteresis: the mass fraction that arms the zone, the lower one that
 # releases it, and how long each side must persist (a single noisy frame cannot
@@ -281,9 +299,14 @@ def open_mask(mask: np.ndarray) -> np.ndarray:
     return np.logical_or.reduce(_shifted(eroded))
 
 
-def _ema(previous: float | None, value: float, dt: float, tau: float) -> float:
+def _ema(
+    previous: float | None, value: float, dt: float, tau: float, fall_tau: float | None = None
+) -> float:
+    """Time-constant low-pass; ``fall_tau`` lets a value decay faster than it rises."""
     if previous is None:
         return float(value)
+    if fall_tau is not None and value < previous:
+        tau = fall_tau
     if tau <= 0.0:
         return float(value)
     alpha = 1.0 - math.exp(-max(0.0, dt) / tau)
@@ -327,6 +350,8 @@ class MotionModel:
     def reset(self) -> None:
         """Forget the background and every smoothed value."""
         self._background: np.ndarray | None = None
+        self._cover_age: np.ndarray | None = None
+        self._scene_ref: np.ndarray | None = None
         self._last_time = 0.0
         self._last_x: float | None = None
         self._last_y: float | None = None
@@ -338,23 +363,66 @@ class MotionModel:
         """Process one frame at ``now`` (monotonic seconds)."""
         gray = gray_frame(rgb, self.processing_width)
         height, width = gray.shape
-        if self._background is None or self._background.shape != gray.shape:
-            self._background = gray.astype(np.float32)
+        luma = gray.astype(np.float32)
+        if (
+            self._background is None
+            or self._cover_age is None
+            or self._scene_ref is None
+            or self._background.shape != gray.shape
+        ):
+            self._background = luma.copy()
+            self._cover_age = np.zeros_like(luma)
+            self._scene_ref = luma.copy()
             self._last_time = float(now)
             dt = 0.0
             mask = np.zeros_like(gray, dtype=bool)
         else:
             dt = max(0.0, float(now) - self._last_time)
             self._last_time = float(now)
-            alpha = clamp(1.0 - math.exp(-dt / self.bg_tau_s), BG_ALPHA_MIN, 1.0)
-            self._background += alpha * (gray.astype(np.float32) - self._background)
-            difference = np.abs(gray.astype(np.float32) - self._background) > self.threshold
+            shift = float(
+                np.median((luma - self._background)[::ILLUMINATION_SAMPLE, ::ILLUMINATION_SAMPLE])
+            )
+            corrected = luma - shift
+            difference = np.abs(corrected - self._background) > self.threshold
             mask = open_mask(difference)
+            if float(mask.mean()) < self.min_area:
+                mask = np.zeros_like(mask, dtype=bool)
+            # The scene under a pixel that just became covered: a pixel is an
+            # object only while it differs from what was there before it. Only a
+            # trustworthy background (one that still agrees with the remembered
+            # scene) may overwrite the memory.
+            drift = np.abs(self._background - self._scene_ref)
+            fresh = mask & (self._cover_age <= 0.0) & (drift <= self.threshold)
+            self._scene_ref[fresh] = self._background[fresh]
+            drift[fresh] = 0.0
+            # A background that drifted away from the scene while the pixel is
+            # back to the scene is a GHOST (the object left and the safety valve
+            # had learned it): snap it back, do not count it as presence.
+            back = (drift > self.threshold) & (
+                np.abs(corrected - self._scene_ref) <= self.threshold
+            )
+            if back.any():
+                self._background[back] = corrected[back]
+                mask &= ~back
+            # Learn the pixels with no motion, plus the ones that have been
+            # covered for so long that they ARE the scene (the safety valve).
+            settled = mask & (self._cover_age >= BG_HOLD_S)
+            update = ~mask | settled
+            alpha = clamp(1.0 - math.exp(-dt / self.bg_tau_s), BG_ALPHA_MIN, 1.0)
+            self._background[update] += alpha * (corrected[update] - self._background[update])
+            self._cover_age[mask] += dt
+            self._cover_age[~mask] = 0.0
         present = 1.0 if float(mask.mean()) >= self.min_area else 0.0
         if present == 0.0:
             mask = np.zeros_like(mask, dtype=bool)
         fraction = float(mask.mean())
-        self._energy = _ema(self._energy, clamp(fraction / ENERGY_FULL, 0.0, 1.0), dt, ENERGY_TAU_S)
+        self._energy = _ema(
+            self._energy,
+            clamp(fraction / ENERGY_FULL, 0.0, 1.0),
+            dt,
+            ENERGY_TAU_S,
+            ENERGY_FALL_TAU_S,
+        )
         x, y = self._position(mask, width, height)
         if mask.any() and dt > 0.0 and self._last_x is not None and self._last_y is not None:
             raw_vx = clamp((x - self._last_x) / dt, -VEL_CLAMP, VEL_CLAMP)
@@ -396,7 +464,13 @@ class _ZoneState:
     exit_until: float = -1.0
 
     def step(self, now: float, fraction: float, x: float, y: float, dt: float) -> dict[str, float]:
-        self.energy = _ema(self.energy, clamp(fraction / ENERGY_FULL, 0.0, 1.0), dt, ENERGY_TAU_S)
+        self.energy = _ema(
+            self.energy,
+            clamp(fraction / ENERGY_FULL, 0.0, 1.0),
+            dt,
+            ENERGY_TAU_S,
+            ENERGY_FALL_TAU_S,
+        )
         if dt > 0.0:
             self.vx = _ema(self.vx, clamp((x - self.x) / dt, -VEL_CLAMP, VEL_CLAMP), dt, VEL_TAU_S)
             self.vy = _ema(self.vy, clamp((y - self.y) / dt, -VEL_CLAMP, VEL_CLAMP), dt, VEL_TAU_S)

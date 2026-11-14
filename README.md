@@ -24,8 +24,8 @@ root** (PortAudio included, so no `libportaudio2` package is needed). Download
 [GitHub Releases](https://github.com/lupin3rd/VJmix/releases) page, then:
 
 ```bash
-chmod +x vjmix-1.3.0-x86_64.AppImage
-./vjmix-1.3.0-x86_64.AppImage
+chmod +x vjmix-1.3.1-x86_64.AppImage
+./vjmix-1.3.1-x86_64.AppImage
 ```
 
 ### Where your data lives

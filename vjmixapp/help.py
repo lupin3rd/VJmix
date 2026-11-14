@@ -457,18 +457,15 @@ HELP: dict[str, HelpEntry] = {
             ("Custom", "the colours below, unchanged by a preset"),
         ),
     ),
-    "settings.client_ip": HelpEntry("Client IP", "Where VJmix sends OSC: viOSC's address."),
-    "settings.client_port": HelpEntry("Client port", "viOSC's listening port."),
-    "settings.client_connect": HelpEntry(
-        "Connect Client", "Open the OSC client toward viOSC with the address on the left."
+    "settings.client_ip": HelpEntry(
+        "viOSC address", "Where VJmix reaches viOSC's HTTP surface (machine A)."
     ),
-    "settings.listen_ip": HelpEntry("Listen IP", "Where VJmix receives viOSC's state feed."),
-    "settings.listen_port": HelpEntry("Listen port", "The port viOSC sends its state to."),
-    "settings.server": HelpEntry(
-        "Start Server", "Start or stop the listening server for viOSC's state feed."
+    "settings.client_port": HelpEntry("viOSC HTTP port", "The port of that HTTP surface."),
+    "settings.client_connect": HelpEntry(
+        "Connect", "Connect VJmix to viOSC's HTTP surface at the address on the left."
     ),
     "settings.pair": HelpEntry(
-        "Pair with viOSC", "Ask viOSC for a pairing code and point both endpoints at each other."
+        "Pair with viOSC", "Open the pairing prompt; enter the code viOSC shows."
     ),
     "settings.viosc_load": HelpEntry(
         "Load", "Read viOSC's remote configuration into the fields below."
@@ -606,7 +603,9 @@ HELP: dict[str, HelpEntry] = {
     ),
     "zones.min_area": HelpEntry(
         "Min area",
-        "Smallest blob, as a share of the frame, that counts as presence: 0.0005 to 0.1.",
+        "Smallest change that counts as presence, as a share of the whole frame:"
+        " 0.0005 to 1. Raising it ignores small motion everywhere; a zone still needs"
+        " 1.5 % of its own area to turn ON.",
     ),
     "zones.maxhz": HelpEntry(
         "Max Hz", "Analysis passes per second, 2 to 15; higher reacts faster and costs CPU."
@@ -624,7 +623,9 @@ HELP: dict[str, HelpEntry] = {
     ),
     "zones.restart": HelpEntry("Restart", "Rebuild the zones engine and reopen the camera."),
     "zones.reset": HelpEntry(
-        "Reset activity", "Drop the energy history of every zone but keep the zone shapes."
+        "Reset activity",
+        "Drop the background and the energy history of every zone, keeping the shapes."
+        " Use it after a lighting change that leaves a zone stuck ON.",
     ),
     "zones.zone_name": HelpEntry(
         "Zone name", "The label used by the signals, the events and the Mapper."
@@ -723,6 +724,10 @@ HELP: dict[str, HelpEntry] = {
         "New mapping", "Create a mapping of any Type; it asks which Source when needed."
     ),
     "sessions.roots": HelpEntry("Media root", "The machine A folder the sessions manager browses."),
+    "sessions.load_more": HelpEntry(
+        "Load more",
+        "Fetch the next page of this folder; large directories arrive in pages.",
+    ),
     "sessions.new": HelpEntry("New", "Start a new, empty set of sources."),
     "sessions.save": HelpEntry("Save", "Write the current set of sources to disk."),
     "sessions.send": HelpEntry(
@@ -769,6 +774,64 @@ PROPERTY_NOTES: dict[str, str] = {
 def entry(key: str) -> HelpEntry:
     """The card for `key`; KeyError is the loud, test-visible failure mode."""
     return HELP[key]
+
+
+# BUG-2026-11-14T190000 (operator): the viOSC configuration page rendered bare
+# snake_case keys with no explanation. One card per REMOTE-EDITABLE field
+# (viOSC config.remote_editable_fields), keyed by the daemon's own name; the
+# TITLE doubles as the human label the page shows. A field the daemon adds
+# later still renders with its raw key and a generic card.
+VIOSC_CONFIG_FIELDS: dict[str, HelpEntry] = {
+    "sync_interval_ms": HelpEntry(
+        "Roster poll (ms)",
+        "How often viOSC re-reads the whole source roster from vimix. Lower is"
+        " faster and busier; 2000 ms is the default. The per-property state tier"
+        " stays at 1 s.",
+    ),
+    "thumb_max_count": HelpEntry(
+        "Thumbnail frames",
+        "How many frames viOSC extracts per video; VJmix cycles them on the tile.",
+    ),
+    "pairing_code_length": HelpEntry(
+        "Pairing code length",
+        "How many characters the pairing code has. A longer code is harder to guess;"
+        " changing it rotates the persisted code on restart.",
+    ),
+    "pairing_code_ttl_hours": HelpEntry(
+        "Pairing code TTL (h)",
+        "How many hours the persisted pairing code stays valid before viOSC rotates it.",
+    ),
+    "fs_roots": HelpEntry(
+        "Media roots",
+        "The folders the Sessions Manager may browse, comma-separated. Absolute"
+        " paths; ~ expands to the home folder.",
+    ),
+    "fs_show_hidden": HelpEntry(
+        "Show hidden files",
+        "List dot-files and dot-folders in the Sessions Manager.",
+    ),
+    "fs_sessions_dir": HelpEntry(
+        "Sessions folder",
+        "The default folder for drafts sent without a folder. New from folder"
+        " writes beside the chosen folder. ~ expands to the home folder.",
+    ),
+}
+
+VIOSC_UNKNOWN_FIELD = HelpEntry(
+    "viOSC option",
+    "A viOSC setting this VJmix version does not describe yet: the key is shown as-is.",
+)
+
+
+def viosc_config_entry(key: str) -> HelpEntry:
+    """The card for one viOSC config key (a generic card for a future key)."""
+    return VIOSC_CONFIG_FIELDS.get(key, VIOSC_UNKNOWN_FIELD)
+
+
+def viosc_config_label(key: str) -> str:
+    """The human label of one viOSC config key (the raw key when unknown)."""
+    described = VIOSC_CONFIG_FIELDS.get(key)
+    return described.title if described is not None else key
 
 
 def option_lines(key: str) -> tuple[tuple[str, str], ...]:
